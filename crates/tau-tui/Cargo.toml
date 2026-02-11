@@ -1,0 +1,20 @@
+[package]
+name = "tau-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Terminal UI components for tau"
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+unicode-width = "0.2"
+textwrap = "0.16"
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
