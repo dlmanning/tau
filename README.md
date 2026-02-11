@@ -4,14 +4,14 @@
 
 ## Features
 
-- 🤖 **Multiple AI Providers**: Anthropic Claude, OpenAI GPT, Google Gemini
-- 🛠️ **7 Built-in Tools**: bash, read, write, edit, glob, grep, list
-- 💬 **Two Modes**: Interactive CLI or full TUI (Terminal User Interface)
-- 💾 **Session Management**: Save, resume, and list conversation sessions
-- 📊 **Token Tracking**: Real-time token usage and cost estimates
-- 🔄 **Smart Retry**: Exponential backoff for rate limits and transient errors
-- ⚙️ **Configuration**: TOML-based config with environment variable support
-- 🔐 **OAuth Support**: Direct login to Anthropic (no API key needed)
+- **Multiple AI Providers**: Anthropic Claude, OpenAI GPT, Google Gemini
+- **7 Built-in Tools**: bash, read, write, edit, glob, grep, list
+- **Two Modes**: Interactive CLI or full TUI (Terminal User Interface)
+- **Session Management**: Save, resume, and list conversation sessions
+- **Token Tracking**: Real-time token usage and cost estimates
+- **Smart Retry**: Exponential backoff for rate limits and transient errors
+- **Configuration**: TOML-based config with environment variable support
+- **OAuth Support**: Direct login to Anthropic (no API key needed)
 
 ## Installation
 
@@ -286,7 +286,7 @@ Contributions welcome! This project uses:
 
 ## Related Projects
 
-Part of the [pi-mono](https://github.com/badlogic/pi-mono) repository.
+Inspired by [pi-mono](https://github.com/badlogic/pi-mono).
 
 ## Support
 
