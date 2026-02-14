@@ -29,6 +29,13 @@ pub enum AgentEvent {
         arguments: serde_json::Value,
     },
 
+    /// Tool execution progress update (emitted by tools during execution)
+    ToolExecutionUpdate {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+    },
+
     /// Tool execution completed
     ToolExecutionEnd {
         tool_call_id: String,
@@ -48,6 +55,17 @@ pub enum AgentEvent {
     AgentEnd {
         total_turns: u32,
         total_usage: Usage,
+    },
+
+    /// Context compaction started
+    CompactionStart {
+        reason: crate::compaction::CompactionReason,
+    },
+
+    /// Context compaction completed
+    CompactionEnd {
+        tokens_before: u32,
+        tokens_after: u32,
     },
 
     /// Error occurred
