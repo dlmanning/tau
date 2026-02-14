@@ -11,6 +11,7 @@ use ratatui::{
 pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<'a>> {
     let mut lines: Vec<Line<'a>> = Vec::new();
     let mut current_line: Vec<Span<'a>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![theme.base_style()];
     let mut current_style = theme.base_style();
     let mut in_code_block = false;
     let mut code_block_content = String::new();
@@ -62,12 +63,15 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                     current_line.push(Span::styled(format!("{}• ", indent), theme.dim_style()));
                 }
                 Tag::Emphasis => {
+                    style_stack.push(current_style);
                     current_style = current_style.add_modifier(Modifier::ITALIC);
                 }
                 Tag::Strong => {
+                    style_stack.push(current_style);
                     current_style = current_style.add_modifier(Modifier::BOLD);
                 }
                 Tag::Strikethrough => {
+                    style_stack.push(current_style);
                     current_style = current_style.add_modifier(Modifier::CROSSED_OUT);
                 }
                 Tag::Link { .. } => {
@@ -115,7 +119,7 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                     }
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
-                    current_style = theme.base_style();
+                    current_style = style_stack.pop().unwrap_or_else(|| theme.base_style());
                 }
                 TagEnd::Link => {
                     current_style = theme.base_style();

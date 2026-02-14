@@ -9,6 +9,86 @@ use ratatui::{
     widgets::{Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Widget},
 };
 
+/// Maximum width for selector popups
+const MAX_POPUP_WIDTH: u16 = 80;
+
+// --- Shared rendering helpers ---
+
+/// Compute the popup size given a title, item labels/descriptions, and max width.
+fn compute_popup_size(
+    title_len: usize,
+    items: impl Iterator<Item = (usize, Option<usize>)>, // (label_len, desc_len)
+    count: usize,
+) -> (u16, u16) {
+    let mut max_width = title_len + 4;
+    for (label_len, desc_len) in items {
+        max_width = max_width.max(label_len + 6);
+        if let Some(d) = desc_len {
+            max_width = max_width.max(d + 8);
+        }
+    }
+    let height = count as u16 + 2;
+    let width = (max_width as u16).clamp(20, MAX_POPUP_WIDTH);
+    (width, height.min(20))
+}
+
+/// Render a generic selector popup centered in `area`.
+fn render_selector_popup(
+    title: &str,
+    items: Vec<ListItem<'_>>,
+    selected: usize,
+    popup_size: (u16, u16),
+    theme: &Theme,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let (width, height) = popup_size;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect::new(x, y, width.min(area.width), height.min(area.height));
+
+    Clear.render(popup_area, buf);
+
+    let block = Block::default()
+        .title(format!(" {} ", title))
+        .title_style(theme.accent_bold())
+        .borders(Borders::ALL)
+        .border_style(theme.accent_style());
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_spacing(HighlightSpacing::Always);
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    ratatui::widgets::StatefulWidget::render(list, popup_area, buf, &mut state);
+}
+
+/// Build a styled `ListItem` for a selector entry.
+fn build_list_item<'a>(
+    label: &str,
+    is_current: bool,
+    is_selected: bool,
+    theme: &Theme,
+) -> ListItem<'a> {
+    let prefix = if is_current { "● " } else { "  " };
+    let style = if is_selected {
+        Style::default()
+            .bg(theme.accent)
+            .fg(theme.bg)
+            .add_modifier(Modifier::BOLD)
+    } else if is_current {
+        theme.accent_style()
+    } else {
+        theme.base_style()
+    };
+    let content = format!("{}{}", prefix, label);
+    ListItem::new(Line::from(Span::styled(content, style)))
+}
+
+// --- Borrowed selector ---
+
 /// A popup selector for choosing from a list of options
 pub struct Selector<'a> {
     title: &'a str,
@@ -26,6 +106,70 @@ pub struct SelectorItem<'a> {
     /// Whether this item is currently active
     pub is_current: bool,
 }
+
+impl<'a> Selector<'a> {
+    /// Create a new selector
+    pub fn new(title: &'a str, items: Vec<SelectorItem<'a>>, theme: &'a Theme) -> Self {
+        let selected = items.iter().position(|item| item.is_current).unwrap_or(0);
+        Self {
+            title,
+            items,
+            selected,
+            theme,
+        }
+    }
+
+    /// Set the selected index
+    pub fn with_selected(mut self, index: usize) -> Self {
+        self.selected = index.min(self.items.len().saturating_sub(1));
+        self
+    }
+
+    /// Get the selected index
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Move selection up
+    pub fn up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        } else {
+            self.selected = self.items.len().saturating_sub(1);
+        }
+    }
+
+    /// Move selection down
+    pub fn down(&mut self) {
+        if self.selected < self.items.len().saturating_sub(1) {
+            self.selected += 1;
+        } else {
+            self.selected = 0;
+        }
+    }
+
+    /// Render the selector centered in the given area
+    pub fn render_centered(&self, area: Rect, buf: &mut Buffer) {
+        let size = compute_popup_size(
+            self.title.len(),
+            self.items
+                .iter()
+                .map(|item| (item.label.len(), item.description.map(|d| d.len()))),
+            self.items.len(),
+        );
+
+        let list_items: Vec<ListItem> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| build_list_item(item.label, item.is_current, i == self.selected, self.theme))
+            .collect();
+
+        render_selector_popup(self.title, list_items, self.selected, size, self.theme, area, buf);
+    }
+}
+
+// --- Owned selector ---
 
 /// An item in the selector (owned version for dynamic content)
 pub struct OwnedSelectorItem {
@@ -63,198 +207,28 @@ impl<'a> OwnedSelector<'a> {
         self
     }
 
-    /// Calculate the ideal size for the popup
-    fn calculate_size(&self) -> (u16, u16) {
-        let mut max_width = self.title.len() + 4;
-
-        for item in &self.items {
-            let item_width = item.label.len() + 6;
-            max_width = max_width.max(item_width);
-
-            if let Some(ref desc) = item.description {
-                max_width = max_width.max(desc.len() + 8);
-            }
-        }
-
-        let height = self.items.len() as u16 + 2;
-        let width = (max_width as u16).clamp(20, 80);
-
-        (width, height.min(20))
-    }
-
     /// Render the selector centered in the given area
     pub fn render_centered(&self, area: Rect, buf: &mut Buffer) {
-        let (width, height) = self.calculate_size();
+        let size = compute_popup_size(
+            self.title.len(),
+            self.items
+                .iter()
+                .map(|item| (item.label.len(), item.description.as_ref().map(|d| d.len()))),
+            self.items.len(),
+        );
 
-        let x = area.x + (area.width.saturating_sub(width)) / 2;
-        let y = area.y + (area.height.saturating_sub(height)) / 2;
-
-        let popup_area = Rect::new(x, y, width.min(area.width), height.min(area.height));
-
-        Clear.render(popup_area, buf);
-
-        let items: Vec<ListItem> = self
+        let list_items: Vec<ListItem> = self
             .items
             .iter()
             .enumerate()
-            .map(|(i, item)| {
-                let is_selected = i == self.selected;
-                let prefix = if item.is_current { "● " } else { "  " };
-
-                let style = if is_selected {
-                    Style::default()
-                        .bg(self.theme.accent)
-                        .fg(self.theme.bg)
-                        .add_modifier(Modifier::BOLD)
-                } else if item.is_current {
-                    self.theme.accent_style()
-                } else {
-                    self.theme.base_style()
-                };
-
-                let content = format!("{}{}", prefix, item.label);
-                ListItem::new(Line::from(Span::styled(content, style)))
-            })
+            .map(|(i, item)| build_list_item(&item.label, item.is_current, i == self.selected, self.theme))
             .collect();
 
-        let block = Block::default()
-            .title(format!(" {} ", self.title))
-            .title_style(self.theme.accent_bold())
-            .borders(Borders::ALL)
-            .border_style(self.theme.accent_style());
-
-        let list = List::new(items)
-            .block(block)
-            .highlight_spacing(HighlightSpacing::Always);
-
-        let mut state = ListState::default();
-        state.select(Some(self.selected));
-
-        ratatui::widgets::StatefulWidget::render(list, popup_area, buf, &mut state);
+        render_selector_popup(&self.title, list_items, self.selected, size, self.theme, area, buf);
     }
 }
 
-impl<'a> Selector<'a> {
-    /// Create a new selector
-    pub fn new(title: &'a str, items: Vec<SelectorItem<'a>>, theme: &'a Theme) -> Self {
-        // Find the currently selected item (the one marked as current)
-        let selected = items.iter().position(|item| item.is_current).unwrap_or(0);
-
-        Self {
-            title,
-            items,
-            selected,
-            theme,
-        }
-    }
-
-    /// Set the selected index
-    pub fn with_selected(mut self, index: usize) -> Self {
-        self.selected = index.min(self.items.len().saturating_sub(1));
-        self
-    }
-
-    /// Get the selected index
-    pub fn selected(&self) -> usize {
-        self.selected
-    }
-
-    /// Move selection up
-    pub fn up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-        } else {
-            // Wrap to bottom
-            self.selected = self.items.len().saturating_sub(1);
-        }
-    }
-
-    /// Move selection down
-    pub fn down(&mut self) {
-        if self.selected < self.items.len().saturating_sub(1) {
-            self.selected += 1;
-        } else {
-            // Wrap to top
-            self.selected = 0;
-        }
-    }
-
-    /// Calculate the ideal size for the popup
-    fn calculate_size(&self) -> (u16, u16) {
-        let mut max_width = self.title.len() + 4; // Title + borders + padding
-
-        for item in &self.items {
-            let item_width = item.label.len() + 6; // Prefix + padding
-            max_width = max_width.max(item_width);
-
-            if let Some(desc) = item.description {
-                max_width = max_width.max(desc.len() + 8);
-            }
-        }
-
-        let height = self.items.len() as u16 + 2; // Items + borders
-        let width = (max_width as u16).clamp(20, 60);
-
-        (width, height.min(20))
-    }
-
-    /// Render the selector centered in the given area
-    pub fn render_centered(&self, area: Rect, buf: &mut Buffer) {
-        let (width, height) = self.calculate_size();
-
-        // Center the popup
-        let x = area.x + (area.width.saturating_sub(width)) / 2;
-        let y = area.y + (area.height.saturating_sub(height)) / 2;
-
-        let popup_area = Rect::new(x, y, width.min(area.width), height.min(area.height));
-
-        // Clear the area behind the popup
-        Clear.render(popup_area, buf);
-
-        // Create list items
-        let items: Vec<ListItem> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = i == self.selected;
-
-                let prefix = if item.is_current { "● " } else { "  " };
-
-                let style = if is_selected {
-                    Style::default()
-                        .bg(self.theme.accent)
-                        .fg(self.theme.bg)
-                        .add_modifier(Modifier::BOLD)
-                } else if item.is_current {
-                    self.theme.accent_style()
-                } else {
-                    self.theme.base_style()
-                };
-
-                let content = format!("{}{}", prefix, item.label);
-                ListItem::new(Line::from(Span::styled(content, style)))
-            })
-            .collect();
-
-        let block = Block::default()
-            .title(format!(" {} ", self.title))
-            .title_style(self.theme.accent_bold())
-            .borders(Borders::ALL)
-            .border_style(self.theme.accent_style());
-
-        let list = List::new(items)
-            .block(block)
-            .highlight_spacing(HighlightSpacing::Always);
-
-        // We need to render with state for the selection highlight
-        let mut state = ListState::default();
-        state.select(Some(self.selected));
-
-        // Render the list
-        ratatui::widgets::StatefulWidget::render(list, popup_area, buf, &mut state);
-    }
-}
+// --- Selector state ---
 
 /// State for the selector popup
 #[derive(Default)]

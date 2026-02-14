@@ -223,12 +223,29 @@ impl Widget for MessageList<'_> {
 /// Calculate total height of messages
 pub fn calculate_message_height(messages: &[ChatMessage], width: usize) -> usize {
     let mut total = 0;
+    let theme = Theme::dark(); // Use default theme for calculation
+    let content_width = width.saturating_sub(2);
+    
     for msg in messages {
         // Role header
         total += 1;
-        // Content lines
-        let wrapped = textwrap::wrap(&msg.content, width.saturating_sub(2));
-        total += wrapped.len();
+        
+        // Content lines - must match actual rendering logic
+        if msg.role == "assistant" && !msg.is_error {
+            if msg.content.is_empty() && msg.is_streaming {
+                // Thinking indicator
+                total += 1;
+            } else {
+                // Render markdown to count actual lines
+                let md_lines = render_markdown(&msg.content, &theme, content_width);
+                total += md_lines.len();
+            }
+        } else {
+            // Plain text with wrapping
+            let wrapped = textwrap::wrap(&msg.content, content_width);
+            total += wrapped.len();
+        }
+        
         // Separator
         total += 1;
     }
