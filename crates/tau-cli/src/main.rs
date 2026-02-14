@@ -7,6 +7,7 @@ mod oauth;
 mod session;
 mod tools;
 mod ui;
+mod utils;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -19,20 +20,20 @@ use tau_ai::{Api, CostInfo, InputType, Model, Provider, ReasoningLevel};
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Model to use (default: claude-sonnet-4-5-20250929)
-    #[arg(short, long, default_value = "claude-sonnet-4-5-20250929")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 
     /// Provider (anthropic, openai, google)
-    #[arg(short, long, default_value = "anthropic")]
-    provider: String,
+    #[arg(short, long)]
+    provider: Option<String>,
 
     /// Enable reasoning/thinking mode
     #[arg(short, long)]
     reasoning: bool,
 
     /// Reasoning level (off, minimal, low, medium, high)
-    #[arg(long, default_value = "off")]
-    reasoning_level: String,
+    #[arg(long)]
+    reasoning_level: Option<String>,
 
     /// Run in non-interactive mode with a single prompt
     #[arg(short = 'c', long)]
@@ -85,46 +86,66 @@ fn parse_reasoning_level(s: &str) -> ReasoningLevel {
     }
 }
 
+fn parse_provider(s: &str) -> Provider {
+    match s.to_lowercase().as_str() {
+        "anthropic" => Provider::Anthropic,
+        "openai" => Provider::OpenAI,
+        "google" => Provider::Google,
+        "groq" => Provider::Groq,
+        "cerebras" => Provider::Cerebras,
+        "xai" => Provider::XAI,
+        "openrouter" => Provider::OpenRouter,
+        "ollama" => Provider::Ollama,
+        _ => Provider::Custom,
+    }
+}
+
 fn get_model(provider: &str, model_id: &str) -> Model {
-    // Default models for each provider
-    let (api, base_url, cost) = match provider {
+    // Try registry lookup first
+    if let Some(model) = tau_ai::models::get_model_by_id(model_id) {
+        return model;
+    }
+
+    // Fallback: construct a default model for unknown/custom model IDs
+    let provider_enum = parse_provider(provider);
+
+    let (api, base_url) = match provider {
         "anthropic" => (
             Api::AnthropicMessages,
             "https://api.anthropic.com".to_string(),
-            CostInfo {
-                input: 3.0,
-                output: 15.0,
-                cache_read: 0.3,
-                cache_write: 3.75,
-                thinking: 15.0, // Same as output for extended thinking
-            },
         ),
         "openai" => (
-            Api::OpenAICompletions,
+            Api::OpenAIResponses,
             "https://api.openai.com/v1".to_string(),
-            CostInfo {
-                input: 5.0,
-                output: 15.0,
-                ..Default::default()
-            },
         ),
         "google" => (
             Api::GoogleGenerativeAI,
             "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            CostInfo::default(),
+        ),
+        "groq" => (
+            Api::OpenAICompletions,
+            "https://api.groq.com/openai/v1".to_string(),
+        ),
+        "cerebras" => (
+            Api::OpenAICompletions,
+            "https://api.cerebras.ai/v1".to_string(),
+        ),
+        "xai" => (
+            Api::OpenAICompletions,
+            "https://api.x.ai/v1".to_string(),
+        ),
+        "openrouter" => (
+            Api::OpenAICompletions,
+            "https://openrouter.ai/api/v1".to_string(),
+        ),
+        "ollama" => (
+            Api::OpenAICompletions,
+            "http://localhost:11434/v1".to_string(),
         ),
         _ => (
-            Api::AnthropicMessages,
-            "https://api.anthropic.com/v1".to_string(),
-            CostInfo::default(),
+            Api::OpenAICompletions,
+            String::new(),
         ),
-    };
-
-    let provider_enum = match provider {
-        "anthropic" => Provider::Anthropic,
-        "openai" => Provider::OpenAI,
-        "google" => Provider::Google,
-        _ => Provider::Anthropic,
     };
 
     Model {
@@ -133,39 +154,18 @@ fn get_model(provider: &str, model_id: &str) -> Model {
         api,
         provider: provider_enum,
         base_url,
-        reasoning: true,
-        input_types: vec![InputType::Text, InputType::Image],
-        cost,
-        context_window: 200000,
-        max_tokens: 64000,
+        reasoning: false,
+        input_types: vec![InputType::Text],
+        cost: CostInfo::default(),
+        context_window: 128000,
+        max_tokens: 8192,
         headers: Default::default(),
     }
 }
 
 /// Get list of commonly available models
 fn get_available_models() -> Vec<Model> {
-    vec![
-        // Anthropic models (current)
-        get_model("anthropic", "claude-sonnet-4-5-20250929"),
-        get_model("anthropic", "claude-haiku-4-5-20251001"),
-        get_model("anthropic", "claude-opus-4-5-20251101"),
-        get_model("anthropic", "claude-opus-4-1-20250805"),
-        // Anthropic models (legacy)
-        get_model("anthropic", "claude-sonnet-4-20250514"),
-        get_model("anthropic", "claude-3-7-sonnet-20250219"),
-        get_model("anthropic", "claude-opus-4-20250514"),
-        get_model("anthropic", "claude-3-5-haiku-20241022"),
-        // OpenAI models
-        get_model("openai", "gpt-4o"),
-        get_model("openai", "gpt-4o-mini"),
-        get_model("openai", "gpt-4-turbo"),
-        get_model("openai", "o1"),
-        get_model("openai", "o1-mini"),
-        // Google models
-        get_model("google", "gemini-1.5-pro"),
-        get_model("google", "gemini-1.5-flash"),
-        get_model("google", "gemini-2.0-flash-exp"),
-    ]
+    tau_ai::models::get_all_models()
 }
 
 #[tokio::main]
@@ -223,26 +223,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Merge config with CLI args (CLI takes precedence)
-    let provider = if args.provider != "anthropic" {
-        args.provider.clone()
-    } else {
-        cfg.provider
-            .clone()
-            .unwrap_or_else(|| args.provider.clone())
-    };
+    let provider = args
+        .provider
+        .or(cfg.provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
 
-    let model_id = if args.model != "claude-sonnet-4-5-20250929" {
-        args.model.clone()
-    } else {
-        cfg.model.clone().unwrap_or_else(|| args.model.clone())
-    };
+    let model_id = args
+        .model
+        .or(cfg.model.clone())
+        .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
 
     let model = get_model(&provider, &model_id);
 
     let reasoning = if args.reasoning {
         ReasoningLevel::Medium
-    } else if args.reasoning_level != "off" {
-        parse_reasoning_level(&args.reasoning_level)
+    } else if let Some(ref level) = args.reasoning_level {
+        parse_reasoning_level(level)
     } else {
         cfg.reasoning_level
             .as_ref()
@@ -282,12 +278,26 @@ async fn main() -> anyhow::Result<()> {
         api_key,
     ));
 
+    // Build compaction config from settings
+    let compaction = if let Some(ref compaction_settings) = cfg.compaction {
+        tau_agent::CompactionConfig {
+            enabled: compaction_settings.enabled.unwrap_or(true),
+            reserve_tokens: compaction_settings.reserve_tokens.unwrap_or(16384),
+            keep_recent_tokens: compaction_settings.keep_recent_tokens.unwrap_or(20000),
+        }
+    } else {
+        tau_agent::CompactionConfig::default()
+    };
+
     // Create agent with initial config (no system prompt yet)
     let config = AgentConfig {
         system_prompt: None,
         model: model.clone(),
         reasoning,
         max_tokens: None,
+        compaction,
+        steering_mode: tau_agent::DequeueMode::All,
+        follow_up_mode: tau_agent::DequeueMode::All,
     };
     let mut agent = Agent::new(config, transport);
 
@@ -307,13 +317,19 @@ async fn main() -> anyhow::Result<()> {
     // Resume session if specified
     if let Some(ref session_id) = args.resume {
         match session::SessionManager::load(session_id) {
-            Ok((_session, messages)) => {
+            Ok((_session, messages, previous_summary)) => {
                 println!(
-                    "Resuming session {} ({} messages)",
+                    "Resuming session {} ({} messages{})",
                     session_id,
-                    messages.len()
+                    messages.len(),
+                    if previous_summary.is_some() {
+                        ", with compacted context"
+                    } else {
+                        ""
+                    }
                 );
                 agent.set_messages(messages);
+                agent.set_previous_summary(previous_summary);
             }
             Err(e) => {
                 eprintln!("Error loading session: {}", e);
@@ -367,6 +383,11 @@ async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow:
                 AgentEvent::ToolExecutionStart { tool_name, .. } => {
                     println!("\n[Running {}...]", tool_name);
                 }
+                AgentEvent::ToolExecutionUpdate {
+                    tool_name, content, ..
+                } => {
+                    println!("[{}: {}]", tool_name, content);
+                }
                 AgentEvent::ToolExecutionEnd {
                     tool_name,
                     result,
@@ -376,16 +397,21 @@ async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow:
                     if is_error {
                         println!("[{} failed: {}]", tool_name, result);
                     } else {
-                        // Use chars for proper Unicode handling
-                        let result_chars: Vec<char> = result.chars().collect();
-                        let preview = if result_chars.len() > 200 {
-                            let truncated: String = result_chars[..200].iter().collect();
-                            format!("{}...", truncated)
-                        } else {
-                            result
-                        };
+                        let preview = crate::utils::truncate_chars(&result, 200);
                         println!("[{}: {}]", tool_name, preview);
                     }
+                }
+                AgentEvent::CompactionStart { reason } => {
+                    println!("[Compacting context ({})]", crate::utils::compaction_reason_str(reason));
+                }
+                AgentEvent::CompactionEnd {
+                    tokens_before,
+                    tokens_after,
+                } => {
+                    println!(
+                        "[Compacted: ~{} -> ~{} tokens]",
+                        tokens_before, tokens_after
+                    );
                 }
                 AgentEvent::Error { message } => {
                     eprintln!("Error: {}", message);
@@ -402,10 +428,7 @@ async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow:
         }
     });
 
-    agent
-        .prompt(command)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    agent.prompt(command).await?;
 
     // Wait a bit for final events
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -512,6 +535,23 @@ async fn run_interactive(
                             println!("\nUse /branch <index> to create a branch from that message.");
                         }
                     }
+                    commands::CommandResult::Compact => {
+                        println!("Compacting context...");
+                        match agent
+                            .run_compaction(tau_agent::CompactionReason::Manual)
+                            .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "Context compacted. {} messages remaining.",
+                                    agent.messages().len()
+                                );
+                            }
+                            Err(e) => {
+                                println!("Compaction failed: {}", e);
+                            }
+                        }
+                    }
                     commands::CommandResult::BranchFrom(branch_index) => {
                         match session::SessionManager::branch_from(
                             agent.messages(),
@@ -577,6 +617,12 @@ async fn run_interactive(
                         print!("\n[{}...", tool_name);
                         io::stdout().flush().ok();
                     }
+                    AgentEvent::ToolExecutionUpdate {
+                        content, ..
+                    } => {
+                        print!(" {}", content);
+                        io::stdout().flush().ok();
+                    }
                     AgentEvent::ToolExecutionEnd {
                         tool_name: _,
                         result,
@@ -585,30 +631,22 @@ async fn run_interactive(
                     } => {
                         if is_error {
                             println!(" error]");
-                            // Show error on next line
-                            let result_chars: Vec<char> = result.chars().collect();
-                            let preview = if result_chars.len() > 80 {
-                                let truncated: String = result_chars[..80].iter().collect();
-                                format!("{}...", truncated)
-                            } else {
-                                result
-                            };
+                            let preview = crate::utils::truncate_chars(&result, 80);
                             println!("  {}", preview.replace('\n', " "));
                         } else {
                             // Compact success output
-                            let result_chars: Vec<char> = result.chars().collect();
+                            let char_count = result.chars().count();
                             let first_line = result.lines().next().unwrap_or("");
-                            let first_line_chars: Vec<char> = first_line.chars().collect();
 
-                            if result_chars.len() <= 60 && !result.contains('\n') {
+                            if char_count <= 60 && !result.contains('\n') {
                                 // Short single-line result: show inline
                                 println!(" {}]", result);
-                            } else if first_line_chars.len() <= 50 {
+                            } else if first_line.chars().count() <= 50 {
                                 // Multi-line but short first line: show preview
                                 println!(" {}...]", first_line);
                             } else {
                                 // Long content: just close the bracket
-                                let preview: String = first_line_chars.iter().take(40).collect();
+                                let preview: String = first_line.chars().take(40).collect();
                                 println!(" {}...]", preview);
                             }
                         }
@@ -622,6 +660,18 @@ async fn run_interactive(
                                 total_usage.input, total_usage.output, cost.total
                             );
                         }
+                    }
+                    AgentEvent::CompactionStart { reason } => {
+                        println!("[Compacting context ({})]", crate::utils::compaction_reason_str(reason));
+                    }
+                    AgentEvent::CompactionEnd {
+                        tokens_before,
+                        tokens_after,
+                    } => {
+                        println!(
+                            "[Compacted: ~{} -> ~{} tokens]",
+                            tokens_before, tokens_after
+                        );
                     }
                     AgentEvent::Error { message } => {
                         eprintln!("\nError: {}", message);

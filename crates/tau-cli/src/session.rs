@@ -27,6 +27,15 @@ pub enum SessionEntry {
         cache_write: u32,
         timestamp: i64,
     },
+    /// Context compaction event
+    Compaction {
+        summary: String,
+        first_kept_message_index: usize,
+        tokens_before: u32,
+        read_files: Vec<String>,
+        modified_files: Vec<String>,
+        timestamp: i64,
+    },
 }
 
 /// Session manager for persisting conversations
@@ -34,8 +43,7 @@ pub struct SessionManager {
     /// Session ID
     id: String,
     /// Path to the session file
-    #[allow(dead_code)]
-    path: PathBuf,
+    _path: PathBuf,
     /// Writer for appending entries
     writer: Option<BufWriter<File>>,
 }
@@ -73,13 +81,15 @@ impl SessionManager {
 
         Ok(Self {
             id,
-            path,
+            _path: path,
             writer: Some(writer),
         })
     }
 
-    /// Load an existing session
-    pub fn load(id: &str) -> std::io::Result<(Self, Vec<Message>)> {
+    /// Load an existing session.
+    /// Returns (manager, messages, previous_summary).
+    /// If a compaction entry exists, messages are rebuilt from the summary + messages after the compaction point.
+    pub fn load(id: &str) -> std::io::Result<(Self, Vec<Message>, Option<String>)> {
         let sessions_dir = Self::sessions_dir();
         let path = sessions_dir.join(format!("{}.jsonl", id));
 
@@ -93,7 +103,8 @@ impl SessionManager {
         let file = File::open(&path)?;
         let reader = BufReader::new(file);
 
-        let mut messages = Vec::new();
+        let mut all_messages = Vec::new();
+        let mut last_compaction: Option<(String, usize)> = None;
 
         for line in reader.lines() {
             let line = line?;
@@ -101,12 +112,36 @@ impl SessionManager {
                 continue;
             }
 
-            if let Ok(SessionEntry::Message { message, .. }) =
-                serde_json::from_str::<SessionEntry>(&line)
-            {
-                messages.push(message);
+            match serde_json::from_str::<SessionEntry>(&line) {
+                Ok(SessionEntry::Message { message, .. }) => {
+                    all_messages.push(message);
+                }
+                Ok(SessionEntry::Compaction {
+                    summary,
+                    first_kept_message_index,
+                    ..
+                }) => {
+                    last_compaction = Some((summary, first_kept_message_index));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Skipping corrupted session line: {}", e);
+                }
             }
         }
+
+        // If there was a compaction, rebuild context
+        let (messages, previous_summary) = if let Some((summary, kept_index)) = last_compaction {
+            let summary_msg =
+                Message::user(format!("<context-summary>\n{}\n</context-summary>", summary));
+            let mut rebuilt = vec![summary_msg];
+            if kept_index < all_messages.len() {
+                rebuilt.extend_from_slice(&all_messages[kept_index..]);
+            }
+            (rebuilt, Some(summary))
+        } else {
+            (all_messages, None)
+        };
 
         // Open for appending
         let file = File::options().append(true).open(&path)?;
@@ -115,10 +150,11 @@ impl SessionManager {
         Ok((
             Self {
                 id: id.to_string(),
-                path,
+                _path: path,
                 writer: Some(writer),
             },
             messages,
+            previous_summary,
         ))
     }
 
@@ -132,6 +168,31 @@ impl SessionManager {
         if let Some(ref mut writer) = self.writer {
             let entry = SessionEntry::Message {
                 message: message.clone(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Append a compaction entry
+    #[allow(dead_code)]
+    pub fn append_compaction(
+        &mut self,
+        summary: &str,
+        first_kept_message_index: usize,
+        tokens_before: u32,
+        read_files: &[String],
+        modified_files: &[String],
+    ) -> std::io::Result<()> {
+        if let Some(ref mut writer) = self.writer {
+            let entry = SessionEntry::Compaction {
+                summary: summary.to_string(),
+                first_kept_message_index,
+                tokens_before,
+                read_files: read_files.to_vec(),
+                modified_files: modified_files.to_vec(),
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
             writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
@@ -194,13 +255,18 @@ impl SessionManager {
             working_dir,
         }) = serde_json::from_str(&first_line)
         {
-            // Count messages
+            // Count messages by deserializing each line
             let file = File::open(path).ok()?;
             let reader = BufReader::new(file);
             let message_count = reader
                 .lines()
                 .map_while(Result::ok)
-                .filter(|l| l.contains("\"type\":\"message\""))
+                .filter(|l| {
+                    matches!(
+                        serde_json::from_str::<SessionEntry>(l),
+                        Ok(SessionEntry::Message { .. })
+                    )
+                })
                 .count();
 
             Some(SessionInfo {
@@ -213,14 +279,6 @@ impl SessionManager {
         } else {
             None
         }
-    }
-
-    /// Delete a session
-    #[allow(dead_code)]
-    pub fn delete(id: &str) -> std::io::Result<()> {
-        let sessions_dir = Self::sessions_dir();
-        let path = sessions_dir.join(format!("{}.jsonl", id));
-        fs::remove_file(path)
     }
 
     /// Create a branched session from messages up to (and including) branch_index.
@@ -265,7 +323,7 @@ impl SessionManager {
 
         Ok(Self {
             id,
-            path,
+            _path: path,
             writer: Some(writer),
         })
     }
@@ -273,10 +331,10 @@ impl SessionManager {
 
 /// Information about a saved session
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SessionInfo {
     pub id: String,
     pub created_at: i64,
-    #[allow(dead_code)]
     pub model: String,
     pub working_dir: String,
     pub message_count: usize,

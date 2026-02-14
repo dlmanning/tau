@@ -33,6 +33,8 @@ pub enum CommandResult {
     OpenBranchSelector,
     /// Create branch from specific message index
     BranchFrom(Option<usize>),
+    /// Trigger manual context compaction
+    Compact,
 }
 
 /// Parse and execute a slash command
@@ -68,6 +70,8 @@ pub fn execute_command(
 
         "branch" | "b" => BranchCommand::execute(args, agent),
 
+        "compact" => CommandResult::Compact,
+
         _ => CommandResult::Unknown(command),
     })
 }
@@ -79,6 +83,7 @@ fn help_message() -> String {
   /thinking, /t [lvl]  Show or set reasoning level (off/minimal/low/medium/high)
   /session, /s         Show session info and token usage
   /branch, /b [index]  Branch conversation from a message (opens selector if no index)
+  /compact             Compact context by summarizing old messages
   /clear, /c           Clear conversation history
   /quit, /exit, /q     Exit tau
 

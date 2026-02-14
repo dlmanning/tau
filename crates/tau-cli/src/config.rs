@@ -21,6 +21,21 @@ pub struct Config {
     /// API keys (alternative to environment variables)
     #[serde(default)]
     pub api_keys: ApiKeys,
+    /// Compaction settings
+    #[serde(default)]
+    pub compaction: Option<CompactionSettings>,
+}
+
+/// Settings for context compaction
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionSettings {
+    /// Whether compaction is enabled (default: true)
+    pub enabled: Option<bool>,
+    /// Reserve this many tokens below context window to trigger proactive compaction
+    pub reserve_tokens: Option<u32>,
+    /// Keep at least this many tokens of recent messages when compacting
+    pub keep_recent_tokens: Option<u32>,
 }
 
 /// API key configuration
@@ -60,12 +75,12 @@ impl Config {
             Ok(content) => match toml::from_str(&content) {
                 Ok(config) => config,
                 Err(e) => {
-                    eprintln!("Warning: Failed to parse config file: {}", e);
+                    eprintln!("Warning: Failed to parse config file {}: {}", path.display(), e);
                     Self::default()
                 }
             },
             Err(e) => {
-                eprintln!("Warning: Failed to read config file: {}", e);
+                eprintln!("Warning: Failed to read config file {}: {}", path.display(), e);
                 Self::default()
             }
         }
@@ -95,6 +110,7 @@ impl Config {
             tui: Some(true),
             system_prompt_file: None,
             api_keys: ApiKeys::default(),
+            compaction: None,
         };
 
         default_config.save()?;
@@ -120,6 +136,10 @@ impl Config {
             "anthropic" => "ANTHROPIC_API_KEY",
             "openai" => "OPENAI_API_KEY",
             "google" => "GOOGLE_API_KEY",
+            "groq" => "GROQ_API_KEY",
+            "cerebras" => "CEREBRAS_API_KEY",
+            "xai" => "XAI_API_KEY",
+            "openrouter" => "OPENROUTER_API_KEY",
             _ => return None,
         };
 
@@ -175,5 +195,11 @@ tui = true
 # anthropic = "sk-ant-..."
 # openai = "sk-..."
 # google = "..."
+
+# Context compaction settings (optional)
+# [compaction]
+# enabled = true
+# reserve_tokens = 16384
+# keep_recent_tokens = 20000
 "#
 }

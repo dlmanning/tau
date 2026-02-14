@@ -153,20 +153,18 @@ impl TuiState {
             AgentEvent::ToolExecutionStart { tool_name, .. } => {
                 self.status = format!("Running {}...", tool_name);
             }
+            AgentEvent::ToolExecutionUpdate {
+                tool_name, content, ..
+            } => {
+                self.status = format!("{}: {}", tool_name, content);
+            }
             AgentEvent::ToolExecutionEnd {
                 tool_name,
                 result,
                 is_error,
                 ..
             } => {
-                // Use chars for proper Unicode handling
-                let result_chars: Vec<char> = result.chars().collect();
-                let preview = if result_chars.len() > 200 {
-                    let truncated: String = result_chars[..200].iter().collect();
-                    format!("{}...", truncated)
-                } else {
-                    result
-                };
+                let preview = crate::utils::truncate_chars(&result, 200);
                 self.messages
                     .push(ChatMessage::tool(&tool_name, preview, is_error));
                 self.scroll_to_bottom();
@@ -194,8 +192,36 @@ impl TuiState {
                     is_streaming: false,
                 });
             }
+            AgentEvent::CompactionStart { reason } => {
+                self.status = format!("Compacting context ({})...", crate::utils::compaction_reason_str(reason));
+            }
+            AgentEvent::CompactionEnd {
+                tokens_before,
+                tokens_after,
+            } => {
+                self.messages.push(ChatMessage::system(
+                    &format!(
+                        "Context compacted: ~{} -> ~{} tokens",
+                        tokens_before, tokens_after
+                    ),
+                ));
+                self.scroll_to_bottom();
+            }
             // Ignore turn/message start events (we handle updates/ends)
             AgentEvent::TurnStart { .. } | AgentEvent::MessageStart { .. } => {}
+        }
+    }
+
+    /// Handle mouse scroll events.
+    fn handle_mouse_scroll(&mut self, kind: MouseEventKind) {
+        match kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_add(3);
+            }
+            _ => {}
         }
     }
 
@@ -415,14 +441,7 @@ impl TuiState {
             .iter()
             .enumerate()
             .map(|(i, msg)| {
-                // Truncate content for display
-                let content_chars: Vec<char> = msg.content.chars().collect();
-                let preview = if content_chars.len() > 50 {
-                    let truncated: String = content_chars[..50].iter().collect();
-                    format!("{}...", truncated)
-                } else {
-                    msg.content.clone()
-                };
+                let preview = crate::utils::truncate_chars(&msg.content, 50);
                 // Replace newlines with spaces for single-line display
                 let preview = preview.replace('\n', " ");
                 OwnedSelectorItem {
@@ -670,7 +689,7 @@ pub async fn run_tui(
                     // Poll the prompt future
                     result = &mut prompt_future => {
                         if let Err(e) = result {
-                            state.handle_agent_event(AgentEvent::Error { message: e });
+                            state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
                         }
                         break; // Exit inner loop, prompt is done
                     }
@@ -711,15 +730,7 @@ pub async fn run_tui(
                                 state.input.handle_action(&Action::Paste(text), area_width);
                             }
                             Some(Ok(Event::Mouse(mouse))) => {
-                                match mouse.kind {
-                                    MouseEventKind::ScrollUp => {
-                                        state.scroll = state.scroll.saturating_sub(3);
-                                    }
-                                    MouseEventKind::ScrollDown => {
-                                        state.scroll = state.scroll.saturating_add(3);
-                                    }
-                                    _ => {}
-                                }
+                                state.handle_mouse_scroll(mouse.kind);
                             }
                             Some(Ok(Event::Resize(_, _))) => {}
                             Some(Err(_)) | None => {
@@ -777,15 +788,7 @@ pub async fn run_tui(
                         state.handle_action(Action::Paste(text), area_width).await;
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                state.scroll = state.scroll.saturating_sub(3);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                state.scroll = state.scroll.saturating_add(3);
-                            }
-                            _ => {}
-                        }
+                        state.handle_mouse_scroll(mouse.kind);
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Err(e)) => {
@@ -846,6 +849,20 @@ pub async fn run_tui(
                                 CommandResult::OpenBranchSelector => {
                                     // Open the branch selector popup
                                     state.open_branch_selector();
+                                }
+                                CommandResult::Compact => {
+                                    state.show_system_message("Compacting context...");
+                                    match agent.run_compaction(tau_agent::CompactionReason::Manual).await {
+                                        Ok(()) => {
+                                            state.show_system_message(&format!(
+                                                "Context compacted. {} messages remaining.",
+                                                agent.messages().len()
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            state.show_system_message(&format!("Compaction failed: {}", e));
+                                        }
+                                    }
                                 }
                                 CommandResult::BranchFrom(branch_index) => {
                                     // Create branch directly (CLI mode or with index)
