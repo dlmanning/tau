@@ -4,6 +4,8 @@
 //! including Anthropic, OpenAI, and Google.
 
 pub mod error;
+pub mod models;
+mod models_generated;
 pub mod providers;
 pub mod stream;
 pub mod types;
