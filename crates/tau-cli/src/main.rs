@@ -281,15 +281,24 @@ async fn main() -> anyhow::Result<()> {
         tau_agent::CompactionConfig::default()
     };
 
+    let thinking_adaptive = cfg.thinking_adaptive.unwrap_or(false);
+    let cache_scope = cfg.cache.as_ref().and_then(|c| c.scope.clone());
+    let cache_ttl = cfg.cache.as_ref().and_then(|c| c.ttl.clone());
+    let system_prompt_boundary = cfg.cache.as_ref().and_then(|c| c.prompt_boundary.clone());
+
     // Create agent with initial config (no system prompt yet)
     let config = AgentConfig {
         system_prompt: None,
         model: model.clone(),
         reasoning,
+        thinking_adaptive,
         max_tokens: None,
         compaction,
         steering_mode: tau_agent::DequeueMode::All,
         follow_up_mode: tau_agent::DequeueMode::All,
+        cache_scope,
+        cache_ttl,
+        system_prompt_boundary,
     };
     let mut agent = Agent::new(config, transport);
 

@@ -529,8 +529,12 @@ async fn call_summarization_llm(
         tools: vec![],
         model: agent_config.model.clone(),
         reasoning: None, // No reasoning for summarization
+        thinking_adaptive: false,
         max_tokens: Some(4096),
         temperature: None,
+        cache_scope: None,
+        cache_ttl: None,
+        system_prompt_boundary: None,
     };
 
     let user_message = Message::user(prompt);

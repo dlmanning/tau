@@ -14,6 +14,8 @@ pub struct Config {
     pub provider: Option<String>,
     /// Default reasoning level
     pub reasoning_level: Option<String>,
+    /// Use adaptive thinking (model decides when to think)
+    pub thinking_adaptive: Option<bool>,
     /// Whether to use TUI mode by default
     pub tui: Option<bool>,
     /// Custom system prompt file path
@@ -24,6 +26,21 @@ pub struct Config {
     /// Compaction settings
     #[serde(default)]
     pub compaction: Option<CompactionSettings>,
+    /// Cache settings
+    #[serde(default)]
+    pub cache: Option<CacheSettings>,
+}
+
+/// Settings for prompt caching
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheSettings {
+    /// Cache scope: "global" or "org"
+    pub scope: Option<String>,
+    /// Cache TTL: "1h" or "5m"
+    pub ttl: Option<String>,
+    /// Dynamic boundary marker for system prompt splitting
+    pub prompt_boundary: Option<String>,
 }
 
 /// Settings for context compaction
@@ -115,10 +132,12 @@ impl Config {
             model: Some("claude-sonnet-4-5-20250929".to_string()),
             provider: Some("anthropic".to_string()),
             reasoning_level: Some("off".to_string()),
+            thinking_adaptive: None,
             tui: Some(true),
             system_prompt_file: None,
             api_keys: ApiKeys::default(),
             compaction: None,
+            cache: None,
         };
 
         default_config.save()?;

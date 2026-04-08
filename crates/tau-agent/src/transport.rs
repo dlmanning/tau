@@ -48,16 +48,53 @@ impl RetryConfig {
 async fn create_provider_and_stream(
     model: &Model,
     context: &Context,
+    config: &AgentRunConfig,
     api_key: Option<&str>,
 ) -> Result<tau_ai::stream::MessageEventStream> {
     match model.api {
         tau_ai::Api::AnthropicMessages => {
+            use tau_ai::providers::anthropic::{AnthropicOptions, AnthropicProvider, CacheScope};
+
             let provider = if let Some(key) = api_key {
-                tau_ai::providers::anthropic::AnthropicProvider::new(key.to_string())
+                AnthropicProvider::new(key.to_string())
             } else {
-                tau_ai::providers::anthropic::AnthropicProvider::from_env()?
+                AnthropicProvider::from_env()?
             };
-            provider.stream(model, context, None).await
+
+            let reasoning = config.reasoning.unwrap_or_default();
+            let thinking_enabled = reasoning != tau_ai::ReasoningLevel::Off;
+
+            let budget = match reasoning {
+                tau_ai::ReasoningLevel::Off => None,
+                tau_ai::ReasoningLevel::Minimal => Some(1024),
+                tau_ai::ReasoningLevel::Low => Some(4096),
+                tau_ai::ReasoningLevel::Medium => Some(10000),
+                tau_ai::ReasoningLevel::High => Some(32000),
+            };
+
+            let cache_scope = config.cache_scope.as_deref().and_then(|s| match s {
+                "global" => Some(CacheScope::Global),
+                "org" => Some(CacheScope::Org),
+                _ => None,
+            });
+
+            let options = AnthropicOptions {
+                base: tau_ai::StreamOptions {
+                    max_tokens: config.max_tokens,
+                    temperature: config.temperature,
+                    reasoning: config.reasoning,
+                    stop_sequences: vec![],
+                },
+                thinking_enabled,
+                thinking_adaptive: config.thinking_adaptive,
+                thinking_budget_tokens: budget,
+                tool_choice: None,
+                cache_scope,
+                cache_ttl: config.cache_ttl.clone(),
+                system_prompt_boundary: config.system_prompt_boundary.clone(),
+            };
+
+            provider.stream(model, context, Some(&options)).await
         }
         tau_ai::Api::OpenAICompletions | tau_ai::Api::OpenAIResponses => {
             let provider = if let Some(key) = api_key {
@@ -181,10 +218,18 @@ pub struct AgentRunConfig {
     pub model: Model,
     /// Reasoning/thinking level
     pub reasoning: Option<tau_ai::ReasoningLevel>,
+    /// Use adaptive thinking (model decides when to think)
+    pub thinking_adaptive: bool,
     /// Maximum tokens per response
     pub max_tokens: Option<u32>,
     /// Temperature
     pub temperature: Option<f32>,
+    /// Cache scope for prompt caching
+    pub cache_scope: Option<String>,
+    /// Cache TTL (e.g. "1h")
+    pub cache_ttl: Option<String>,
+    /// Dynamic boundary marker for system prompt splitting
+    pub system_prompt_boundary: Option<String>,
 }
 
 /// A stream of agent events
@@ -254,6 +299,7 @@ impl Transport for ProviderTransport {
 
         // Get the appropriate provider and stream
         let model = config.model.clone();
+        let run_config = config.clone();
         let api_key = self.api_key.clone();
         let retry_config = self.retry_config.clone();
 
@@ -270,7 +316,7 @@ impl Transport for ProviderTransport {
                     return;
                 }
 
-                match create_provider_and_stream(&model, &context, api_key.as_deref()).await {
+                match create_provider_and_stream(&model, &context, &run_config, api_key.as_deref()).await {
                     Ok(s) => {
                         message_stream = s;
                         break;

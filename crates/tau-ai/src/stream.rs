@@ -27,6 +27,7 @@ pub enum MessageEvent {
     ThinkingEnd {
         content_index: usize,
         thinking: String,
+        signature: Option<String>,
     },
     /// Tool call started
     ToolCallStart {
@@ -84,7 +85,10 @@ pub struct MessageBuilder {
 #[derive(Debug)]
 enum ContentBuffer {
     Text(String),
-    Thinking(String),
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -127,13 +131,19 @@ impl MessageBuilder {
                 }
             }
             MessageEvent::ThinkingStart { content_index } => {
-                self.ensure_buffer(*content_index, ContentBuffer::Thinking(String::new()));
+                self.ensure_buffer(
+                    *content_index,
+                    ContentBuffer::Thinking {
+                        text: String::new(),
+                        signature: None,
+                    },
+                );
             }
             MessageEvent::ThinkingDelta {
                 content_index,
                 delta,
             } => {
-                if let Some(ContentBuffer::Thinking(thinking)) =
+                if let Some(ContentBuffer::Thinking { text: thinking, .. }) =
                     self.content_buffers.get_mut(*content_index)
                 {
                     thinking.push_str(delta);
@@ -142,10 +152,23 @@ impl MessageBuilder {
             MessageEvent::ThinkingEnd {
                 content_index,
                 thinking,
+                signature,
             } => {
                 if *content_index < self.content_buffers.len() {
-                    self.content_buffers[*content_index] =
-                        ContentBuffer::Thinking(thinking.clone());
+                    // Use signature from event; fall back to any accumulated via deltas
+                    let sig = signature.clone().or_else(|| {
+                        if let ContentBuffer::Thinking { signature: s, .. } =
+                            &self.content_buffers[*content_index]
+                        {
+                            s.clone()
+                        } else {
+                            None
+                        }
+                    });
+                    self.content_buffers[*content_index] = ContentBuffer::Thinking {
+                        text: thinking.clone(),
+                        signature: sig,
+                    };
                 }
             }
             MessageEvent::ToolCallStart {
@@ -203,9 +226,9 @@ impl MessageBuilder {
             .into_iter()
             .map(|buf| match buf {
                 ContentBuffer::Text(text) => Content::Text { text },
-                ContentBuffer::Thinking(thinking) => Content::Thinking {
-                    thinking,
-                    signature: None,
+                ContentBuffer::Thinking { text, signature } => Content::Thinking {
+                    thinking: text,
+                    signature,
                 },
                 ContentBuffer::ToolCall {
                     id,
@@ -240,9 +263,9 @@ impl MessageBuilder {
             .iter()
             .map(|buf| match buf {
                 ContentBuffer::Text(text) => Content::Text { text: text.clone() },
-                ContentBuffer::Thinking(thinking) => Content::Thinking {
-                    thinking: thinking.clone(),
-                    signature: None,
+                ContentBuffer::Thinking { text, signature } => Content::Thinking {
+                    thinking: text.clone(),
+                    signature: signature.clone(),
                 },
                 ContentBuffer::ToolCall {
                     id,

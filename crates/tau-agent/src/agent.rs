@@ -35,6 +35,8 @@ pub struct AgentConfig {
     pub model: Model,
     /// Reasoning/thinking level
     pub reasoning: ReasoningLevel,
+    /// Use adaptive thinking (model decides when to think)
+    pub thinking_adaptive: bool,
     /// Maximum tokens per response
     pub max_tokens: Option<u32>,
     /// Context compaction configuration
@@ -43,6 +45,12 @@ pub struct AgentConfig {
     pub steering_mode: DequeueMode,
     /// How to drain the follow-up queue
     pub follow_up_mode: DequeueMode,
+    /// Cache scope for prompt caching ("global" or "org")
+    pub cache_scope: Option<String>,
+    /// Cache TTL (e.g. "1h")
+    pub cache_ttl: Option<String>,
+    /// Dynamic boundary marker for system prompt splitting
+    pub system_prompt_boundary: Option<String>,
 }
 
 // Re-export types that were moved to their own modules so existing
@@ -360,8 +368,12 @@ impl Agent {
             tools: self.tools.iter().map(|t| to_api_tool(t.as_ref())).collect(),
             model: self.config.model.clone(),
             reasoning: Some(self.config.reasoning),
+            thinking_adaptive: self.config.thinking_adaptive,
             max_tokens: self.config.max_tokens,
             temperature: None,
+            cache_scope: self.config.cache_scope.clone(),
+            cache_ttl: self.config.cache_ttl.clone(),
+            system_prompt_boundary: self.config.system_prompt_boundary.clone(),
         }
     }
 
@@ -988,10 +1000,14 @@ mod tests {
                 headers: Default::default(),
             },
             reasoning: tau_ai::ReasoningLevel::Off,
+            thinking_adaptive: false,
             max_tokens: None,
             compaction: CompactionConfig::default(),
             steering_mode: DequeueMode::All,
             follow_up_mode: DequeueMode::All,
+            cache_scope: None,
+            cache_ttl: None,
+            system_prompt_boundary: None,
         };
         Agent::new(config, transport)
     }

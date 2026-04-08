@@ -7,9 +7,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Error, Result},
+    messages::ensure_tool_result_pairing,
     stream::{MessageEvent, MessageEventStream},
     types::{Api, Content, Context, Message, Model, StopReason, StreamOptions, Tool, Usage},
 };
+
+/// Cache scope for prompt caching
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    /// Global scope — shared across all users/orgs (1P only)
+    Global,
+    /// Org scope — shared within an organization
+    Org,
+}
 
 /// Anthropic-specific streaming options
 #[derive(Debug, Clone, Default)]
@@ -18,10 +29,18 @@ pub struct AnthropicOptions {
     pub base: StreamOptions,
     /// Enable extended thinking
     pub thinking_enabled: bool,
-    /// Budget for thinking tokens
+    /// Use adaptive thinking (model decides when to think)
+    pub thinking_adaptive: bool,
+    /// Budget for thinking tokens (used when not adaptive)
     pub thinking_budget_tokens: Option<u32>,
     /// Tool choice strategy
     pub tool_choice: Option<ToolChoice>,
+    /// Cache scope for prompt caching breakpoints
+    pub cache_scope: Option<CacheScope>,
+    /// Cache TTL (e.g. "1h", "5m")
+    pub cache_ttl: Option<String>,
+    /// Dynamic boundary marker for system prompt splitting
+    pub system_prompt_boundary: Option<String>,
 }
 
 /// Tool choice strategy
@@ -38,6 +57,15 @@ pub enum ToolChoice {
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
+}
+
+/// Build a CacheControl with the given scope and TTL options
+fn make_cache_control(scope: &Option<CacheScope>, ttl: &Option<String>) -> CacheControl {
+    CacheControl {
+        control_type: "ephemeral".to_string(),
+        scope: scope.clone(),
+        ttl: ttl.clone(),
+    }
 }
 
 impl AnthropicProvider {
@@ -73,16 +101,20 @@ impl AnthropicProvider {
         let is_oauth = self.api_key.contains("sk-ant-oat");
         let mut headers = reqwest::header::HeaderMap::new();
 
+        // Build beta headers based on features in use
+        let mut betas = vec!["fine-grained-tool-streaming-2025-05-14"];
+        if opts.thinking_enabled {
+            betas.push("interleaved-thinking-2025-05-14");
+        }
+        if matches!(opts.cache_scope, Some(CacheScope::Global)) {
+            betas.push("prompt-caching-scope-2026-01-05");
+        }
+
         if is_oauth {
+            betas.insert(0, "oauth-2025-04-20");
             headers.insert(
                 "Authorization",
                 format!("Bearer {}", self.api_key).parse().unwrap(),
-            );
-            headers.insert(
-                "anthropic-beta",
-                "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
-                    .parse()
-                    .unwrap(),
             );
             headers.insert(
                 "anthropic-dangerous-direct-browser-access",
@@ -90,11 +122,8 @@ impl AnthropicProvider {
             );
         } else {
             headers.insert("x-api-key", self.api_key.parse().unwrap());
-            headers.insert(
-                "anthropic-beta",
-                "fine-grained-tool-streaming-2025-05-14".parse().unwrap(),
-            );
         }
+        headers.insert("anthropic-beta", betas.join(",").parse().unwrap());
         headers.insert("accept", "application/json".parse().unwrap());
         headers.insert("content-type", "application/json".parse().unwrap());
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
@@ -138,25 +167,58 @@ impl AnthropicProvider {
         options: &AnthropicOptions,
     ) -> Result<AnthropicRequest> {
         let is_oauth = self.api_key.contains("sk-ant-oat");
-        // Anthropic allows max 4 cache_control breakpoints total.
-        // Allocate: system prompt (1-2), last tool definition (1), remaining for messages.
-        let system_cache_blocks: usize = if is_oauth {
-            if context.system_prompt.is_some() {
-                2
-            } else {
-                1
-            }
-        } else if context.system_prompt.is_some() {
-            1
-        } else {
-            0
-        };
         let has_tools = !context.tools.is_empty();
+
+        // Build system blocks first so we can count cache breakpoints accurately.
+        let cache = || make_cache_control(&options.cache_scope, &options.cache_ttl);
+        let system_blocks: Option<Vec<SystemBlock>> = if is_oauth {
+            let mut blocks = vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                cache_control: Some(cache()),
+            }];
+            if let Some(ref system_prompt) = context.system_prompt {
+                blocks.extend(split_system_prompt(
+                    system_prompt,
+                    options.system_prompt_boundary.as_deref(),
+                    &options.cache_scope,
+                    &options.cache_ttl,
+                ));
+            }
+            Some(blocks)
+        } else {
+            context.system_prompt.as_ref().map(|sp| {
+                split_system_prompt(
+                    sp,
+                    options.system_prompt_boundary.as_deref(),
+                    &options.cache_scope,
+                    &options.cache_ttl,
+                )
+            })
+        };
+
+        // Count actual cache_control breakpoints in system blocks
+        let system_cache_blocks = system_blocks
+            .as_ref()
+            .map(|blocks| blocks.iter().filter(|b| b.cache_control.is_some()).count())
+            .unwrap_or(0);
         let tool_cache_blocks: usize = if has_tools { 1 } else { 0 };
+
+        // Anthropic allows max 4 cache_control breakpoints total per request.
         let message_cache_budget = 4_usize.saturating_sub(system_cache_blocks + tool_cache_blocks);
-        let messages = convert_messages(&context.messages, message_cache_budget);
+        let messages = convert_messages(
+            &context.messages,
+            message_cache_budget,
+            &options.cache_scope,
+            &options.cache_ttl,
+        );
         let tools = if has_tools {
-            Some(convert_tools(&context.tools, true))
+            Some(convert_tools(
+                &context.tools,
+                true,
+                &options.cache_scope,
+                &options.cache_ttl,
+            ))
         } else {
             None
         };
@@ -168,47 +230,24 @@ impl AnthropicProvider {
             messages,
             max_tokens,
             stream: true,
-            system: None,
+            system: system_blocks,
             temperature: options.base.temperature,
             tools,
             tool_choice: options.tool_choice.clone(),
             thinking: None,
         };
 
-        // Set system prompt - OAuth tokens MUST include Claude Code identity
-        if is_oauth {
-            let mut system_blocks = vec![SystemBlock {
-                block_type: "text".to_string(),
-                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-                cache_control: Some(CacheControl {
-                    control_type: "ephemeral".to_string(),
-                }),
-            }];
-            if let Some(ref system_prompt) = context.system_prompt {
-                system_blocks.push(SystemBlock {
-                    block_type: "text".to_string(),
-                    text: system_prompt.clone(),
-                    cache_control: Some(CacheControl {
-                        control_type: "ephemeral".to_string(),
-                    }),
-                });
-            }
-            request.system = Some(system_blocks);
-        } else if let Some(ref system_prompt) = context.system_prompt {
-            request.system = Some(vec![SystemBlock {
-                block_type: "text".to_string(),
-                text: system_prompt.clone(),
-                cache_control: Some(CacheControl {
-                    control_type: "ephemeral".to_string(),
-                }),
-            }]);
-        }
-
         // Enable thinking if requested
         if options.thinking_enabled && model.reasoning {
-            request.thinking = Some(ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: options.thinking_budget_tokens.unwrap_or(1024),
+            request.thinking = Some(if options.thinking_adaptive {
+                ThinkingConfig::Adaptive {
+                    thinking_type: "adaptive".to_string(),
+                }
+            } else {
+                ThinkingConfig::Enabled {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: options.thinking_budget_tokens.unwrap_or(1024),
+                }
             });
         }
 
@@ -317,6 +356,15 @@ fn create_stream(
                                             };
                                         }
                                     }
+                                    "signature_delta" => {
+                                        if let ContentBlock::Thinking { ref mut signature, .. } = content_blocks[index] {
+                                            let sig = data.delta.signature.unwrap_or_default();
+                                            match signature {
+                                                Some(s) => s.push_str(&sig),
+                                                None => *signature = Some(sig),
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -342,10 +390,11 @@ fn create_stream(
                                             text: text.clone(),
                                         };
                                     }
-                                    ContentBlock::Thinking { thinking, .. } => {
+                                    ContentBlock::Thinking { thinking, signature } => {
                                         yield MessageEvent::ThinkingEnd {
                                             content_index: index,
                                             thinking: thinking.clone(),
+                                            signature: signature.clone(),
                                         };
                                     }
                                     ContentBlock::ToolCall { id, name, arguments_json } => {
@@ -485,17 +534,28 @@ struct SystemBlock {
     cache_control: Option<CacheControl>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CacheControl {
     #[serde(rename = "type")]
     control_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<CacheScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct ThinkingConfig {
-    #[serde(rename = "type")]
-    thinking_type: String,
-    budget_tokens: u32,
+#[serde(untagged)]
+enum ThinkingConfig {
+    Adaptive {
+        #[serde(rename = "type")]
+        thinking_type: String,
+    },
+    Enabled {
+        #[serde(rename = "type")]
+        thinking_type: String,
+        budget_tokens: u32,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -565,6 +625,7 @@ struct DeltaInfo {
     text: Option<String>,
     thinking: Option<String>,
     partial_json: Option<String>,
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -609,10 +670,66 @@ struct ApiError {
 // Conversion functions
 // ============================================================================
 
-fn convert_messages(messages: &[Message], cache_breakpoint_budget: usize) -> Vec<AnthropicMessage> {
+/// Split a system prompt at a dynamic boundary marker.
+///
+/// When a boundary is found and the caller opted into global caching (`cache_scope: Global`),
+/// the static content before the boundary gets global scope and the dynamic content after
+/// gets no caching. Without global scope, the static part uses the caller's scope.
+///
+/// Returns at least one block as long as the prompt is non-empty.
+fn split_system_prompt(
+    prompt: &str,
+    boundary: Option<&str>,
+    scope: &Option<CacheScope>,
+    ttl: &Option<String>,
+) -> Vec<SystemBlock> {
+    if let Some(marker) = boundary {
+        if let Some(pos) = prompt.find(marker) {
+            let static_part = prompt[..pos].trim();
+            let dynamic_part = prompt[pos + marker.len()..].trim();
+            let mut blocks = vec![];
+            if !static_part.is_empty() {
+                // Static part gets the caller's scope (Global if they opted in, Org otherwise)
+                blocks.push(SystemBlock {
+                    block_type: "text".to_string(),
+                    text: static_part.to_string(),
+                    cache_control: Some(make_cache_control(scope, ttl)),
+                });
+            }
+            if !dynamic_part.is_empty() {
+                blocks.push(SystemBlock {
+                    block_type: "text".to_string(),
+                    text: dynamic_part.to_string(),
+                    cache_control: None,
+                });
+            }
+            // Fix issue 2: if boundary splits produced empty parts, fall through
+            if !blocks.is_empty() {
+                return blocks;
+            }
+        }
+    }
+    // No boundary, not found, or both parts empty — single block with configured scope
+    vec![SystemBlock {
+        block_type: "text".to_string(),
+        text: prompt.to_string(),
+        cache_control: Some(make_cache_control(scope, ttl)),
+    }]
+}
+
+fn convert_messages(
+    messages: &[Message],
+    cache_breakpoint_budget: usize,
+    cache_scope: &Option<CacheScope>,
+    cache_ttl: &Option<String>,
+) -> Vec<AnthropicMessage> {
+    // Repair tool_use/tool_result pairing before conversion
+    let mut messages = messages.to_vec();
+    ensure_tool_result_pairing(&mut messages);
+
     let mut result = vec![];
 
-    for message in messages {
+    for message in &messages {
         match message {
             Message::User { content, .. } => {
                 let blocks: Vec<serde_json::Value> = content
@@ -738,7 +855,14 @@ fn convert_messages(messages: &[Message], cache_breakpoint_budget: usize) -> Vec
                     .iter()
                     .rposition(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking"))
                 {
-                    blocks[last_idx]["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                    let mut cc = serde_json::json!({"type": "ephemeral"});
+                    if let Some(scope) = cache_scope {
+                        cc["scope"] = serde_json::to_value(scope).unwrap();
+                    }
+                    if let Some(ttl) = cache_ttl {
+                        cc["ttl"] = serde_json::json!(ttl);
+                    }
+                    blocks[last_idx]["cache_control"] = cc;
                 }
             }
         }
@@ -747,7 +871,12 @@ fn convert_messages(messages: &[Message], cache_breakpoint_budget: usize) -> Vec
     consolidated
 }
 
-fn convert_tools(tools: &[Tool], cache_last: bool) -> Vec<AnthropicTool> {
+fn convert_tools(
+    tools: &[Tool],
+    cache_last: bool,
+    cache_scope: &Option<CacheScope>,
+    cache_ttl: &Option<String>,
+) -> Vec<AnthropicTool> {
     let len = tools.len();
     tools
         .iter()
@@ -770,9 +899,7 @@ fn convert_tools(tools: &[Tool], cache_last: bool) -> Vec<AnthropicTool> {
             // Place cache_control on the last tool definition.
             // This creates a cache prefix covering system prompt + all tools.
             let cache_control = if cache_last && i == len - 1 {
-                Some(CacheControl {
-                    control_type: "ephemeral".to_string(),
-                })
+                Some(make_cache_control(cache_scope, cache_ttl))
             } else {
                 None
             };
@@ -810,4 +937,158 @@ pub async fn stream_anthropic(
     let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| Error::InvalidApiKey)?;
     let provider = AnthropicProvider::new(api_key);
     provider.stream(model, context, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue 8: Verify CacheScope serialization
+    #[test]
+    fn test_cache_scope_serialization() {
+        assert_eq!(
+            serde_json::to_value(CacheScope::Global).unwrap(),
+            serde_json::json!("global")
+        );
+        assert_eq!(
+            serde_json::to_value(CacheScope::Org).unwrap(),
+            serde_json::json!("org")
+        );
+    }
+
+    #[test]
+    fn test_cache_control_serialization_minimal() {
+        let cc = CacheControl {
+            control_type: "ephemeral".to_string(),
+            scope: None,
+            ttl: None,
+        };
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "ephemeral"}));
+        assert!(json.get("scope").is_none());
+        assert!(json.get("ttl").is_none());
+    }
+
+    #[test]
+    fn test_cache_control_serialization_full() {
+        let cc = CacheControl {
+            control_type: "ephemeral".to_string(),
+            scope: Some(CacheScope::Global),
+            ttl: Some("1h".to_string()),
+        };
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "ephemeral", "scope": "global", "ttl": "1h"})
+        );
+    }
+
+    // Issue 9: Verify ThinkingConfig serialization for both variants
+    #[test]
+    fn test_thinking_config_adaptive_serialization() {
+        let config = ThinkingConfig::Adaptive {
+            thinking_type: "adaptive".to_string(),
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "adaptive"}));
+        assert!(json.get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn test_thinking_config_enabled_serialization() {
+        let config = ThinkingConfig::Enabled {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 4096,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "enabled", "budget_tokens": 4096})
+        );
+    }
+
+    // Issue 7: Verify split_system_prompt behavior
+    #[test]
+    fn test_split_system_prompt_no_boundary() {
+        let blocks = split_system_prompt("Hello world", None, &None, &None);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Hello world");
+        assert!(blocks[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn test_split_system_prompt_boundary_not_found() {
+        let blocks = split_system_prompt(
+            "Hello world",
+            Some("<!-- BOUNDARY -->"),
+            &Some(CacheScope::Org),
+            &None,
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Hello world");
+    }
+
+    #[test]
+    fn test_split_system_prompt_boundary_splits() {
+        let prompt = "Static part<!-- BOUNDARY -->Dynamic part";
+        let blocks = split_system_prompt(
+            prompt,
+            Some("<!-- BOUNDARY -->"),
+            &Some(CacheScope::Global),
+            &Some("1h".to_string()),
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "Static part");
+        assert!(blocks[0].cache_control.is_some());
+        let cc = blocks[0].cache_control.as_ref().unwrap();
+        assert!(matches!(cc.scope, Some(CacheScope::Global)));
+        assert_eq!(cc.ttl.as_deref(), Some("1h"));
+        assert_eq!(blocks[1].text, "Dynamic part");
+        assert!(blocks[1].cache_control.is_none());
+    }
+
+    #[test]
+    fn test_split_system_prompt_respects_caller_scope() {
+        // Issue 1 fix: static part should use caller's scope, not hardcode Global
+        let prompt = "Static<!-- B -->Dynamic";
+        let blocks = split_system_prompt(
+            prompt,
+            Some("<!-- B -->"),
+            &Some(CacheScope::Org),
+            &None,
+        );
+        assert_eq!(blocks.len(), 2);
+        let cc = blocks[0].cache_control.as_ref().unwrap();
+        assert!(matches!(cc.scope, Some(CacheScope::Org)));
+    }
+
+    #[test]
+    fn test_split_system_prompt_boundary_at_edges() {
+        // Issue 2 fix: boundary at start — empty static part, should still produce a block
+        let prompt = "<!-- B -->Dynamic only";
+        let blocks =
+            split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Dynamic only");
+        assert!(blocks[0].cache_control.is_none());
+
+        // boundary at end — empty dynamic part
+        let prompt = "Static only<!-- B -->";
+        let blocks =
+            split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Static only");
+        assert!(blocks[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn test_split_system_prompt_boundary_is_entire_prompt() {
+        // Issue 2 fix: if prompt IS the boundary, both parts empty → fallback to single block
+        let prompt = "<!-- B -->";
+        let blocks =
+            split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "<!-- B -->");
+        assert!(blocks[0].cache_control.is_some());
+    }
 }

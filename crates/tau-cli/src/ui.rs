@@ -23,6 +23,15 @@ use tau_tui::{
 };
 use tokio::sync::mpsc;
 
+/// Format a token count compactly (e.g. 1234 → "1.2k", 56 → "56")
+fn format_tokens(n: u32) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Messages sent from UI to agent handler
 #[derive(Debug)]
 pub enum UiMessage {
@@ -59,8 +68,14 @@ pub struct TuiState {
     /// Total tokens used
     total_input_tokens: u32,
     total_output_tokens: u32,
+    total_cache_read: u32,
+    total_cache_write: u32,
     /// Model for cost calculation
     model: Model,
+    /// Current reasoning level
+    reasoning: tau_ai::ReasoningLevel,
+    /// Whether adaptive thinking is enabled
+    thinking_adaptive: bool,
     /// Available models for selection
     available_models: Vec<Model>,
     /// Total cost
@@ -76,7 +91,13 @@ pub struct TuiState {
 }
 
 impl TuiState {
-    pub fn new(model: Model, available_models: Vec<Model>, ui_tx: mpsc::Sender<UiMessage>) -> Self {
+    pub fn new(
+        model: Model,
+        reasoning: tau_ai::ReasoningLevel,
+        thinking_adaptive: bool,
+        available_models: Vec<Model>,
+        ui_tx: mpsc::Sender<UiMessage>,
+    ) -> Self {
         let mut input = InputBox::new().with_placeholder("Type a message...");
         input.set_focused(true);
 
@@ -100,7 +121,11 @@ impl TuiState {
             theme: Theme::dark(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_write: 0,
             model,
+            reasoning,
+            thinking_adaptive,
             available_models,
             total_cost: 0.0,
             ui_tx,
@@ -172,14 +197,25 @@ impl TuiState {
             AgentEvent::TurnEnd { usage, .. } => {
                 self.total_input_tokens += usage.input;
                 self.total_output_tokens += usage.output;
+                self.total_cache_read += usage.cache_read;
+                self.total_cache_write += usage.cache_write;
                 let cost = usage.calculate_cost(&self.model);
                 self.total_cost += cost.total;
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_processing = false;
+                let cache_str = if self.total_cache_read > 0 || self.total_cache_write > 0 {
+                    format!(
+                        " | cache: {}r {}w",
+                        format_tokens(self.total_cache_read),
+                        format_tokens(self.total_cache_write),
+                    )
+                } else {
+                    String::new()
+                };
                 self.status = format!(
-                    "Ready | {} in, {} out | ${:.4}",
-                    self.total_input_tokens, self.total_output_tokens, self.total_cost
+                    "Ready | {} in, {} out{} | ${:.4}",
+                    self.total_input_tokens, self.total_output_tokens, cache_str, self.total_cost
                 );
             }
             AgentEvent::Error { message } => {
@@ -361,6 +397,8 @@ impl TuiState {
                 self.messages.clear();
                 self.total_input_tokens = 0;
                 self.total_output_tokens = 0;
+                self.total_cache_read = 0;
+                self.total_cache_write = 0;
                 self.total_cost = 0.0;
                 self.status = "Ready".to_string();
                 true
@@ -595,7 +633,22 @@ impl TuiState {
                 .split('/')
                 .next_back()
                 .unwrap_or(&self.model.id);
-            let left_content = format!("{} │ {}", model_name, self.status);
+            let reasoning_str = match self.reasoning {
+                tau_ai::ReasoningLevel::Off => "",
+                tau_ai::ReasoningLevel::Minimal => " │ thinking: minimal",
+                tau_ai::ReasoningLevel::Low => " │ thinking: low",
+                tau_ai::ReasoningLevel::Medium => " │ thinking: medium",
+                tau_ai::ReasoningLevel::High => " │ thinking: high",
+            };
+            let adaptive_str = if self.thinking_adaptive && self.reasoning != tau_ai::ReasoningLevel::Off {
+                " (adaptive)"
+            } else {
+                ""
+            };
+            let left_content = format!(
+                "{}{}{} │ {}",
+                model_name, reasoning_str, adaptive_str, self.status
+            );
             let right_content = "Ctrl+K: model │ Ctrl+L: clear │ Ctrl+C: quit";
 
             let left_width = left_content.chars().count();
@@ -648,7 +701,13 @@ pub async fn run_tui(
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(32);
 
     // Create state
-    let mut state = TuiState::new(model.clone(), available_models.to_vec(), ui_tx);
+    let mut state = TuiState::new(
+        model.clone(),
+        *reasoning,
+        agent.config().thinking_adaptive,
+        available_models.to_vec(),
+        ui_tx,
+    );
 
     // Subscribe to agent events
     let mut agent_rx = agent.subscribe();
@@ -825,6 +884,8 @@ pub async fn run_tui(
                                     state.messages.clear();
                                     state.total_input_tokens = 0;
                                     state.total_output_tokens = 0;
+                                    state.total_cache_read = 0;
+                                    state.total_cache_write = 0;
                                     state.total_cost = 0.0;
                                     state.status = "Cleared".to_string();
                                 }
@@ -837,6 +898,7 @@ pub async fn run_tui(
                                 CommandResult::ChangeReasoning(level) => {
                                     state.show_system_message(&format!("Reasoning: {:?}", level));
                                     *reasoning = level;
+                                    state.reasoning = level;
                                     agent.set_reasoning(level);
                                 }
                                 CommandResult::Exit => {
@@ -893,6 +955,8 @@ pub async fn run_tui(
                                             }
                                             state.total_input_tokens = 0;
                                             state.total_output_tokens = 0;
+                                            state.total_cache_read = 0;
+                                            state.total_cache_write = 0;
                                             state.total_cost = 0.0;
                                         }
                                         Err(e) => {
@@ -916,6 +980,8 @@ pub async fn run_tui(
                         state.messages.clear();
                         state.total_input_tokens = 0;
                         state.total_output_tokens = 0;
+                        state.total_cache_read = 0;
+                        state.total_cache_write = 0;
                         state.total_cost = 0.0;
                         state.status = "Cleared".to_string();
                     }
