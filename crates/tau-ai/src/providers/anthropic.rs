@@ -1,14 +1,15 @@
 //! Anthropic Claude API provider
 
+use async_stream::stream;
+use futures::StreamExt;
+use reqwest_eventsource::{Event, EventSource};
+use serde::{Deserialize, Serialize};
+
 use crate::{
     error::{Error, Result},
     stream::{MessageEvent, MessageEventStream},
     types::{Api, Content, Context, Message, Model, StopReason, StreamOptions, Tool, Usage},
 };
-use async_stream::stream;
-use futures::StreamExt;
-use reqwest_eventsource::{Event, EventSource};
-use serde::{Deserialize, Serialize};
 
 /// Anthropic-specific streaming options
 #[derive(Debug, Clone, Default)]
@@ -136,16 +137,31 @@ impl AnthropicProvider {
         context: &Context,
         options: &AnthropicOptions,
     ) -> Result<AnthropicRequest> {
-        let messages = convert_messages(&context.messages);
-        let tools = if context.tools.is_empty() {
-            None
+        let is_oauth = self.api_key.contains("sk-ant-oat");
+        // Anthropic allows max 4 cache_control breakpoints total.
+        // Allocate: system prompt (1-2), last tool definition (1), remaining for messages.
+        let system_cache_blocks: usize = if is_oauth {
+            if context.system_prompt.is_some() {
+                2
+            } else {
+                1
+            }
+        } else if context.system_prompt.is_some() {
+            1
         } else {
-            Some(convert_tools(&context.tools))
+            0
+        };
+        let has_tools = !context.tools.is_empty();
+        let tool_cache_blocks: usize = if has_tools { 1 } else { 0 };
+        let message_cache_budget = 4_usize.saturating_sub(system_cache_blocks + tool_cache_blocks);
+        let messages = convert_messages(&context.messages, message_cache_budget);
+        let tools = if has_tools {
+            Some(convert_tools(&context.tools, true))
+        } else {
+            None
         };
 
         let max_tokens = options.base.max_tokens.unwrap_or(model.max_tokens / 3);
-
-        let is_oauth = self.api_key.contains("sk-ant-oat");
 
         let mut request = AnthropicRequest {
             model: model.id.clone(),
@@ -245,6 +261,7 @@ fn create_stream(
                                 "thinking" => {
                                     content_blocks[index] = ContentBlock::Thinking {
                                         thinking: String::new(),
+                                        signature: None,
                                     };
                                     yield MessageEvent::ThinkingStart { content_index: index };
                                 }
@@ -281,7 +298,7 @@ fn create_stream(
                                         }
                                     }
                                     "thinking_delta" => {
-                                        if let ContentBlock::Thinking { ref mut thinking } = content_blocks[index] {
+                                        if let ContentBlock::Thinking { ref mut thinking, .. } = content_blocks[index] {
                                             let delta = data.delta.thinking.unwrap_or_default();
                                             thinking.push_str(&delta);
                                             yield MessageEvent::ThinkingDelta {
@@ -308,6 +325,16 @@ fn create_stream(
                         if let Ok(data) = serde_json::from_str::<ContentBlockStopEvent>(&message.data) {
                             let index = data.index as usize;
                             if index < content_blocks.len() {
+                                // Capture thinking signature from content_block_stop event
+                                let stop_signature = data.content_block
+                                    .as_ref()
+                                    .and_then(|cb| cb.signature.clone());
+                                if let (Some(sig), ContentBlock::Thinking { signature, .. }) =
+                                    (stop_signature, &mut content_blocks[index])
+                                {
+                                    *signature = Some(sig);
+                                }
+
                                 match &content_blocks[index] {
                                     ContentBlock::Text { text } => {
                                         yield MessageEvent::TextEnd {
@@ -315,7 +342,7 @@ fn create_stream(
                                             text: text.clone(),
                                         };
                                     }
-                                    ContentBlock::Thinking { thinking } => {
+                                    ContentBlock::Thinking { thinking, .. } => {
                                         yield MessageEvent::ThinkingEnd {
                                             content_index: index,
                                             thinking: thinking.clone(),
@@ -370,7 +397,7 @@ fn create_stream(
             .into_iter()
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(Content::Text { text }),
-                ContentBlock::Thinking { thinking } => Some(Content::Thinking { thinking }),
+                ContentBlock::Thinking { thinking, signature } => Some(Content::Thinking { thinking, signature }),
                 ContentBlock::ToolCall { id, name, arguments_json } => {
                     let arguments = serde_json::from_str(&arguments_json)
                         .unwrap_or(serde_json::Value::Null);
@@ -418,6 +445,7 @@ enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        signature: Option<String>,
     },
     ToolCall {
         id: String,
@@ -481,6 +509,8 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 // ============================================================================
@@ -540,6 +570,15 @@ struct DeltaInfo {
 #[derive(Debug, Deserialize)]
 struct ContentBlockStopEvent {
     index: u32,
+    /// Signature for thinking blocks (sent by Anthropic API on content_block_stop)
+    #[serde(default)]
+    content_block: Option<ContentBlockStopInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentBlockStopInfo {
+    /// Signature for thinking blocks
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,7 +609,7 @@ struct ApiError {
 // Conversion functions
 // ============================================================================
 
-fn convert_messages(messages: &[Message]) -> Vec<AnthropicMessage> {
+fn convert_messages(messages: &[Message], cache_breakpoint_budget: usize) -> Vec<AnthropicMessage> {
     let mut result = vec![];
 
     for message in messages {
@@ -608,12 +647,17 @@ fn convert_messages(messages: &[Message]) -> Vec<AnthropicMessage> {
                         Content::Text { text } => {
                             Some(serde_json::json!({ "type": "text", "text": text }))
                         }
-                        Content::Thinking { thinking } => {
-                            // Convert thinking to text block for compatibility
-                            Some(serde_json::json!({
-                                "type": "text",
-                                "text": format!("<thinking>\n{}\n</thinking>", thinking)
-                            }))
+                        Content::Thinking {
+                            thinking,
+                            signature,
+                            ..
+                        } => {
+                            let mut block =
+                                serde_json::json!({ "type": "thinking", "thinking": thinking });
+                            if let Some(sig) = signature {
+                                block["signature"] = serde_json::json!(sig);
+                            }
+                            Some(block)
                         }
                         Content::ToolCall {
                             id,
@@ -666,13 +710,49 @@ fn convert_messages(messages: &[Message]) -> Vec<AnthropicMessage> {
         }
     }
 
-    result
+    // Consolidate consecutive messages with the same role.
+    // This merges e.g. multiple tool_result user messages into one.
+    let mut consolidated: Vec<AnthropicMessage> = Vec::with_capacity(result.len());
+    for msg in result {
+        if let Some(last) = consolidated.last_mut() {
+            if last.role == msg.role {
+                if let serde_json::Value::Array(new_blocks) = msg.content {
+                    last.content.as_array_mut().unwrap().extend(new_blocks);
+                }
+                continue;
+            }
+        }
+        consolidated.push(msg);
+    }
+
+    // Add cache breakpoints to recent messages, respecting the budget.
+    // Anthropic allows max 4 cache_control blocks total per request;
+    // the budget accounts for system prompt blocks already used.
+    if cache_breakpoint_budget > 0 {
+        let total = consolidated.len();
+        let cache_zone_start = total.saturating_sub(cache_breakpoint_budget);
+        for msg in &mut consolidated[cache_zone_start..] {
+            if let serde_json::Value::Array(ref mut blocks) = msg.content {
+                // Find the last non-thinking block to add cache_control to
+                if let Some(last_idx) = blocks
+                    .iter()
+                    .rposition(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking"))
+                {
+                    blocks[last_idx]["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+            }
+        }
+    }
+
+    consolidated
 }
 
-fn convert_tools(tools: &[Tool]) -> Vec<AnthropicTool> {
+fn convert_tools(tools: &[Tool], cache_last: bool) -> Vec<AnthropicTool> {
+    let len = tools.len();
     tools
         .iter()
-        .map(|tool| {
+        .enumerate()
+        .map(|(i, tool)| {
             let input_schema = if tool.parameters.is_object() {
                 let mut schema = tool.parameters.clone();
                 if let Some(obj) = schema.as_object_mut() {
@@ -687,10 +767,21 @@ fn convert_tools(tools: &[Tool]) -> Vec<AnthropicTool> {
                 })
             };
 
+            // Place cache_control on the last tool definition.
+            // This creates a cache prefix covering system prompt + all tools.
+            let cache_control = if cache_last && i == len - 1 {
+                Some(CacheControl {
+                    control_type: "ephemeral".to_string(),
+                })
+            } else {
+                None
+            };
+
             AnthropicTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 input_schema,
+                cache_control,
             }
         })
         .collect()
