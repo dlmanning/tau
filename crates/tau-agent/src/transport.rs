@@ -35,6 +35,13 @@ impl Default for RetryConfig {
     }
 }
 
+/// Seconds of stream inactivity before logging a stall warning
+#[allow(dead_code)] // used inside stream! macro
+const STREAM_STALL_WARN_SECS: u64 = 30;
+/// Seconds of stream inactivity before aborting the stream
+#[allow(dead_code)] // used inside stream! macro
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+
 impl RetryConfig {
     /// Calculate delay for a given attempt (0-indexed)
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
@@ -284,6 +291,7 @@ impl Default for ProviderTransport {
 }
 
 #[async_trait]
+#[allow(unused_assignments)] // stall_warned inside stream! macro
 impl Transport for ProviderTransport {
     async fn run(
         &self,
@@ -358,12 +366,53 @@ impl Transport for ProviderTransport {
             let mut builder = MessageBuilder::new();
             let mut final_message = None;
             let mut final_usage = tau_ai::Usage::default();
+            let mut stall_warned = false;
+            let mut last_event_at = tokio::time::Instant::now();
 
-            while let Some(event) = message_stream.next().await {
+            loop {
                 if cancel.is_cancelled() {
                     yield AgentEvent::Error { message: "Cancelled".to_string() };
                     return;
                 }
+
+                // Try with stall-warn timeout first, then hard timeout
+                let stall_remaining = Duration::from_secs(STREAM_STALL_WARN_SECS)
+                    .saturating_sub(last_event_at.elapsed());
+                let idle_remaining = Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)
+                    .saturating_sub(last_event_at.elapsed());
+
+                if idle_remaining.is_zero() {
+                    tracing::error!("Stream idle for {}s, aborting", STREAM_IDLE_TIMEOUT_SECS);
+                    yield AgentEvent::Error {
+                        message: format!("Stream timed out after {}s of inactivity", STREAM_IDLE_TIMEOUT_SECS),
+                    };
+                    return;
+                }
+
+                if stall_remaining.is_zero() && !stall_warned {
+                    tracing::warn!("Stream stalled for {}s, waiting up to {}s before aborting",
+                        STREAM_STALL_WARN_SECS, STREAM_IDLE_TIMEOUT_SECS);
+                    stall_warned = true;
+                }
+
+                let event = match tokio::time::timeout(
+                    idle_remaining,
+                    message_stream.next(),
+                ).await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        tracing::error!("Stream idle for {}s, aborting", STREAM_IDLE_TIMEOUT_SECS);
+                        yield AgentEvent::Error {
+                            message: format!("Stream timed out after {}s of inactivity", STREAM_IDLE_TIMEOUT_SECS),
+                        };
+                        return;
+                    }
+                };
+
+                let Some(event) = event else { break };
+
+                last_event_at = tokio::time::Instant::now();
+                stall_warned = false;
 
                 builder.process_event(&event);
 

@@ -102,7 +102,10 @@ impl AnthropicProvider {
         let mut headers = reqwest::header::HeaderMap::new();
 
         // Build beta headers based on features in use
-        let mut betas = vec!["fine-grained-tool-streaming-2025-05-14"];
+        let mut betas = vec![
+            "fine-grained-tool-streaming-2025-05-14",
+            "token-efficient-tools-2026-03-28",
+        ];
         if opts.thinking_enabled {
             betas.push("interleaved-thinking-2025-05-14");
         }
