@@ -9,8 +9,9 @@ mod tools;
 mod ui;
 mod utils;
 
-use clap::Parser;
 use std::sync::Arc;
+
+use clap::Parser;
 use tau_agent::{Agent, AgentConfig, AgentEvent};
 use tau_ai::{Api, CostInfo, InputType, Model, Provider, ReasoningLevel};
 
@@ -130,10 +131,7 @@ fn get_model(provider: &str, model_id: &str) -> Model {
             Api::OpenAICompletions,
             "https://api.cerebras.ai/v1".to_string(),
         ),
-        "xai" => (
-            Api::OpenAICompletions,
-            "https://api.x.ai/v1".to_string(),
-        ),
+        "xai" => (Api::OpenAICompletions, "https://api.x.ai/v1".to_string()),
         "openrouter" => (
             Api::OpenAICompletions,
             "https://openrouter.ai/api/v1".to_string(),
@@ -142,10 +140,7 @@ fn get_model(provider: &str, model_id: &str) -> Model {
             Api::OpenAICompletions,
             "http://localhost:11434/v1".to_string(),
         ),
-        _ => (
-            Api::OpenAICompletions,
-            String::new(),
-        ),
+        _ => (Api::OpenAICompletions, String::new()),
     };
 
     Model {
@@ -249,30 +244,27 @@ async fn main() -> anyhow::Result<()> {
     let use_tui = !args.no_tui && cfg.tui.unwrap_or(true);
 
     // Check for API key (OAuth, config, or env)
-    if cfg.get_api_key_with_oauth(&provider).await.is_none() {
-        let api_key_var = model
-            .provider
-            .api_key_env_var()
-            .unwrap_or("ANTHROPIC_API_KEY");
-        eprintln!("Error: No authentication found for {}", provider);
-        eprintln!();
-        if provider == "anthropic" {
-            eprintln!("Options:");
-            eprintln!("  1. Login with Claude Pro/Max: tau --login anthropic");
-            eprintln!("  2. Set API key: export {}=your-key", api_key_var);
-            eprintln!("  3. Add to config: tau --init-config");
-        } else {
-            eprintln!("Set your API key with: export {}=your-key", api_key_var);
-            eprintln!("Or add it to config file: tau --init-config");
+    let api_key = match cfg.get_api_key_with_oauth(&provider).await {
+        Some(key) => key,
+        None => {
+            let api_key_var = model
+                .provider
+                .api_key_env_var()
+                .unwrap_or("ANTHROPIC_API_KEY");
+            eprintln!("Error: No authentication found for {}", provider);
+            eprintln!();
+            if provider == "anthropic" {
+                eprintln!("Options:");
+                eprintln!("  1. Login with Claude Pro/Max: tau --login anthropic");
+                eprintln!("  2. Set API key: export {}=your-key", api_key_var);
+                eprintln!("  3. Add to config: tau --init-config");
+            } else {
+                eprintln!("Set your API key with: export {}=your-key", api_key_var);
+                eprintln!("Or add it to config file: tau --init-config");
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
-    }
-
-    // Get API key (OAuth token or regular API key)
-    let api_key = cfg
-        .get_api_key_with_oauth(&provider)
-        .await
-        .expect("API key check passed but key not found");
+    };
 
     let transport = Arc::new(tau_agent::transport::ProviderTransport::with_api_key(
         api_key,
@@ -402,7 +394,10 @@ async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow:
                     }
                 }
                 AgentEvent::CompactionStart { reason } => {
-                    println!("[Compacting context ({})]", crate::utils::compaction_reason_str(reason));
+                    println!(
+                        "[Compacting context ({})]",
+                        crate::utils::compaction_reason_str(reason)
+                    );
                 }
                 AgentEvent::CompactionEnd {
                     tokens_before,
@@ -617,9 +612,7 @@ async fn run_interactive(
                         print!("\n[{}...", tool_name);
                         io::stdout().flush().ok();
                     }
-                    AgentEvent::ToolExecutionUpdate {
-                        content, ..
-                    } => {
+                    AgentEvent::ToolExecutionUpdate { content, .. } => {
                         print!(" {}", content);
                         io::stdout().flush().ok();
                     }
@@ -662,7 +655,10 @@ async fn run_interactive(
                         }
                     }
                     AgentEvent::CompactionStart { reason } => {
-                        println!("[Compacting context ({})]", crate::utils::compaction_reason_str(reason));
+                        println!(
+                            "[Compacting context ({})]",
+                            crate::utils::compaction_reason_str(reason)
+                        );
                     }
                     AgentEvent::CompactionEnd {
                         tokens_before,
@@ -681,21 +677,18 @@ async fn run_interactive(
             }
         });
 
-        // Save user message to session before prompting
-        if let Some(ref mut s) = session {
-            let user_msg = tau_ai::Message::user(input);
-            let _ = s.append_message(&user_msg);
-        }
+        // Track message count before prompt to save new messages after
+        let msgs_before = agent.messages().len();
 
         if let Err(e) = agent.prompt(input).await {
             eprintln!("Error: {}", e);
         }
 
-        // Save assistant response to session
+        // Save all new messages (user + assistant + tool calls) to session
         if let Some(ref mut s) = session {
-            // Get the last message (should be assistant response)
-            if let Some(last_msg) = agent.messages().last() {
-                let _ = s.append_message(last_msg);
+            let all_msgs = agent.messages();
+            for msg in all_msgs.iter().skip(msgs_before) {
+                let _ = s.append_message(msg);
             }
             // Save usage
             let _ = s.append_usage(&agent.state().total_usage);
@@ -751,7 +744,6 @@ fn build_system_prompt(tool_names: &[&str]) -> String {
     let has_edit = tool_names.contains(&"edit");
     let has_glob = tool_names.contains(&"glob");
     let has_grep = tool_names.contains(&"grep");
-    let has_list = tool_names.contains(&"list");
 
     let can_modify = has_write || has_edit || has_bash;
 
@@ -762,32 +754,8 @@ fn build_system_prompt(tool_names: &[&str]) -> String {
         prompt.push_str("NOTE: You are in READ-ONLY mode. You can explore and analyze code but cannot make changes.\n\n");
     }
 
-    // Tool descriptions - only list tools that are actually available
-    if !tool_names.is_empty() {
-        prompt.push_str("Tools:\n");
-        if has_bash {
-            prompt.push_str("- bash: Execute shell commands\n");
-        }
-        if has_read {
-            prompt.push_str("- read: Read file contents\n");
-        }
-        if has_write {
-            prompt.push_str("- write: Write content to a file\n");
-        }
-        if has_edit {
-            prompt.push_str("- edit: Make text replacements in files\n");
-        }
-        if has_glob {
-            prompt.push_str("- glob: Find files by pattern\n");
-        }
-        if has_grep {
-            prompt.push_str("- grep: Search file contents\n");
-        }
-        if has_list {
-            prompt.push_str("- list: List directory contents\n");
-        }
-        prompt.push('\n');
-    }
+    // Tool descriptions are provided via the API tool definitions;
+    // no need to duplicate them in the system prompt.
 
     // Conditional guidelines based on available tools
     prompt.push_str("Guidelines:\n");

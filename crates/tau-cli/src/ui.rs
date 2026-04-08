@@ -1,6 +1,6 @@
 //! TUI implementation for tau
 
-use tokio::sync::mpsc;
+use std::time::Instant;
 
 use crossterm::event::{Event, EventStream, MouseEventKind};
 use futures::StreamExt;
@@ -11,7 +11,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
-use std::time::Instant;
 use tau_agent::{Agent, AgentEvent};
 use tau_ai::Model;
 use tau_tui::{
@@ -22,6 +21,7 @@ use tau_tui::{
         SelectorState, Spinner, message_list::ChatMessage,
     },
 };
+use tokio::sync::mpsc;
 
 /// Messages sent from UI to agent handler
 #[derive(Debug)]
@@ -193,18 +193,19 @@ impl TuiState {
                 });
             }
             AgentEvent::CompactionStart { reason } => {
-                self.status = format!("Compacting context ({})...", crate::utils::compaction_reason_str(reason));
+                self.status = format!(
+                    "Compacting context ({})...",
+                    crate::utils::compaction_reason_str(reason)
+                );
             }
             AgentEvent::CompactionEnd {
                 tokens_before,
                 tokens_after,
             } => {
-                self.messages.push(ChatMessage::system(
-                    &format!(
-                        "Context compacted: ~{} -> ~{} tokens",
-                        tokens_before, tokens_after
-                    ),
-                ));
+                self.messages.push(ChatMessage::system(format!(
+                    "Context compacted: ~{} -> ~{} tokens",
+                    tokens_before, tokens_after
+                )));
                 self.scroll_to_bottom();
             }
             // Ignore turn/message start events (we handle updates/ends)
@@ -626,13 +627,15 @@ pub async fn run_tui(
     reasoning: &mut tau_ai::ReasoningLevel,
     available_models: &[Model],
 ) -> anyhow::Result<()> {
-    use crate::commands::{CommandResult, execute_command};
+    use std::io;
+
     use crossterm::{
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
     use ratatui::{Terminal, backend::CrosstermBackend};
-    use std::io;
+
+    use crate::commands::{CommandResult, execute_command};
 
     // Setup terminal
     enable_raw_mode()?;
