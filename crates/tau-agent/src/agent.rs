@@ -572,28 +572,14 @@ impl Agent {
         let result = loop {
             turn += 1;
 
-            // Build context and user message for this turn
+            // Build context for this turn
             let context_messages = self.build_context(&messages_to_add);
-            let current_user_msg = if turn == 1 {
-                messages_to_add
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| Message::User {
-                        content: vec![],
-                        timestamp: chrono::Utc::now().timestamp_millis(),
-                    })
-            } else {
-                Message::User {
-                    content: vec![],
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                }
-            };
 
             // Run the transport
             let cancel_token = self.handle.cancel.lock().clone();
             let mut event_stream = match self
                 .transport
-                .run(context_messages, current_user_msg, &run_config, cancel_token)
+                .run(context_messages, &run_config, cancel_token)
                 .await
             {
                 Ok(s) => s,
@@ -927,7 +913,6 @@ mod tests {
         async fn run(
             &self,
             _messages: Vec<Message>,
-            _user_message: Message,
             _config: &AgentRunConfig,
             _cancel: tokio_util::sync::CancellationToken,
         ) -> tau_ai::Result<AgentEventStream> {

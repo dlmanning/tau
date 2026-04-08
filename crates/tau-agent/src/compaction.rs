@@ -547,7 +547,7 @@ async fn call_summarization_llm(
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let mut event_stream = transport
-        .run(vec![], user_message, &run_config, cancel)
+        .run(vec![user_message], &run_config, cancel)
         .await
         .map_err(|e| format!("Compaction LLM call failed: {}", e))?;
 

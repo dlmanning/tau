@@ -2,11 +2,10 @@
 
 use std::{pin::Pin, sync::LazyLock, time::Duration};
 
-use regex::Regex;
-
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::StreamExt;
+use regex::Regex;
 use tau_ai::{Context, Model, Result, stream::MessageBuilder};
 use tokio_stream::Stream;
 
@@ -154,8 +153,9 @@ static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 
 /// Regex for HTTP 400 status codes in error strings (e.g. "400 Bad Request", "HTTP 400", "status: 400").
 /// Requires word boundary to avoid matching port numbers or IDs containing "400".
-static HTTP_400_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(?:status|http|error)[:\s]*400\b|\b400\s+bad\s+request").unwrap());
+static HTTP_400_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:status|http|error)[:\s]*400\b|\b400\s+bad\s+request").unwrap()
+});
 
 /// Check if an error indicates a context overflow / too many tokens
 pub fn is_context_overflow(error: &str) -> bool {
@@ -197,7 +197,6 @@ pub trait Transport: Send + Sync {
     async fn run(
         &self,
         messages: Vec<tau_ai::Message>,
-        user_message: tau_ai::Message,
         config: &AgentRunConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<AgentEventStream>;
@@ -244,16 +243,14 @@ impl Transport for ProviderTransport {
     async fn run(
         &self,
         messages: Vec<tau_ai::Message>,
-        user_message: tau_ai::Message,
         config: &AgentRunConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<AgentEventStream> {
-        let mut context = Context {
+        let context = Context {
             system_prompt: config.system_prompt.clone(),
             messages,
             tools: config.tools.clone(),
         };
-        context.push(user_message);
 
         // Get the appropriate provider and stream
         let model = config.model.clone();
@@ -403,15 +400,15 @@ mod tests {
 
     #[test]
     fn test_overflow_openai_max_tokens_with_exceeds() {
-        assert!(is_context_overflow(
-            "max_tokens exceeds the model limit"
-        ));
+        assert!(is_context_overflow("max_tokens exceeds the model limit"));
     }
 
     #[test]
     fn test_no_overflow_max_tokens_config_error() {
         // "max_tokens" alone (e.g. config validation) should NOT match
-        assert!(!is_context_overflow("max_tokens parameter must be positive"));
+        assert!(!is_context_overflow(
+            "max_tokens parameter must be positive"
+        ));
         assert!(!is_context_overflow("invalid value for max_tokens"));
     }
 
@@ -478,7 +475,9 @@ mod tests {
     #[test]
     fn test_overflow_http_400_with_token() {
         assert!(is_context_overflow("HTTP 400: token count exceeds limit"));
-        assert!(is_context_overflow("status: 400 - too many tokens in context"));
+        assert!(is_context_overflow(
+            "status: 400 - too many tokens in context"
+        ));
         assert!(is_context_overflow("error 400: context length exceeded"));
     }
 
@@ -505,7 +504,11 @@ mod tests {
     #[test]
     fn test_no_overflow_400_in_unrelated_context() {
         // "400" appearing as port or ID should NOT match
-        assert!(!is_context_overflow("connected to port 14001 with token auth"));
-        assert!(!is_context_overflow("processed 400 items in context manager"));
+        assert!(!is_context_overflow(
+            "connected to port 14001 with token auth"
+        ));
+        assert!(!is_context_overflow(
+            "processed 400 items in context manager"
+        ));
     }
 }
