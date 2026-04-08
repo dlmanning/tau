@@ -1,4 +1,19 @@
 //! LSP client infrastructure — manages language server processes
+//!
+//! ## Known limitations
+//!
+//! - No `textDocument/didChange` or `textDocument/didSave` notifications are sent.
+//!   After the model edits a file, the server's view becomes stale until the file
+//!   is re-opened (which happens on the next tool call for that file if the server
+//!   has crashed and restarted, but not otherwise). A future improvement would track
+//!   file edits and send change notifications.
+//!
+//! - The request timeout is fixed at 60 seconds. rust-analyzer's initial workspace
+//!   indexing can exceed this on very large codebases. The first request after server
+//!   start may time out; a retry will typically succeed once indexing completes.
+//!
+//! - Server stderr is logged at debug level. Set `RUST_LOG=lsp_stderr=debug` to see
+//!   language server diagnostic output.
 
 mod client;
 mod servers;
@@ -14,41 +29,62 @@ use client::LspClient;
 pub use servers::discover_servers;
 use servers::{ServerConfig, server_for_extension};
 
-/// Convert a file path to a file:// URI string and parse as lsp_types::Uri
+/// Maximum file size we'll send to an LSP server via didOpen (10 MB).
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Convert a file path to a file:// URI with proper percent-encoding.
 fn file_uri(path: &Path) -> anyhow::Result<Uri> {
-    let uri_str = format!("file://{}", path.display());
-    uri_str.parse().map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))
+    // Percent-encode each path component, preserving /
+    let encoded: String = path
+        .components()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            urlencoding::encode(&s).into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    // file:// + / + encoded (components don't include leading /)
+    let uri_str = format!("file:///{}", encoded.trim_start_matches('/'));
+    uri_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid URI '{}': {}", uri_str, e))
 }
 
-/// Extract a file path from a file:// URI
-fn uri_to_path_string(uri: &Uri) -> String {
+/// Extract a file path from a file:// URI.
+fn uri_to_path(uri: &Uri) -> String {
     let s = uri.as_str();
-    s.strip_prefix("file://").unwrap_or(s).to_string()
+    let path = s.strip_prefix("file://").unwrap_or(s);
+    // Decode percent-encoding
+    urlencoding::decode(path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Manages LSP server lifecycle and routes requests by file type.
 pub struct LspManager {
+    /// extension → client (may contain dead clients that need restart)
     servers: Mutex<HashMap<String, Arc<LspClient>>>,
     configs: Vec<ServerConfig>,
     workspace_root: PathBuf,
-    opened_files: Mutex<HashSet<String>>,
+    /// URIs of files sent didOpen, keyed by server command to reset on restart
+    opened_files: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl LspManager {
-    pub fn new(workspace_root: PathBuf) -> Self {
-        let configs = discover_servers();
+    pub async fn new(workspace_root: PathBuf) -> Self {
+        let configs = discover_servers().await;
         if configs.is_empty() {
             tracing::debug!("No LSP servers found on PATH");
         } else {
             for cfg in &configs {
-                tracing::debug!("Found LSP server: {} ({})", cfg.command, cfg.language_id);
+                tracing::debug!("Found LSP server: {}", cfg.command);
             }
         }
         Self {
             servers: Mutex::new(HashMap::new()),
             configs,
             workspace_root,
-            opened_files: Mutex::new(HashSet::new()),
+            opened_files: Mutex::new(HashMap::new()),
         }
     }
 
@@ -58,6 +94,7 @@ impl LspManager {
     }
 
     /// Get or start a server for the given file path.
+    /// If the cached server is dead, removes it and starts a fresh one.
     async fn ensure_server(&self, file_path: &Path) -> anyhow::Result<Arc<LspClient>> {
         let ext = file_path
             .extension()
@@ -69,12 +106,23 @@ impl LspManager {
             .clone();
 
         let mut servers = self.servers.lock().await;
+
+        // Check if cached server is still alive
         if let Some(client) = servers.get(ext) {
-            return Ok(client.clone());
+            if client.is_alive().await {
+                return Ok(client.clone());
+            }
+            // Dead server — remove stale entries and opened_files tracking
+            tracing::warn!("LSP server {} died, restarting", config.command);
+            for (e, _) in &config.extensions {
+                servers.remove(e);
+            }
+            self.opened_files.lock().await.remove(&config.command);
         }
 
         tracing::info!("Starting LSP server: {} for .{}", config.command, ext);
-        let client = LspClient::spawn(&config.command, &config.args, &self.workspace_root).await?;
+        let client =
+            LspClient::spawn(&config.command, &config.args, &self.workspace_root).await?;
 
         // Initialize
         #[allow(deprecated)] // root_uri still needed by many servers
@@ -108,32 +156,42 @@ impl LspManager {
         };
 
         let _init_result: InitializeResult = client.request("initialize", init_params).await?;
-        client
-            .notify("initialized", InitializedParams {})
-            .await?;
+        client.notify("initialized", InitializedParams {}).await?;
 
         let client = Arc::new(client);
-        // Cache for all extensions this server handles
-        for e in &config.extensions {
-            servers.insert(e.clone(), client.clone());
+        for (e, _) in &config.extensions {
+            servers.insert(e.to_string(), client.clone());
         }
 
         Ok(client)
     }
 
     /// Ensure a file is open in the server (textDocument/didOpen).
+    /// Tracks per-server so a server restart correctly re-opens files.
     async fn ensure_file_open(
         &self,
         client: &LspClient,
         path: &Path,
+        server_command: &str,
         language_id: &str,
     ) -> anyhow::Result<()> {
         let uri = file_uri(path)?;
-        let uri_str = uri.to_string();
+        let uri_str = uri.as_str().to_string();
 
         let mut opened = self.opened_files.lock().await;
-        if opened.contains(&uri_str) {
+        let server_files = opened.entry(server_command.to_string()).or_default();
+        if server_files.contains(&uri_str) {
             return Ok(());
+        }
+
+        // Check file size before reading
+        let metadata = tokio::fs::metadata(path).await?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(anyhow::anyhow!(
+                "File too large for LSP ({:.1} MB, max {:.1} MB)",
+                metadata.len() as f64 / 1_048_576.0,
+                MAX_FILE_SIZE as f64 / 1_048_576.0,
+            ));
         }
 
         let text = tokio::fs::read_to_string(path).await?;
@@ -151,15 +209,13 @@ impl LspManager {
             )
             .await?;
 
-        opened.insert(uri_str);
+        server_files.insert(uri_str);
         Ok(())
     }
 
-    fn language_id_for_path(&self, path: &Path) -> String {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    fn config_for_path(&self, path: &Path) -> Option<&ServerConfig> {
+        let ext = path.extension().and_then(|e| e.to_str())?;
         server_for_extension(&self.configs, ext)
-            .map(|c| c.language_id.clone())
-            .unwrap_or_else(|| "plaintext".into())
     }
 
     /// Go to definition at the given position.
@@ -169,18 +225,34 @@ impl LspManager {
         line: u32,
         character: u32,
     ) -> anyhow::Result<String> {
+        let config = self.config_for_path(path).cloned();
         let client = self.ensure_server(path).await?;
-        let lang_id = self.language_id_for_path(path);
-        self.ensure_file_open(&client, path, &lang_id).await?;
+        let lang_id = config
+            .as_ref()
+            .and_then(|c| {
+                let ext = path.extension()?.to_str()?;
+                c.language_id_for(ext).map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "plaintext".into());
+        self.ensure_file_open(
+            &client,
+            path,
+            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
+            &lang_id,
+        )
+        .await?;
 
-        let uri = file_uri(path).unwrap();
+        let uri = file_uri(path)?;
         let result: Option<GotoDefinitionResponse> = client
             .request(
                 "textDocument/definition",
                 GotoDefinitionParams {
                     text_document_position_params: TextDocumentPositionParams {
                         text_document: TextDocumentIdentifier { uri },
-                        position: Position::new(line.saturating_sub(1), character.saturating_sub(1)),
+                        position: Position::new(
+                            line.saturating_sub(1),
+                            character.saturating_sub(1),
+                        ),
                     },
                     work_done_progress_params: Default::default(),
                     partial_result_params: Default::default(),
@@ -198,18 +270,34 @@ impl LspManager {
         line: u32,
         character: u32,
     ) -> anyhow::Result<String> {
+        let config = self.config_for_path(path).cloned();
         let client = self.ensure_server(path).await?;
-        let lang_id = self.language_id_for_path(path);
-        self.ensure_file_open(&client, path, &lang_id).await?;
+        let lang_id = config
+            .as_ref()
+            .and_then(|c| {
+                let ext = path.extension()?.to_str()?;
+                c.language_id_for(ext).map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "plaintext".into());
+        self.ensure_file_open(
+            &client,
+            path,
+            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
+            &lang_id,
+        )
+        .await?;
 
-        let uri = file_uri(path).unwrap();
+        let uri = file_uri(path)?;
         let result: Option<Vec<Location>> = client
             .request(
                 "textDocument/references",
                 ReferenceParams {
                     text_document_position: TextDocumentPositionParams {
                         text_document: TextDocumentIdentifier { uri },
-                        position: Position::new(line.saturating_sub(1), character.saturating_sub(1)),
+                        position: Position::new(
+                            line.saturating_sub(1),
+                            character.saturating_sub(1),
+                        ),
                     },
                     context: ReferenceContext {
                         include_declaration: true,
@@ -230,18 +318,34 @@ impl LspManager {
         line: u32,
         character: u32,
     ) -> anyhow::Result<String> {
+        let config = self.config_for_path(path).cloned();
         let client = self.ensure_server(path).await?;
-        let lang_id = self.language_id_for_path(path);
-        self.ensure_file_open(&client, path, &lang_id).await?;
+        let lang_id = config
+            .as_ref()
+            .and_then(|c| {
+                let ext = path.extension()?.to_str()?;
+                c.language_id_for(ext).map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "plaintext".into());
+        self.ensure_file_open(
+            &client,
+            path,
+            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
+            &lang_id,
+        )
+        .await?;
 
-        let uri = file_uri(path).unwrap();
+        let uri = file_uri(path)?;
         let result: Option<Hover> = client
             .request(
                 "textDocument/hover",
                 HoverParams {
                     text_document_position_params: TextDocumentPositionParams {
                         text_document: TextDocumentIdentifier { uri },
-                        position: Position::new(line.saturating_sub(1), character.saturating_sub(1)),
+                        position: Position::new(
+                            line.saturating_sub(1),
+                            character.saturating_sub(1),
+                        ),
                     },
                     work_done_progress_params: Default::default(),
                 },
@@ -253,11 +357,24 @@ impl LspManager {
 
     /// Get document symbols for a file.
     pub async fn document_symbol(&self, path: &Path) -> anyhow::Result<String> {
+        let config = self.config_for_path(path).cloned();
         let client = self.ensure_server(path).await?;
-        let lang_id = self.language_id_for_path(path);
-        self.ensure_file_open(&client, path, &lang_id).await?;
+        let lang_id = config
+            .as_ref()
+            .and_then(|c| {
+                let ext = path.extension()?.to_str()?;
+                c.language_id_for(ext).map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "plaintext".into());
+        self.ensure_file_open(
+            &client,
+            path,
+            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
+            &lang_id,
+        )
+        .await?;
 
-        let uri = file_uri(path).unwrap();
+        let uri = file_uri(path)?;
         let result: Option<DocumentSymbolResponse> = client
             .request(
                 "textDocument/documentSymbol",
@@ -276,10 +393,6 @@ impl LspManager {
 // ============================================================================
 // Result formatters
 // ============================================================================
-
-fn uri_to_path(uri: &Uri) -> String {
-    uri_to_path_string(uri)
-}
 
 fn format_definition_result(result: Option<GotoDefinitionResponse>) -> String {
     match result {
@@ -333,31 +446,31 @@ fn format_references_result(result: Option<Vec<Location>>) -> String {
         Some(locs) if !locs.is_empty() => locs,
         _ => return "No references found".into(),
     };
-    {
-            // Group by file
-            let mut by_file: HashMap<String, Vec<String>> = HashMap::new();
-            for loc in &locs {
-                let path = uri_to_path(&loc.uri);
-                by_file
-                    .entry(path)
-                    .or_default()
-                    .push(format!(
-                        "  line {}:{}",
-                        loc.range.start.line + 1,
-                        loc.range.start.character + 1
-                    ));
-            }
 
-            let mut output = format!("Found {} references in {} files:\n", locs.len(), by_file.len());
-            for (file, refs) in &by_file {
-                output.push_str(&format!("\n{}:\n", file));
-                for r in refs {
-                    output.push_str(r);
-                    output.push('\n');
-                }
-            }
-            output
+    // Group by file
+    let mut by_file: HashMap<String, Vec<String>> = HashMap::new();
+    for loc in &locs {
+        let path = uri_to_path(&loc.uri);
+        by_file.entry(path).or_default().push(format!(
+            "  line {}:{}",
+            loc.range.start.line + 1,
+            loc.range.start.character + 1
+        ));
     }
+
+    let mut output = format!(
+        "Found {} references in {} files:\n",
+        locs.len(),
+        by_file.len()
+    );
+    for (file, refs) in &by_file {
+        output.push_str(&format!("\n{}:\n", file));
+        for r in refs {
+            output.push_str(r);
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn format_hover_result(result: Option<Hover>) -> String {

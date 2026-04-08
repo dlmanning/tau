@@ -313,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
     agent.add_tool(Arc::new(tools::ListTool::new()));
 
     // Add LSP tool if any language servers are available
-    let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?));
+    let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
     if lsp_manager.is_available() {
         agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager)));
     }

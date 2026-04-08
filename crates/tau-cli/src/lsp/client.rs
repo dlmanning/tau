@@ -13,9 +13,15 @@ use tokio::sync::{Mutex, oneshot};
 /// A JSON-RPC 2.0 client that communicates with an LSP server over stdio.
 pub struct LspClient {
     stdin: Mutex<ChildStdin>,
-    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>>,
     next_id: AtomicI64,
-    _child: Child,
+    _child: Mutex<Child>,
+}
+
+/// Result from a JSON-RPC response — either a value or a server error.
+enum RpcResult {
+    Ok(serde_json::Value),
+    Err { code: i64, message: String },
 }
 
 #[derive(Serialize)]
@@ -58,14 +64,26 @@ impl LspClient {
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped()) // capture for debugging, don't null
             .kill_on_drop(true)
             .spawn()?;
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
-        let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>> =
+        // Log stderr in background
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    tracing::debug!(target: "lsp_stderr", "{}", line.trim_end());
+                    line.clear();
+                }
+            });
+        }
+
+        let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn background reader task
@@ -80,7 +98,7 @@ impl LspClient {
             stdin: Mutex::new(stdin),
             pending,
             next_id: AtomicI64::new(1),
-            _child: child,
+            _child: Mutex::new(child),
         })
     }
 
@@ -103,12 +121,19 @@ impl LspClient {
         };
         self.send_message(&serde_json::to_string(&request)?).await?;
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        // Wait with timeout
+        let rpc_result = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
             .await
-            .map_err(|_| anyhow::anyhow!("LSP request timed out: {}", method))?
-            .map_err(|_| anyhow::anyhow!("LSP response channel closed"))?;
+            .map_err(|_| anyhow::anyhow!("LSP request timed out after 60s: {}", method))?
+            .map_err(|_| anyhow::anyhow!("LSP server connection lost"))?;
 
-        serde_json::from_value(response).map_err(Into::into)
+        // Handle JSON-RPC level errors properly
+        match rpc_result {
+            RpcResult::Ok(value) => serde_json::from_value(value).map_err(Into::into),
+            RpcResult::Err { code, message } => {
+                Err(anyhow::anyhow!("LSP server error ({}): {}", code, message))
+            }
+        }
     }
 
     /// Send a notification (no response expected).
@@ -124,11 +149,15 @@ impl LspClient {
     /// Send an LSP shutdown request and exit notification.
     #[allow(dead_code)]
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        // shutdown is a request
         let _: serde_json::Value = self.request("shutdown", serde_json::Value::Null).await?;
-        // exit is a notification
         self.notify("exit", serde_json::Value::Null).await?;
         Ok(())
+    }
+
+    /// Check if the server process is still alive.
+    pub async fn is_alive(&self) -> bool {
+        let mut child = self._child.lock().await;
+        matches!(child.try_wait(), Ok(None))
     }
 
     async fn send_message(&self, json: &str) -> anyhow::Result<()> {
@@ -143,7 +172,7 @@ impl LspClient {
 /// Background task: read Content-Length framed messages from stdout, dispatch responses.
 async fn read_loop(
     stdout: ChildStdout,
-    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>>,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut header_buf = String::new();
@@ -181,18 +210,18 @@ async fn read_loop(
             if let Some(id) = response.id {
                 let mut pending = pending.lock().await;
                 if let Some(tx) = pending.remove(&id) {
-                    let value = if let Some(error) = response.error {
-                        // Return error as a JSON value so the caller can handle it
-                        serde_json::json!({
-                            "error": { "code": error.code, "message": error.message }
-                        })
+                    let result = if let Some(error) = response.error {
+                        RpcResult::Err {
+                            code: error.code,
+                            message: error.message,
+                        }
                     } else {
-                        response.result.unwrap_or(serde_json::Value::Null)
+                        RpcResult::Ok(response.result.unwrap_or(serde_json::Value::Null))
                     };
-                    let _ = tx.send(value);
+                    let _ = tx.send(result);
                 }
             }
-            // Notifications from server (id is None) — just ignore for now
+            // Notifications from server (id is None) — logged via stderr
         }
     }
 }
