@@ -1,14 +1,15 @@
 //! Google Generative AI (Gemini) API provider
 
+use async_stream::stream;
+use futures::StreamExt;
+use reqwest_eventsource::{Event, EventSource};
+use serde::{Deserialize, Serialize};
+
 use crate::{
     error::{Error, Result},
     stream::{MessageEvent, MessageEventStream},
     types::{AssistantMetadata, Content, Context, Message, Model, StopReason, Usage},
 };
-use async_stream::stream;
-use futures::StreamExt;
-use reqwest_eventsource::{Event, EventSource};
-use serde::{Deserialize, Serialize};
 
 /// Google Generative AI client
 pub struct GoogleProvider {
@@ -150,8 +151,10 @@ fn convert_message(msg: &Message) -> Option<GeminiContent> {
                 .filter_map(|c| match c {
                     Content::Text { text } => Some(GeminiPart::Text { text: text.clone() }),
                     Content::Image { mime_type, data } => Some(GeminiPart::InlineData {
-                        mime_type: mime_type.clone(),
-                        data: data.clone(),
+                        inline_data: GeminiInlineData {
+                            mime_type: mime_type.clone(),
+                            data: data.clone(),
+                        },
                     }),
                     _ => None,
                 })
@@ -241,6 +244,7 @@ fn create_stream(
         let mut finish_reason: Option<String> = None;
         let mut total_input_tokens = 0u32;
         let mut total_output_tokens = 0u32;
+        let mut text_started = false;
 
         // Emit start event
         let start_message = Message::Assistant {
@@ -268,6 +272,10 @@ fn create_stream(
                                     for part in &content.parts {
                                         match part {
                                             GeminiResponsePart::Text { text } => {
+                                                if !text_started {
+                                                    text_started = true;
+                                                    yield MessageEvent::TextStart { content_index: 0 };
+                                                }
                                                 accumulated_text.push_str(text);
                                                 yield MessageEvent::TextDelta {
                                                     content_index: 0,
@@ -339,7 +347,7 @@ fn create_stream(
 
         if !accumulated_text.is_empty() {
             content.push(Content::Text {
-                text: accumulated_text,
+                text: accumulated_text.clone(),
             });
         }
 
@@ -370,6 +378,14 @@ fn create_stream(
                 ..Default::default()
             },
         };
+
+        // Emit TextEnd if we started text
+        if text_started {
+            yield MessageEvent::TextEnd {
+                content_index: 0,
+                text: accumulated_text.clone(),
+            };
+        }
 
         yield MessageEvent::Done {
             message: final_message,
@@ -412,8 +428,7 @@ enum GeminiPart {
     },
     InlineData {
         #[serde(rename = "inlineData")]
-        mime_type: String,
-        data: String,
+        inline_data: GeminiInlineData,
     },
     FunctionCall {
         #[serde(rename = "functionCall")]
@@ -423,6 +438,13 @@ enum GeminiPart {
         #[serde(rename = "functionResponse")]
         function_response: GeminiFunctionResponse,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct GeminiInlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -556,4 +578,96 @@ impl GoogleModelInfo {
 #[derive(Debug, Deserialize)]
 struct GoogleModelList {
     models: Vec<GoogleModelInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Content, Message};
+
+    #[test]
+    fn test_convert_user_text_message() {
+        let msg = Message::user("Hello");
+        let result = convert_message(&msg).unwrap();
+        assert_eq!(result.role, Some("user".to_string()));
+        assert_eq!(result.parts.len(), 1);
+        let json = serde_json::to_value(&result.parts[0]).unwrap();
+        assert_eq!(json["text"], "Hello");
+    }
+
+    #[test]
+    fn test_convert_user_image_message() {
+        let msg = Message::User {
+            content: vec![Content::Image {
+                mime_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }],
+            timestamp: 0,
+        };
+        let result = convert_message(&msg).unwrap();
+        assert_eq!(result.parts.len(), 1);
+        let json = serde_json::to_value(&result.parts[0]).unwrap();
+        // Verify correct nested structure: { "inlineData": { "mimeType": "...", "data": "..." } }
+        assert_eq!(json["inlineData"]["mimeType"], "image/png");
+        assert_eq!(json["inlineData"]["data"], "base64data");
+    }
+
+    #[test]
+    fn test_convert_assistant_text_message() {
+        let msg = Message::Assistant {
+            content: vec![Content::text("Hi there")],
+            metadata: Default::default(),
+        };
+        let result = convert_message(&msg).unwrap();
+        assert_eq!(result.role, Some("model".to_string()));
+        let json = serde_json::to_value(&result.parts[0]).unwrap();
+        assert_eq!(json["text"], "Hi there");
+    }
+
+    #[test]
+    fn test_convert_assistant_tool_call() {
+        let msg = Message::Assistant {
+            content: vec![Content::ToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "/foo.rs"}),
+            }],
+            metadata: Default::default(),
+        };
+        let result = convert_message(&msg).unwrap();
+        let json = serde_json::to_value(&result.parts[0]).unwrap();
+        assert_eq!(json["functionCall"]["name"], "read");
+        assert_eq!(json["functionCall"]["args"]["path"], "/foo.rs");
+    }
+
+    #[test]
+    fn test_convert_tool_result() {
+        let msg = Message::tool_result(
+            "call_1",
+            "read",
+            vec![Content::text("file contents")],
+            false,
+        );
+        let result = convert_message(&msg).unwrap();
+        assert_eq!(result.role, Some("function".to_string()));
+        let json = serde_json::to_value(&result.parts[0]).unwrap();
+        assert_eq!(json["functionResponse"]["name"], "read");
+    }
+
+    #[test]
+    fn test_inline_data_serialization_format() {
+        let part = GeminiPart::InlineData {
+            inline_data: GeminiInlineData {
+                mime_type: "image/jpeg".to_string(),
+                data: "abc123".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        // Must be nested: {"inlineData": {"mimeType": "image/jpeg", "data": "abc123"}}
+        assert!(json.get("inlineData").is_some(), "missing inlineData key");
+        assert_eq!(json["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(json["inlineData"]["data"], "abc123");
+        // Must NOT have flat fields
+        assert!(json.get("mime_type").is_none());
+    }
 }

@@ -1,9 +1,11 @@
 //! Streaming event types and utilities
 
-use crate::types::{Content, Message, StopReason, Usage};
-use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+
+use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
+
+use crate::types::{Content, Message, StopReason, Usage};
 
 /// Events emitted during message streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +108,10 @@ impl MessageBuilder {
                 content_index,
                 delta,
             } => {
+                // Auto-create buffer if TextStart was not emitted (e.g. OpenAI, Google)
+                if self.content_buffers.len() <= *content_index {
+                    self.ensure_buffer(*content_index, ContentBuffer::Text(String::new()));
+                }
                 if let Some(ContentBuffer::Text(text)) =
                     self.content_buffers.get_mut(*content_index)
                 {
@@ -260,5 +266,101 @@ impl MessageBuilder {
                 .push(ContentBuffer::Text(String::new()));
         }
         self.content_buffers[index] = default;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_text_delta_without_text_start() {
+        // Simulates OpenAI/Google behavior: TextDelta without prior TextStart
+        let mut builder = MessageBuilder::new();
+        builder.process_event(&MessageEvent::Start {
+            message: Message::Assistant {
+                content: vec![],
+                metadata: Default::default(),
+            },
+        });
+        // No TextStart — go straight to TextDelta
+        builder.process_event(&MessageEvent::TextDelta {
+            content_index: 0,
+            delta: "Hello ".to_string(),
+        });
+        builder.process_event(&MessageEvent::TextDelta {
+            content_index: 0,
+            delta: "world".to_string(),
+        });
+
+        let msg = builder.build();
+        let text = msg.text();
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn test_text_with_start_and_end() {
+        // Simulates Anthropic behavior: TextStart → TextDelta → TextEnd
+        let mut builder = MessageBuilder::new();
+        builder.process_event(&MessageEvent::Start {
+            message: Message::Assistant {
+                content: vec![],
+                metadata: Default::default(),
+            },
+        });
+        builder.process_event(&MessageEvent::TextStart { content_index: 0 });
+        builder.process_event(&MessageEvent::TextDelta {
+            content_index: 0,
+            delta: "Hello".to_string(),
+        });
+        builder.process_event(&MessageEvent::TextEnd {
+            content_index: 0,
+            text: "Hello".to_string(),
+        });
+
+        let msg = builder.build();
+        assert_eq!(msg.text(), "Hello");
+    }
+
+    #[test]
+    fn test_tool_call_building() {
+        let mut builder = MessageBuilder::new();
+        builder.process_event(&MessageEvent::Start {
+            message: Message::Assistant {
+                content: vec![],
+                metadata: Default::default(),
+            },
+        });
+        builder.process_event(&MessageEvent::ToolCallStart {
+            content_index: 0,
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+        });
+        builder.process_event(&MessageEvent::ToolCallEnd {
+            content_index: 0,
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+
+        let msg = builder.build();
+        match &msg {
+            Message::Assistant { content, .. } => {
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    Content::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        assert_eq!(id, "call_1");
+                        assert_eq!(name, "bash");
+                        assert_eq!(arguments["command"], "ls");
+                    }
+                    other => panic!("expected ToolCall, got {:?}", other),
+                }
+            }
+            other => panic!("expected Assistant, got {:?}", other),
+        }
     }
 }

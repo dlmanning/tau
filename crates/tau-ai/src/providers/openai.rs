@@ -141,6 +141,7 @@ impl OpenAIProvider {
             } else {
                 None
             },
+            stream_options: Some(serde_json::json!({"include_usage": true})),
         })
     }
 }
@@ -267,6 +268,7 @@ fn create_stream(
         let mut current_tool_index: Option<usize> = None;
         let mut finish_reason: Option<String> = None;
         let mut usage = Usage::default();
+        let mut text_started = false;
 
         // Emit start event
         let start_message = Message::Assistant {
@@ -292,6 +294,10 @@ fn create_stream(
                             for choice in &chunk.choices {
                                 // Handle text delta
                                 if let Some(ref content) = choice.delta.content {
+                                    if !text_started {
+                                        text_started = true;
+                                        yield MessageEvent::TextStart { content_index: 0 };
+                                    }
                                     accumulated_text.push_str(content);
                                     yield MessageEvent::TextDelta {
                                         content_index: 0,
@@ -381,7 +387,7 @@ fn create_stream(
 
         if !accumulated_text.is_empty() {
             content.push(Content::Text {
-                text: accumulated_text,
+                text: accumulated_text.clone(),
             });
         }
 
@@ -415,6 +421,14 @@ fn create_stream(
             },
         };
 
+        // Emit TextEnd if we started text
+        if text_started {
+            yield MessageEvent::TextEnd {
+                content_index: 0,
+                text: accumulated_text.clone(),
+            };
+        }
+
         yield MessageEvent::Done {
             message: final_message,
             stop_reason: stop_reason.unwrap_or(StopReason::Stop),
@@ -438,6 +452,8 @@ struct OpenAIRequest {
     tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -525,4 +541,113 @@ struct StreamFunction {
 struct StreamUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Content, Message};
+
+    #[test]
+    fn test_convert_user_text_message() {
+        let msg = Message::user("Hello");
+        let result = convert_message(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        match &result[0].content {
+            Some(MessageContent::Text(t)) => assert_eq!(t, "Hello"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_assistant_text_message() {
+        let msg = Message::Assistant {
+            content: vec![Content::text("Hi")],
+            metadata: Default::default(),
+        };
+        let result = convert_message(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "assistant");
+        match &result[0].content {
+            Some(MessageContent::Text(t)) => assert_eq!(t, "Hi"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_assistant_tool_call() {
+        let msg = Message::Assistant {
+            content: vec![Content::ToolCall {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            }],
+            metadata: Default::default(),
+        };
+        let result = convert_message(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "assistant");
+        let tc = result[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].id, "call_1");
+        assert_eq!(tc[0].function.name, "bash");
+    }
+
+    #[test]
+    fn test_convert_tool_result() {
+        let msg = Message::tool_result("call_1", "bash", vec![Content::text("output")], false);
+        let result = convert_message(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "tool");
+        assert_eq!(result[0].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn test_convert_assistant_mixed_text_and_tools() {
+        let msg = Message::Assistant {
+            content: vec![
+                Content::text("Let me check"),
+                Content::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "foo.rs"}),
+                },
+            ],
+            metadata: Default::default(),
+        };
+        let result = convert_message(&msg);
+        assert_eq!(result.len(), 1);
+        // Should have both text content and tool calls
+        assert!(result[0].content.is_some());
+        assert!(result[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn test_request_includes_stream_options() {
+        let provider = OpenAIProvider::new("test-key");
+        let model = Model {
+            id: "gpt-4".to_string(),
+            name: "GPT-4".to_string(),
+            api: crate::Api::OpenAICompletions,
+            provider: crate::Provider::OpenAI,
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning: false,
+            input_types: vec![],
+            cost: Default::default(),
+            context_window: 128000,
+            max_tokens: 8192,
+            headers: Default::default(),
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![],
+        };
+        let request = provider.build_request(&model, &context).unwrap();
+        assert!(request.stream);
+        assert!(request.stream_options.is_some());
+        let opts = request.stream_options.unwrap();
+        assert_eq!(opts["include_usage"], true);
+    }
 }
