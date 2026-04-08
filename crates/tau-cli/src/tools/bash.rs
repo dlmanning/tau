@@ -1,17 +1,20 @@
 //! Bash command execution tool
 
+use std::{collections::VecDeque, process::Stdio};
+
 use async_trait::async_trait;
 use serde_json::json;
-use std::process::Stdio;
 use tau_agent::tool::{Tool, ToolResult};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Maximum output size in bytes before truncation
-const MAX_OUTPUT_SIZE: usize = 100_000; // 100KB
+const MAX_OUTPUT_SIZE: usize = 30_000; // 30KB
 /// Maximum number of lines before truncation
-const MAX_OUTPUT_LINES: usize = 1000;
+const MAX_OUTPUT_LINES: usize = 500;
 
 /// Tool for executing bash commands
 pub struct BashTool;
@@ -25,6 +28,93 @@ impl BashTool {
 impl Default for BashTool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Collects output lines with head+tail truncation.
+/// Keeps the first half and last half of lines within size/line limits.
+struct OutputCollector {
+    /// Lines kept from the beginning of output
+    head: Vec<String>,
+    /// Rolling buffer of recent lines (the tail)
+    tail: VecDeque<String>,
+    /// Total bytes in head
+    head_bytes: usize,
+    /// Total bytes in tail
+    tail_bytes: usize,
+    /// Whether we've exceeded head capacity and started collecting tail
+    head_full: bool,
+    /// Total number of lines seen (for truncation notice)
+    total_lines: usize,
+    /// Max bytes for head portion
+    max_head_bytes: usize,
+    /// Max lines for head portion
+    max_head_lines: usize,
+    /// Max bytes for tail portion
+    max_tail_bytes: usize,
+    /// Max lines for tail portion
+    max_tail_lines: usize,
+}
+
+impl OutputCollector {
+    fn new() -> Self {
+        let half_bytes = MAX_OUTPUT_SIZE / 2;
+        let half_lines = MAX_OUTPUT_LINES / 2;
+        Self {
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            head_bytes: 0,
+            tail_bytes: 0,
+            head_full: false,
+            total_lines: 0,
+            max_head_bytes: half_bytes,
+            max_head_lines: half_lines,
+            max_tail_bytes: half_bytes,
+            max_tail_lines: half_lines,
+        }
+    }
+
+    fn push_line(&mut self, line: String) {
+        self.total_lines += 1;
+        let line_len = line.len() + 1; // +1 for newline
+
+        if !self.head_full {
+            if self.head.len() < self.max_head_lines
+                && self.head_bytes + line_len <= self.max_head_bytes
+            {
+                self.head_bytes += line_len;
+                self.head.push(line);
+                return;
+            }
+            self.head_full = true;
+        }
+
+        // Add to tail, evicting old entries if needed
+        self.tail_bytes += line_len;
+        self.tail.push_back(line);
+        while self.tail.len() > self.max_tail_lines
+            || (self.tail_bytes > self.max_tail_bytes && self.tail.len() > 1)
+        {
+            if let Some(evicted) = self.tail.pop_front() {
+                self.tail_bytes -= evicted.len() + 1;
+            }
+        }
+    }
+
+    fn into_string(self) -> String {
+        if !self.head_full {
+            // No truncation needed
+            return self.head.join("\n");
+        }
+
+        let head_text = self.head.join("\n");
+        let tail_count = self.tail.len();
+        let tail_text: String = self.tail.into_iter().collect::<Vec<_>>().join("\n");
+        let omitted = self.total_lines - self.head.len() - tail_count;
+        format!(
+            "{}\n\n... [{} lines truncated] ...\n\n{}",
+            head_text, omitted, tail_text
+        )
     }
 }
 
@@ -95,12 +185,10 @@ impl Tool for BashTool {
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
 
-        let mut output = String::new();
-        let mut error_output = String::new();
-        let mut stdout_lines = 0usize;
-        let mut stderr_lines = 0usize;
-        let mut stdout_truncated = false;
-        let mut stderr_truncated = false;
+        let mut stdout_collector = OutputCollector::new();
+        let mut stderr_collector = OutputCollector::new();
+        let mut stdout_done = false;
+        let mut stderr_done = false;
 
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         let deadline = tokio::time::Instant::now() + timeout;
@@ -115,84 +203,47 @@ impl Tool for BashTool {
                     let _ = child.kill().await;
                     let result = format!(
                         "{}\n{}\n\nCommand timed out after {} seconds",
-                        output, error_output, timeout_secs
+                        stdout_collector.into_string(),
+                        stderr_collector.into_string(),
+                        timeout_secs
                     );
                     return ToolResult::error(result);
                 }
-                line = stdout_reader.next_line() => {
+                line = stdout_reader.next_line(), if !stdout_done => {
                     match line {
                         Ok(Some(l)) => {
-                            // Check truncation limits
-                            if stdout_truncated {
-                                continue; // Skip remaining lines
-                            }
-                            if stdout_lines >= MAX_OUTPUT_LINES || output.len() + l.len() > MAX_OUTPUT_SIZE {
-                                stdout_truncated = true;
-                                continue;
-                            }
-                            if !output.is_empty() {
-                                output.push('\n');
-                            }
-                            output.push_str(&l);
-                            stdout_lines += 1;
+                            stdout_collector.push_line(l);
                         }
-                        Ok(None) => {}
+                        Ok(None) => { stdout_done = true; }
                         Err(e) => {
-                            error_output.push_str(&format!("\nStdout read error: {}", e));
+                            stderr_collector.push_line(format!("Stdout read error: {}", e));
+                            stdout_done = true;
                         }
                     }
                 }
-                line = stderr_reader.next_line() => {
+                line = stderr_reader.next_line(), if !stderr_done => {
                     match line {
                         Ok(Some(l)) => {
-                            // Check truncation limits
-                            if stderr_truncated {
-                                continue; // Skip remaining lines
-                            }
-                            if stderr_lines >= MAX_OUTPUT_LINES || error_output.len() + l.len() > MAX_OUTPUT_SIZE {
-                                stderr_truncated = true;
-                                continue;
-                            }
-                            if !error_output.is_empty() {
-                                error_output.push('\n');
-                            }
-                            error_output.push_str(&l);
-                            stderr_lines += 1;
+                            stderr_collector.push_line(l);
                         }
-                        Ok(None) => {}
+                        Ok(None) => { stderr_done = true; }
                         Err(e) => {
-                            error_output.push_str(&format!("\nStderr read error: {}", e));
+                            stderr_collector.push_line(format!("Stderr read error: {}", e));
+                            stderr_done = true;
                         }
                     }
                 }
                 status = child.wait() => {
                     match status {
                         Ok(exit_status) => {
-                            let mut result = output;
+                            let mut result = stdout_collector.into_string();
 
-                            // Add truncation notice for stdout
-                            if stdout_truncated {
-                                result.push_str(&format!(
-                                    "\n\n... (stdout truncated at {} lines / {}KB)",
-                                    stdout_lines,
-                                    MAX_OUTPUT_SIZE / 1024
-                                ));
-                            }
-
-                            if !error_output.is_empty() {
+                            let err_output = stderr_collector.into_string();
+                            if !err_output.is_empty() {
                                 if !result.is_empty() {
                                     result.push('\n');
                                 }
-                                result.push_str(&error_output);
-
-                                // Add truncation notice for stderr
-                                if stderr_truncated {
-                                    result.push_str(&format!(
-                                        "\n\n... (stderr truncated at {} lines / {}KB)",
-                                        stderr_lines,
-                                        MAX_OUTPUT_SIZE / 1024
-                                    ));
-                                }
+                                result.push_str(&err_output);
                             }
 
                             if result.is_empty() {
