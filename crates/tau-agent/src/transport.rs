@@ -105,6 +105,8 @@ async fn create_provider_and_stream(
                 effort: None,
                 output_format: None,
                 container: None,
+                auto_cache_control: false,
+                inference_geo: None,
             };
 
             provider.stream(model, context, Some(&options)).await

@@ -60,6 +60,10 @@ pub struct AnthropicOptions {
     pub output_format: Option<serde_json::Value>,
     /// Container ID for code execution sandboxing
     pub container: Option<String>,
+    /// Top-level cache control — auto-applies to last cacheable block
+    pub auto_cache_control: bool,
+    /// Geographic region for inference processing
+    pub inference_geo: Option<String>,
 }
 
 /// Tool choice strategy
@@ -326,6 +330,12 @@ impl AnthropicProvider {
             service_tier: options.service_tier.clone(),
             output_config,
             container: options.container.clone(),
+            cache_control: if options.auto_cache_control {
+                Some(make_cache_control(&options.cache_scope, &options.cache_ttl))
+            } else {
+                None
+            },
+            inference_geo: options.inference_geo.clone(),
         };
 
         // Enable thinking if requested

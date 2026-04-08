@@ -209,6 +209,9 @@ provider = "anthropic"
 # Default reasoning level (off, minimal, low, medium, high)
 reasoning_level = "off"
 
+# Use adaptive thinking — model decides when and how much to think
+# thinking_adaptive = true
+
 # Whether to use TUI mode by default (true by default)
 # Set to false for simple stdin/stdout mode
 tui = true
@@ -228,5 +231,11 @@ tui = true
 # enabled = true
 # reserve_tokens = 16384
 # keep_recent_tokens = 20000
+
+# Prompt caching settings (optional)
+# [cache]
+# scope = "org"           # "global" (1P only) or "org"
+# ttl = "1h"              # "1h" or "5m" (default: 5m)
+# prompt_boundary = "<!-- DYNAMIC_BOUNDARY -->"
 "#
 }
