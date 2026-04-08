@@ -12,7 +12,6 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
-async-trait = { workspace = true }
 reqwest = { workspace = true }
 reqwest-eventsource = { workspace = true }
 serde = { workspace = true }

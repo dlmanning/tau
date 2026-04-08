@@ -1,10 +1,12 @@
 //! Model registry — auto-generated model data with public lookup API.
 
-use crate::models_generated::{ModelEntry, MODEL_ENTRIES};
-use crate::{Api, CostInfo, InputType, Model, Provider};
+use crate::{
+    Api, CostInfo, InputType, Model, Provider,
+    models_generated::{MODEL_ENTRIES, ModelEntry},
+};
 
 impl ModelEntry {
-    fn to_model(&self) -> Model {
+    fn as_model(&self) -> Model {
         Model {
             id: self.id.to_string(),
             name: self.name.to_string(),
@@ -47,7 +49,7 @@ pub fn get_model(provider: Provider, id: &str) -> Option<Model> {
     MODEL_ENTRIES
         .iter()
         .find(|e| e.id == id && e.provider == provider.name())
-        .map(|e| e.to_model())
+        .map(|e| e.as_model())
 }
 
 /// Look up a model by ID only (first match across all providers).
@@ -55,7 +57,7 @@ pub fn get_model_by_id(id: &str) -> Option<Model> {
     MODEL_ENTRIES
         .iter()
         .find(|e| e.id == id)
-        .map(|e| e.to_model())
+        .map(|e| e.as_model())
 }
 
 /// Get all models for a specific provider.
@@ -63,13 +65,13 @@ pub fn get_models(provider: Provider) -> Vec<Model> {
     MODEL_ENTRIES
         .iter()
         .filter(|e| e.provider == provider.name())
-        .map(|e| e.to_model())
+        .map(|e| e.as_model())
         .collect()
 }
 
 /// Get all registered models.
 pub fn get_all_models() -> Vec<Model> {
-    MODEL_ENTRIES.iter().map(|e| e.to_model()).collect()
+    MODEL_ENTRIES.iter().map(|e| e.as_model()).collect()
 }
 
 /// Get all providers that have at least one registered model.
