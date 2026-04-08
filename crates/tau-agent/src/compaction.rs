@@ -88,7 +88,7 @@ fn content_char_count(content: &[Content]) -> usize {
         .iter()
         .map(|c| match c {
             Content::Text { text } => text.len(),
-            Content::Thinking { thinking } => thinking.len(),
+            Content::Thinking { thinking, .. } => thinking.len(),
             Content::ToolCall {
                 name, arguments, ..
             } => name.len() + serde_json::to_string(arguments).unwrap_or_default().len(),
@@ -122,7 +122,7 @@ fn serialize_messages_for_summary(messages: &[Message]) -> String {
 
                 for c in content {
                     match c {
-                        Content::Thinking { thinking } => {
+                        Content::Thinking { thinking, .. } => {
                             thinking_parts.push(thinking.as_str());
                         }
                         Content::Text { text } => {

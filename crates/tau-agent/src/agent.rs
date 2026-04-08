@@ -721,7 +721,7 @@ fn has_meaningful_content(message: &Message) -> bool {
 
     content.iter().any(|c| match c {
         Content::Text { text } => !text.trim().is_empty(),
-        Content::Thinking { thinking } => !thinking.trim().is_empty(),
+        Content::Thinking { thinking, .. } => !thinking.trim().is_empty(),
         Content::ToolCall { name, .. } => !name.is_empty(),
         Content::Image { .. } => true,
     })

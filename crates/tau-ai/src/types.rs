@@ -1,7 +1,8 @@
 //! Core types for LLM interactions
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Supported API types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -175,7 +176,12 @@ pub enum Content {
     /// Image content (base64 encoded)
     Image { data: String, mime_type: String },
     /// Thinking/reasoning content
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        /// Anthropic thinking block signature for cache efficiency
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     /// Tool call request
     ToolCall {
         id: String,
@@ -202,6 +208,18 @@ impl Content {
     pub fn thinking(thinking: impl Into<String>) -> Self {
         Self::Thinking {
             thinking: thinking.into(),
+            signature: None,
+        }
+    }
+
+    /// Create thinking content with a signature
+    pub fn thinking_with_signature(
+        thinking: impl Into<String>,
+        signature: impl Into<String>,
+    ) -> Self {
+        Self::Thinking {
+            thinking: thinking.into(),
+            signature: Some(signature.into()),
         }
     }
 

@@ -197,7 +197,10 @@ impl MessageBuilder {
             .into_iter()
             .map(|buf| match buf {
                 ContentBuffer::Text(text) => Content::Text { text },
-                ContentBuffer::Thinking(thinking) => Content::Thinking { thinking },
+                ContentBuffer::Thinking(thinking) => Content::Thinking {
+                    thinking,
+                    signature: None,
+                },
                 ContentBuffer::ToolCall {
                     id,
                     name,
@@ -233,6 +236,7 @@ impl MessageBuilder {
                 ContentBuffer::Text(text) => Content::Text { text: text.clone() },
                 ContentBuffer::Thinking(thinking) => Content::Thinking {
                     thinking: thinking.clone(),
+                    signature: None,
                 },
                 ContentBuffer::ToolCall {
                     id,
