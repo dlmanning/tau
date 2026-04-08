@@ -5,6 +5,7 @@ mod config;
 mod context;
 mod lsp;
 mod oauth;
+mod prompts;
 mod session;
 mod tools;
 mod ui;
@@ -320,7 +321,26 @@ async fn main() -> anyhow::Result<()> {
 
     // Build dynamic system prompt based on registered tools
     let tool_names = agent.tool_names();
-    agent.set_system_prompt(build_system_prompt(&tool_names));
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let acolyte_mode = cfg.acolyte_mode.unwrap_or(false);
+    let prompt_opts = prompts::PromptOptions {
+        tool_names: &tool_names,
+        cwd: &cwd,
+        acolyte_mode,
+    };
+    let mut system_prompt = prompts::build_system_prompt(&prompt_opts);
+
+    // Append project context (CLAUDE.md, AGENTS.md)
+    if let Some(context_content) = context::load_context() {
+        system_prompt = format!(
+            "{}\n\n---\n\n# Project Context\n\n{}",
+            system_prompt, context_content
+        );
+    }
+
+    agent.set_system_prompt(system_prompt);
 
     // Resume session if specified
     if let Some(ref session_id) = args.resume {
@@ -752,63 +772,6 @@ fn list_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build dynamic system prompt based on available tools
-fn build_system_prompt(tool_names: &[&str]) -> String {
-    let has_bash = tool_names.contains(&"bash");
-    let has_read = tool_names.contains(&"read");
-    let has_write = tool_names.contains(&"write");
-    let has_edit = tool_names.contains(&"edit");
-    let has_glob = tool_names.contains(&"glob");
-    let has_grep = tool_names.contains(&"grep");
-
-    let can_modify = has_write || has_edit || has_bash;
-
-    let mut prompt = String::from("You are tau, an AI-powered coding assistant.\n\n");
-
-    // Mode notice if read-only
-    if !can_modify {
-        prompt.push_str("NOTE: You are in READ-ONLY mode. You can explore and analyze code but cannot make changes.\n\n");
-    }
-
-    // Tool descriptions are provided via the API tool definitions;
-    // no need to duplicate them in the system prompt.
-
-    // Conditional guidelines based on available tools
-    prompt.push_str("Guidelines:\n");
-    prompt.push_str("- Be concise and helpful\n");
-
-    if has_read && (has_edit || has_write) {
-        prompt.push_str("- Always read files before making edits\n");
-    }
-
-    if has_edit && has_write {
-        prompt.push_str("- Use edit for small changes, write for new files\n");
-    }
-
-    if has_glob || has_grep {
-        prompt.push_str("- Use glob/grep to explore before making changes\n");
-    }
-
-    if has_bash {
-        prompt.push_str("- Warn before destructive commands\n");
-    }
-
-    // Add current working directory
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-    prompt.push_str(&format!("\nWorking directory: {}", cwd));
-
-    // Load hierarchical context files (AGENTS.md, CLAUDE.md)
-    if let Some(context_content) = context::load_context() {
-        format!(
-            "{}\n\n---\n\n# Project Context\n\n{}",
-            prompt, context_content
-        )
-    } else {
-        prompt
-    }
-}
 
 async fn handle_oauth_login(provider_id: &str) -> anyhow::Result<()> {
     let provider = match oauth::OAuthProvider::from_id(provider_id) {

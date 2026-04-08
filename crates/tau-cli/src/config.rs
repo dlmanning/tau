@@ -29,6 +29,9 @@ pub struct Config {
     /// Cache settings
     #[serde(default)]
     pub cache: Option<CacheSettings>,
+    /// Enable Anthropic-internal prompt additions (stricter verification,
+    /// comment philosophy, faithful reporting, richer communication style)
+    pub acolyte_mode: Option<bool>,
 }
 
 /// Settings for prompt caching
@@ -138,6 +141,7 @@ impl Config {
             api_keys: ApiKeys::default(),
             compaction: None,
             cache: None,
+            acolyte_mode: None,
         };
 
         default_config.save()?;
