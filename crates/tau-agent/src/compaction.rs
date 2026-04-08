@@ -80,7 +80,7 @@ pub fn estimate_tokens(message: &Message) -> u32 {
 
 /// Estimate total tokens for a slice of messages
 pub fn estimate_total_tokens(messages: &[Message]) -> u32 {
-    messages.iter().map(|m| estimate_tokens(m)).sum()
+    messages.iter().map(estimate_tokens).sum()
 }
 
 fn content_char_count(content: &[Content]) -> usize {
@@ -131,8 +131,7 @@ fn serialize_messages_for_summary(messages: &[Message]) -> String {
                         Content::ToolCall {
                             name, arguments, ..
                         } => {
-                            let args_str =
-                                format_tool_args(arguments);
+                            let args_str = format_tool_args(arguments);
                             tool_calls.push(format!("{}({})", name, args_str));
                         }
                         _ => {}
@@ -258,9 +257,7 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
                             }
                         }
                         // Also check file_path for edit tool
-                        if let Some(path) =
-                            arguments.get("file_path").and_then(|v| v.as_str())
-                        {
+                        if let Some(path) = arguments.get("file_path").and_then(|v| v.as_str()) {
                             if !modified_files.contains(&path.to_string()) {
                                 modified_files.push(path.to_string());
                             }
@@ -332,11 +329,11 @@ fn find_cut_point(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPo
     // Check if we split an assistant turn (assistant message with tool calls has results after it)
     let is_split_turn = matches!(&messages[first_kept], Message::Assistant { .. })
         && first_kept > 0
-        && has_tool_calls_with_results(&messages, first_kept);
+        && has_tool_calls_with_results(messages, first_kept);
 
     let turn_start_index = if is_split_turn {
         // Find the assistant message that starts this turn
-        Some(find_turn_start(&messages, first_kept))
+        Some(find_turn_start(messages, first_kept))
     } else {
         None
     };
@@ -351,7 +348,9 @@ fn find_cut_point(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPo
 /// Check if an assistant message at `idx` has tool call results that follow it
 fn has_tool_calls_with_results(messages: &[Message], idx: usize) -> bool {
     if let Message::Assistant { content, .. } = &messages[idx] {
-        let has_tool_calls = content.iter().any(|c| matches!(c, Content::ToolCall { .. }));
+        let has_tool_calls = content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall { .. }));
         if has_tool_calls && idx + 1 < messages.len() {
             return matches!(&messages[idx + 1], Message::ToolResult { .. });
         }
@@ -496,12 +495,8 @@ pub async fn compact(
             let turn_prompt =
                 TURN_PREFIX_SUMMARIZATION_PROMPT.replace("{conversation}", &turn_prefix_text);
 
-            let turn_summary = call_summarization_llm(
-                &turn_prompt,
-                agent_config,
-                transport,
-            )
-            .await?;
+            let turn_summary =
+                call_summarization_llm(&turn_prompt, agent_config, transport).await?;
             full_summary.push_str("## Split Turn Context\n");
             full_summary.push_str(&turn_summary);
             full_summary.push_str("\n\n");
@@ -509,12 +504,7 @@ pub async fn compact(
     }
 
     // Generate the main summary
-    let main_summary = call_summarization_llm(
-        &prompt,
-        agent_config,
-        transport,
-    )
-    .await?;
+    let main_summary = call_summarization_llm(&prompt, agent_config, transport).await?;
     full_summary.push_str(&main_summary);
 
     Ok(CompactionResult {
@@ -574,8 +564,9 @@ async fn call_summarization_llm(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tau_ai::{AssistantMetadata, Content, Message};
+
+    use super::*;
 
     fn user_msg(text: &str) -> Message {
         Message::User {
@@ -630,7 +621,7 @@ mod tests {
     #[test]
     fn test_estimate_total_tokens() {
         let messages = vec![
-            user_msg(&"x".repeat(400)),     // 100 tokens
+            user_msg(&"x".repeat(400)),      // 100 tokens
             assistant_msg(&"y".repeat(800)), // 200 tokens
         ];
         assert_eq!(estimate_total_tokens(&messages), 300);
@@ -647,9 +638,9 @@ mod tests {
         // Create messages with known token sizes
         let messages = vec![
             user_msg(&"a".repeat(400)),      // 100 tokens
-            assistant_msg(&"b".repeat(400)),  // 100 tokens
-            user_msg(&"c".repeat(400)),       // 100 tokens
-            assistant_msg(&"d".repeat(400)),  // 100 tokens
+            assistant_msg(&"b".repeat(400)), // 100 tokens
+            user_msg(&"c".repeat(400)),      // 100 tokens
+            assistant_msg(&"d".repeat(400)), // 100 tokens
         ];
         // keep_recent_tokens=150 -> should keep last ~2 messages
         let cut = find_cut_point(&messages, 150).unwrap();
@@ -668,16 +659,16 @@ mod tests {
         // Should never have first_kept_index pointing at a ToolResult
         let cut = find_cut_point(&messages, 200);
         if let Some(cut) = cut {
-            assert!(!matches!(&messages[cut.first_kept_index], Message::ToolResult { .. }));
+            assert!(!matches!(
+                &messages[cut.first_kept_index],
+                Message::ToolResult { .. }
+            ));
         }
     }
 
     #[test]
     fn test_serialize_messages() {
-        let messages = vec![
-            user_msg("Hello"),
-            assistant_msg("Hi there!"),
-        ];
+        let messages = vec![user_msg("Hello"), assistant_msg("Hi there!")];
         let text = serialize_messages_for_summary(&messages);
         assert!(text.contains("[User]: Hello"));
         assert!(text.contains("[Assistant]: Hi there!"));
@@ -701,7 +692,11 @@ mod tests {
         let messages = vec![
             assistant_with_tool_call("", "read", serde_json::json!({"path": "/foo.rs"})),
             tool_result_msg("read", "contents"),
-            assistant_with_tool_call("", "edit", serde_json::json!({"file_path": "/bar.rs", "old_string": "a", "new_string": "b"})),
+            assistant_with_tool_call(
+                "",
+                "edit",
+                serde_json::json!({"file_path": "/bar.rs", "old_string": "a", "new_string": "b"}),
+            ),
             tool_result_msg("edit", "ok"),
         ];
         let (read, modified) = extract_file_operations(&messages);

@@ -1,11 +1,11 @@
 //! Agent state management and execution
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::Ordering,
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::Ordering},
 };
+
+use parking_lot::Mutex;
 use tau_ai::{Content, Message, Model, ReasoningLevel, Usage};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -47,8 +47,13 @@ pub struct AgentConfig {
 
 // Re-export types that were moved to their own modules so existing
 // `use crate::agent::Conversation` etc. paths keep working.
-pub use crate::conversation::{AgentState, Conversation};
-pub use crate::handle::AgentHandle;
+pub use crate::{
+    conversation::{AgentState, Conversation},
+    handle::AgentHandle,
+};
+
+/// Type alias for the transform context callback.
+type TransformContextFn = dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync;
 
 /// The main agent that orchestrates conversations
 pub struct Agent {
@@ -61,7 +66,7 @@ pub struct Agent {
 
     // --- transformContext hook ---
     /// Optional hook to transform context messages before sending to transport
-    transform_context: Option<Arc<dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync>>,
+    transform_context: Option<Arc<TransformContextFn>>,
 
     // --- Schema validator cache ---
     /// Cached compiled JSON schema validators keyed by tool name
@@ -437,7 +442,11 @@ impl Agent {
         for m in messages_to_add.drain(..) {
             self.conversation.messages.push(m);
         }
-        if self.run_compaction(CompactionReason::Overflow).await.is_ok() {
+        if self
+            .run_compaction(CompactionReason::Overflow)
+            .await
+            .is_ok()
+        {
             if let Some(msg) = first_user_message {
                 *messages_to_add = vec![msg.clone()];
             }
@@ -508,7 +517,12 @@ impl Agent {
                 is_error: result.is_error,
             });
 
-            tool_results.push(Message::tool_result(id, name, result.content, result.is_error));
+            tool_results.push(Message::tool_result(
+                id,
+                name,
+                result.content,
+                result.is_error,
+            ));
 
             // Check steering queue after each tool
             let steering_msgs =
@@ -555,7 +569,10 @@ impl Agent {
     }
 
     /// Core agent loop, shared between prompt_with_content and continue_loop.
-    async fn run_with_messages(&mut self, initial_messages: Vec<Message>) -> crate::error::Result<()> {
+    async fn run_with_messages(
+        &mut self,
+        initial_messages: Vec<Message>,
+    ) -> crate::error::Result<()> {
         // Reset cancellation token
         *self.handle.cancel.lock() = CancellationToken::new();
         self.handle.is_running.store(true, Ordering::Release);
@@ -634,7 +651,8 @@ impl Agent {
             }
 
             self.accumulate_usage(&turn_usage);
-            self.check_compaction_threshold(&turn_usage, &mut messages_to_add).await;
+            self.check_compaction_threshold(&turn_usage, &mut messages_to_add)
+                .await;
 
             // Process assistant message
             if let Some(msg) = assistant_message {
@@ -754,12 +772,16 @@ fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::events::AgentEvent;
-    use crate::transport::{AgentEventStream, AgentRunConfig, Transport};
-    use async_trait::async_trait;
     use std::sync::Arc;
+
+    use async_trait::async_trait;
     use tau_ai::{AssistantMetadata, Content, Message};
+
+    use super::*;
+    use crate::{
+        events::AgentEvent,
+        transport::{AgentEventStream, AgentRunConfig, Transport},
+    };
 
     // ===== Item 2: validate_tool_args tests =====
 
@@ -793,7 +815,11 @@ mod tests {
         assert!(err.is_some());
         let msg = err.unwrap();
         assert!(msg.contains("validation failed"), "got: {}", msg);
-        assert!(msg.contains("path"), "should mention missing field, got: {}", msg);
+        assert!(
+            msg.contains("path"),
+            "should mention missing field, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -997,7 +1023,11 @@ mod tests {
         // Both responses should be in messages:
         // [user, assistant("first response"), user("follow-up question"), assistant("second response")]
         let msgs = agent.messages();
-        assert!(msgs.len() >= 4, "expected at least 4 messages, got {}", msgs.len());
+        assert!(
+            msgs.len() >= 4,
+            "expected at least 4 messages, got {}",
+            msgs.len()
+        );
 
         let texts: Vec<String> = msgs.iter().map(|m| m.text()).collect();
         assert!(texts.iter().any(|t| t.contains("first response")));
@@ -1218,7 +1248,10 @@ mod tests {
         });
 
         agent.prompt("hello").await.unwrap();
-        assert!(called.load(Ordering::Acquire), "transform_context hook should have been called");
+        assert!(
+            called.load(Ordering::Acquire),
+            "transform_context hook should have been called"
+        );
     }
 
     #[tokio::test]
@@ -1242,7 +1275,10 @@ mod tests {
         });
 
         agent.prompt("test").await.unwrap();
-        assert!(*injected.lock(), "transform hook should have modified messages");
+        assert!(
+            *injected.lock(),
+            "transform hook should have modified messages"
+        );
     }
 
     #[tokio::test]
@@ -1279,6 +1315,9 @@ mod tests {
         // Second prompt should NOT increment counter
         agent.prompt("second").await.unwrap();
         let count_after_second = call_count.load(Ordering::Relaxed);
-        assert_eq!(count_after_first, count_after_second, "hook should not be called after clear");
+        assert_eq!(
+            count_after_first, count_after_second,
+            "hook should not be called after clear"
+        );
     }
 }
