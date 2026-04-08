@@ -118,6 +118,15 @@ pub struct Usage {
     pub cache_write: u32,
     /// Thinking/reasoning tokens (Claude extended thinking)
     pub thinking: u32,
+    /// Granular cache creation breakdown by TTL tier
+    #[serde(default)]
+    pub cache_creation_1h: u32,
+    /// Granular cache creation breakdown by TTL tier
+    #[serde(default)]
+    pub cache_creation_5m: u32,
+    /// Service tier used for this request ("standard", "priority", "batch")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 impl Usage {
@@ -187,6 +196,19 @@ pub enum Content {
         id: String,
         name: String,
         arguments: serde_json::Value,
+    },
+    /// Redacted thinking block (content hidden, signature preserved)
+    RedactedThinking { data: String },
+    /// Server-initiated tool use (web search, code execution, etc.)
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Server tool result
+    ServerToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
     },
 }
 

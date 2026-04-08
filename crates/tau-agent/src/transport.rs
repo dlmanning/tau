@@ -95,10 +95,16 @@ async fn create_provider_and_stream(
                 thinking_enabled,
                 thinking_adaptive: config.thinking_adaptive,
                 thinking_budget_tokens: budget,
+                thinking_display: None,
                 tool_choice: None,
                 cache_scope,
                 cache_ttl: config.cache_ttl.clone(),
                 system_prompt_boundary: config.system_prompt_boundary.clone(),
+                metadata: None,
+                service_tier: None,
+                effort: None,
+                output_format: None,
+                container: None,
             };
 
             provider.stream(model, context, Some(&options)).await

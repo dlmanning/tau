@@ -93,6 +93,13 @@ fn content_char_count(content: &[Content]) -> usize {
                 name, arguments, ..
             } => name.len() + serde_json::to_string(arguments).unwrap_or_default().len(),
             Content::Image { .. } => 4800, // ~1200 tokens * 4 chars/token
+            Content::RedactedThinking { data } => data.len(),
+            Content::ServerToolUse { name, input, .. } => {
+                name.len() + serde_json::to_string(input).unwrap_or_default().len()
+            }
+            Content::ServerToolResult { content, .. } => {
+                serde_json::to_string(content).unwrap_or_default().len()
+            }
         })
         .sum()
 }

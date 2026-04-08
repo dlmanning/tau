@@ -740,6 +740,9 @@ fn has_meaningful_content(message: &Message) -> bool {
         Content::Thinking { thinking, .. } => !thinking.trim().is_empty(),
         Content::ToolCall { name, .. } => !name.is_empty(),
         Content::Image { .. } => true,
+        Content::RedactedThinking { .. } => true,
+        Content::ServerToolUse { .. } => true,
+        Content::ServerToolResult { .. } => true,
     })
 }
 

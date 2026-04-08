@@ -33,6 +33,8 @@ pub struct AnthropicOptions {
     pub thinking_adaptive: bool,
     /// Budget for thinking tokens (used when not adaptive)
     pub thinking_budget_tokens: Option<u32>,
+    /// Thinking display mode ("summarized" or "omitted")
+    pub thinking_display: Option<String>,
     /// Tool choice strategy
     pub tool_choice: Option<ToolChoice>,
     /// Cache scope for prompt caching breakpoints
@@ -41,16 +43,55 @@ pub struct AnthropicOptions {
     pub cache_ttl: Option<String>,
     /// Dynamic boundary marker for system prompt splitting
     pub system_prompt_boundary: Option<String>,
+    /// Request metadata (e.g. `{"user_id": "..."}`)
+    pub metadata: Option<serde_json::Value>,
+    /// Service tier ("auto" or "standard_only")
+    pub service_tier: Option<String>,
+    /// Effort level ("low", "medium", "high", "max")
+    pub effort: Option<String>,
+    /// Structured output format (JSON schema)
+    pub output_format: Option<serde_json::Value>,
+    /// Container ID for code execution sandboxing
+    pub container: Option<String>,
 }
 
 /// Tool choice strategy
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
-    Auto,
-    Any,
+    Auto {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
     None,
-    Tool { name: String },
+    Tool {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+}
+
+impl ToolChoice {
+    pub fn auto() -> Self {
+        Self::Auto {
+            disable_parallel_tool_use: None,
+        }
+    }
+    pub fn any() -> Self {
+        Self::Any {
+            disable_parallel_tool_use: None,
+        }
+    }
+    pub fn tool(name: impl Into<String>) -> Self {
+        Self::Tool {
+            name: name.into(),
+            disable_parallel_tool_use: None,
+        }
+    }
 }
 
 /// Anthropic API client
@@ -228,6 +269,16 @@ impl AnthropicProvider {
 
         let max_tokens = options.base.max_tokens.unwrap_or(model.max_tokens / 3);
 
+        // Build output_config if effort or format is specified
+        let output_config = if options.effort.is_some() || options.output_format.is_some() {
+            Some(OutputConfig {
+                effort: options.effort.clone(),
+                format: options.output_format.clone(),
+            })
+        } else {
+            None
+        };
+
         let mut request = AnthropicRequest {
             model: model.id.clone(),
             messages,
@@ -238,18 +289,26 @@ impl AnthropicProvider {
             tools,
             tool_choice: options.tool_choice.clone(),
             thinking: None,
+            stop_sequences: options.base.stop_sequences.clone(),
+            metadata: options.metadata.clone(),
+            service_tier: options.service_tier.clone(),
+            output_config,
+            container: options.container.clone(),
         };
 
         // Enable thinking if requested
         if options.thinking_enabled && model.reasoning {
+            let display = options.thinking_display.clone();
             request.thinking = Some(if options.thinking_adaptive {
                 ThinkingConfig::Adaptive {
                     thinking_type: "adaptive".to_string(),
+                    display,
                 }
             } else {
                 ThinkingConfig::Enabled {
                     thinking_type: "enabled".to_string(),
                     budget_tokens: options.thinking_budget_tokens.unwrap_or(1024),
+                    display,
                 }
             });
         }
@@ -285,6 +344,11 @@ fn create_stream(
                             usage.cache_read = data.message.usage.cache_read_input_tokens.unwrap_or(0);
                             usage.cache_write = data.message.usage.cache_creation_input_tokens.unwrap_or(0);
                             usage.thinking = data.message.usage.thinking_output_tokens.unwrap_or(0);
+                            if let Some(ref cc) = data.message.usage.cache_creation {
+                                usage.cache_creation_1h = cc.ephemeral_1h_input_tokens;
+                                usage.cache_creation_5m = cc.ephemeral_5m_input_tokens;
+                            }
+                            usage.service_tier = data.message.usage.service_tier.clone();
                         }
                     } else if message.event == "content_block_start" {
                         if let Ok(data) = serde_json::from_str::<ContentBlockStartEvent>(&message.data) {
@@ -320,6 +384,17 @@ fn create_stream(
                                         id,
                                         name,
                                     };
+                                }
+                                "redacted_thinking" => {
+                                    content_blocks[index] = ContentBlock::RedactedThinking {
+                                        data: data.content_block.data.unwrap_or_default(),
+                                    };
+                                }
+                                "server_tool_use" => {
+                                    let id = data.content_block.id.unwrap_or_default();
+                                    let name = data.content_block.name.unwrap_or_default();
+                                    let input = data.content_block.input.unwrap_or(serde_json::Value::Null);
+                                    content_blocks[index] = ContentBlock::ServerToolUse { id, name, input };
                                 }
                                 _ => {}
                             }
@@ -424,6 +499,11 @@ fn create_stream(
                             usage.cache_read = data.usage.cache_read_input_tokens.unwrap_or(0);
                             usage.cache_write = data.usage.cache_creation_input_tokens.unwrap_or(0);
                             usage.thinking = data.usage.thinking_output_tokens.unwrap_or(0);
+                            if let Some(ref cc) = data.usage.cache_creation {
+                                usage.cache_creation_1h = cc.ephemeral_1h_input_tokens;
+                                usage.cache_creation_5m = cc.ephemeral_5m_input_tokens;
+                            }
+                            usage.service_tier = data.usage.service_tier.clone();
                         }
                     } else if message.event == "message_stop" {
                         // Stream complete
@@ -450,10 +530,14 @@ fn create_stream(
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(Content::Text { text }),
                 ContentBlock::Thinking { thinking, signature } => Some(Content::Thinking { thinking, signature }),
+                ContentBlock::RedactedThinking { data } => Some(Content::RedactedThinking { data }),
                 ContentBlock::ToolCall { id, name, arguments_json } => {
                     let arguments = serde_json::from_str(&arguments_json)
                         .unwrap_or(serde_json::Value::Null);
                     Some(Content::ToolCall { id, name, arguments })
+                }
+                ContentBlock::ServerToolUse { id, name, input } => {
+                    Some(Content::ServerToolUse { id, name, input })
                 }
                 ContentBlock::Empty => None,
             })
@@ -499,10 +583,18 @@ enum ContentBlock {
         thinking: String,
         signature: Option<String>,
     },
+    RedactedThinking {
+        data: String,
+    },
     ToolCall {
         id: String,
         name: String,
         arguments_json: String,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
     },
 }
 
@@ -526,6 +618,24 @@ struct AnthropicRequest {
     tool_choice: Option<ToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stop_sequences: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -553,11 +663,15 @@ enum ThinkingConfig {
     Adaptive {
         #[serde(rename = "type")]
         thinking_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
     },
     Enabled {
         #[serde(rename = "type")]
         thinking_type: String,
         budget_tokens: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
     },
 }
 
@@ -574,6 +688,14 @@ struct AnthropicTool {
     input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defer_loading: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eager_input_streaming: Option<bool>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    tool_type: Option<String>,
 }
 
 // ============================================================================
@@ -596,9 +718,18 @@ struct UsageInfo {
     output_tokens: u32,
     cache_read_input_tokens: Option<u32>,
     cache_creation_input_tokens: Option<u32>,
-    /// Extended thinking tokens (Claude reasoning)
     #[serde(default)]
     thinking_output_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation: Option<CacheCreationUsage>,
+    #[serde(default)]
+    service_tier: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheCreationUsage {
+    ephemeral_1h_input_tokens: u32,
+    ephemeral_5m_input_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -613,6 +744,10 @@ struct ContentBlockInfo {
     block_type: String,
     id: Option<String>,
     name: Option<String>,
+    /// Data field for redacted_thinking blocks
+    data: Option<String>,
+    /// Input for server_tool_use blocks
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -654,6 +789,10 @@ struct MessageDeltaEvent {
 #[derive(Debug, Deserialize)]
 struct MessageDelta {
     stop_reason: Option<String>,
+    #[allow(dead_code)]
+    stop_sequence: Option<String>,
+    #[allow(dead_code)]
+    stop_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -789,7 +928,13 @@ fn convert_messages(
                             "name": name,
                             "input": arguments
                         })),
-                        Content::Image { .. } => None,
+                        Content::RedactedThinking { data } => {
+                            Some(serde_json::json!({ "type": "redacted_thinking", "data": data }))
+                        }
+                        Content::ServerToolUse { id, name, input } => {
+                            Some(serde_json::json!({ "type": "server_tool_use", "id": id, "name": name, "input": input }))
+                        }
+                        Content::Image { .. } | Content::ServerToolResult { .. } => None,
                     })
                     .collect();
 
@@ -912,6 +1057,10 @@ fn convert_tools(
                 description: tool.description.clone(),
                 input_schema,
                 cache_control,
+                strict: None,
+                defer_loading: None,
+                eager_input_streaming: None,
+                tool_type: None,
             }
         })
         .collect()
@@ -991,6 +1140,7 @@ mod tests {
     fn test_thinking_config_adaptive_serialization() {
         let config = ThinkingConfig::Adaptive {
             thinking_type: "adaptive".to_string(),
+            display: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json, serde_json::json!({"type": "adaptive"}));
@@ -1002,6 +1152,7 @@ mod tests {
         let config = ThinkingConfig::Enabled {
             thinking_type: "enabled".to_string(),
             budget_tokens: 4096,
+            display: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(
