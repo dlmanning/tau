@@ -101,6 +101,48 @@ impl ToolChoice {
     }
 }
 
+const SPOOFED_SDK_VERSION: &str = "0.85.0";
+
+/// Apply Stainless SDK identification headers.
+///
+/// These are required for OAuth tokens and expected by the Anthropic API for
+/// analytics. We spoof the JS SDK identity because there is no official Rust SDK
+/// and OAuth validation may check against known SDK versions.
+fn apply_stainless_headers(headers: &mut reqwest::header::HeaderMap) {
+    let os = match std::env::consts::OS {
+        "macos" => "MacOS",
+        "linux" => "Linux",
+        "windows" => "Windows",
+        "freebsd" => "FreeBSD",
+        "openbsd" => "OpenBSD",
+        _ => "Unknown",
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86" => "x32",
+        "x86_64" => "x64",
+        "arm" => "arm",
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    headers.insert(
+        "User-Agent",
+        format!("Anthropic/JS {}", SPOOFED_SDK_VERSION)
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("X-Stainless-Lang", "js".parse().unwrap());
+    headers.insert(
+        "X-Stainless-Package-Version",
+        SPOOFED_SDK_VERSION.parse().unwrap(),
+    );
+    headers.insert("X-Stainless-OS", os.parse().unwrap());
+    headers.insert("X-Stainless-Arch", arch.parse().unwrap());
+    headers.insert("X-Stainless-Runtime", "node".parse().unwrap());
+    headers.insert("X-Stainless-Runtime-Version", "v22.12.0".parse().unwrap());
+    headers.insert("X-Stainless-Retry-Count", "0".parse().unwrap());
+}
+
 /// Anthropic API client
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -170,15 +212,7 @@ impl AnthropicProvider {
         headers.insert("content-type", "application/json".parse().unwrap());
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
 
-        // SDK identification headers (required for OAuth)
-        headers.insert("User-Agent", "Anthropic/JS 0.52.0".parse().unwrap());
-        headers.insert("X-Stainless-Lang", "js".parse().unwrap());
-        headers.insert("X-Stainless-Package-Version", "0.52.0".parse().unwrap());
-        headers.insert("X-Stainless-OS", "MacOS".parse().unwrap());
-        headers.insert("X-Stainless-Arch", "arm64".parse().unwrap());
-        headers.insert("X-Stainless-Runtime", "node".parse().unwrap());
-        headers.insert("X-Stainless-Runtime-Version", "v22.0.0".parse().unwrap());
-        headers.insert("X-Stainless-Retry-Count", "0".parse().unwrap());
+        apply_stainless_headers(&mut headers);
 
         // Add model-specific headers
         for (key, value) in &model.headers {
