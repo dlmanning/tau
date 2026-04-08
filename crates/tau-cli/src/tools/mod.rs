@@ -5,6 +5,7 @@ mod edit;
 mod glob;
 mod grep;
 mod list;
+pub mod lsp;
 mod read;
 mod write;
 
@@ -13,5 +14,6 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListTool;
+pub use lsp::LspTool;
 pub use read::ReadTool;
 pub use write::WriteTool;

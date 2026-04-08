@@ -3,6 +3,7 @@
 mod commands;
 mod config;
 mod context;
+mod lsp;
 mod oauth;
 mod session;
 mod tools;
@@ -310,6 +311,12 @@ async fn main() -> anyhow::Result<()> {
     agent.add_tool(Arc::new(tools::GlobTool::new()));
     agent.add_tool(Arc::new(tools::GrepTool::new()));
     agent.add_tool(Arc::new(tools::ListTool::new()));
+
+    // Add LSP tool if any language servers are available
+    let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?));
+    if lsp_manager.is_available() {
+        agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager)));
+    }
 
     // Build dynamic system prompt based on registered tools
     let tool_names = agent.tool_names();
