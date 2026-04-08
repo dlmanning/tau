@@ -1,10 +1,13 @@
 //! Grep content search tool
 
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+};
+
 use async_trait::async_trait;
 use serde_json::json;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
 use tau_agent::tool::{Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
 

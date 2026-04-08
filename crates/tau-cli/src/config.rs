@@ -1,8 +1,8 @@
 //! Configuration file support
 
+use std::{fs, path::PathBuf};
+
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
 
 /// Configuration for tau
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -75,12 +75,20 @@ impl Config {
             Ok(content) => match toml::from_str(&content) {
                 Ok(config) => config,
                 Err(e) => {
-                    eprintln!("Warning: Failed to parse config file {}: {}", path.display(), e);
+                    eprintln!(
+                        "Warning: Failed to parse config file {}: {}",
+                        path.display(),
+                        e
+                    );
                     Self::default()
                 }
             },
             Err(e) => {
-                eprintln!("Warning: Failed to read config file {}: {}", path.display(), e);
+                eprintln!(
+                    "Warning: Failed to read config file {}: {}",
+                    path.display(),
+                    e
+                );
                 Self::default()
             }
         }

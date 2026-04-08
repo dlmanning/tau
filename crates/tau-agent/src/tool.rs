@@ -1,8 +1,9 @@
 //! Tool trait and execution
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tau_ai::Content;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;

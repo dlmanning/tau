@@ -9,8 +9,8 @@ pub struct Conversation {
     pub messages: Vec<Message>,
     /// Whether currently streaming
     pub is_streaming: bool,
-    /// Current streaming message (partial)
-    pub stream_message: Option<Message>,
+    /// Current streaming message (partial) — internal to agent loop
+    pub(crate) stream_message: Option<Message>,
     /// Total usage across all turns
     pub total_usage: Usage,
     /// Last error

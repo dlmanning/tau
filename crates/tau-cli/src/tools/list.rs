@@ -1,9 +1,12 @@
 //! List directory tool
 
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
 use async_trait::async_trait;
 use serde_json::json;
-use std::fs;
-use std::path::{Path, PathBuf};
 use tau_agent::tool::{Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
 

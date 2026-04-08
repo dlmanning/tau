@@ -1,7 +1,5 @@
 //! Message list widget for displaying chat messages
 
-use crate::theme::Theme;
-use crate::widgets::markdown::render_markdown;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -10,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 use textwrap;
+
+use crate::{theme::Theme, widgets::markdown::render_markdown};
 
 /// A single message in the chat
 #[derive(Debug, Clone)]
@@ -225,11 +225,11 @@ pub fn calculate_message_height(messages: &[ChatMessage], width: usize) -> usize
     let mut total = 0;
     let theme = Theme::dark(); // Use default theme for calculation
     let content_width = width.saturating_sub(2);
-    
+
     for msg in messages {
         // Role header
         total += 1;
-        
+
         // Content lines - must match actual rendering logic
         if msg.role == "assistant" && !msg.is_error {
             if msg.content.is_empty() && msg.is_streaming {
@@ -245,7 +245,7 @@ pub fn calculate_message_height(messages: &[ChatMessage], width: usize) -> usize
             let wrapped = textwrap::wrap(&msg.content, content_width);
             total += wrapped.len();
         }
-        
+
         // Separator
         total += 1;
     }

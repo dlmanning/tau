@@ -1,9 +1,10 @@
 //! File editing tool
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
-use std::path::PathBuf;
 use tau_agent::tool::{Tool, ToolResult};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;

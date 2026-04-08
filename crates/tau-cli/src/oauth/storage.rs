@@ -2,14 +2,11 @@
 //!
 //! Stores OAuth tokens in ~/.config/tau/oauth.json with restricted permissions (0o600)
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::io;
-use std::path::PathBuf;
-
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::{collections::HashMap, fs, io, path::PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 /// OAuth credentials for a provider
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,8 +1,9 @@
 //! /session command - show session info and stats
 
-use super::CommandResult;
 use tau_agent::Agent;
 use tau_ai::{Model, ReasoningLevel};
+
+use super::CommandResult;
 
 pub struct SessionCommand;
 

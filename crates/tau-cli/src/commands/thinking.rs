@@ -1,7 +1,8 @@
 //! /thinking command - show and set reasoning level
 
-use super::CommandResult;
 use tau_ai::ReasoningLevel;
+
+use super::CommandResult;
 
 pub struct ThinkingCommand;
 

@@ -1,7 +1,10 @@
 //! Main application framework
 
-use crate::input::{Action, event_to_action};
-use crate::theme::Theme;
+use std::{
+    io::{self, Stdout},
+    time::Duration,
+};
+
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -11,8 +14,11 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io::{self, Stdout};
-use std::time::Duration;
+
+use crate::{
+    input::{Action, event_to_action},
+    theme::Theme,
+};
 
 /// Application state trait
 pub trait AppState {

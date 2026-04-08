@@ -1,8 +1,10 @@
 //! Animated spinner widget
 
-use crate::theme::Theme;
-use ratatui::{buffer::Buffer, layout::Rect, text::Span, widgets::Widget};
 use std::time::{Duration, Instant};
+
+use ratatui::{buffer::Buffer, layout::Rect, text::Span, widgets::Widget};
+
+use crate::theme::Theme;
 
 /// Spinner animation frames
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

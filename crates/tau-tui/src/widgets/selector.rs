@@ -1,6 +1,5 @@
 //! Selector popup widget for choosing from a list of options
 
-use crate::Theme;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -8,6 +7,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Widget},
 };
+
+use crate::Theme;
 
 /// Maximum width for selector popups
 const MAX_POPUP_WIDTH: u16 = 80;
@@ -162,10 +163,20 @@ impl<'a> Selector<'a> {
             .items
             .iter()
             .enumerate()
-            .map(|(i, item)| build_list_item(item.label, item.is_current, i == self.selected, self.theme))
+            .map(|(i, item)| {
+                build_list_item(item.label, item.is_current, i == self.selected, self.theme)
+            })
             .collect();
 
-        render_selector_popup(self.title, list_items, self.selected, size, self.theme, area, buf);
+        render_selector_popup(
+            self.title,
+            list_items,
+            self.selected,
+            size,
+            self.theme,
+            area,
+            buf,
+        );
     }
 }
 
@@ -221,10 +232,20 @@ impl<'a> OwnedSelector<'a> {
             .items
             .iter()
             .enumerate()
-            .map(|(i, item)| build_list_item(&item.label, item.is_current, i == self.selected, self.theme))
+            .map(|(i, item)| {
+                build_list_item(&item.label, item.is_current, i == self.selected, self.theme)
+            })
             .collect();
 
-        render_selector_popup(&self.title, list_items, self.selected, size, self.theme, area, buf);
+        render_selector_popup(
+            &self.title,
+            list_items,
+            self.selected,
+            size,
+            self.theme,
+            area,
+            buf,
+        );
     }
 }
 

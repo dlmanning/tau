@@ -1,8 +1,7 @@
+use std::{collections::BTreeMap, fmt::Write, path::Path};
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
-use std::fmt::Write;
-use std::path::Path;
 
 const API_URL: &str = "https://models.dev/api.json";
 
@@ -16,11 +15,7 @@ fn provider_config(key: &str) -> Option<(&'static str, &'static str, &'static st
             "AnthropicMessages",
             "https://api.anthropic.com",
         )),
-        "openai" => Some((
-            "OpenAI",
-            "OpenAIResponses",
-            "https://api.openai.com/v1",
-        )),
+        "openai" => Some(("OpenAI", "OpenAIResponses", "https://api.openai.com/v1")),
         "google" => Some((
             "Google",
             "GoogleGenerativeAI",
@@ -117,7 +112,9 @@ fn main() -> Result<()> {
         None => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
-            eprintln!("  generate-models    Fetch models from models.dev and generate models_generated.rs");
+            eprintln!(
+                "  generate-models    Fetch models from models.dev and generate models_generated.rs"
+            );
             Ok(())
         }
     }
@@ -170,9 +167,7 @@ fn generate_models() -> Result<()> {
                 .unwrap_or_default();
 
             // Strip provider prefix (e.g. "anthropic/claude-opus-4.5" -> "claude-opus-4.5")
-            let id = full_id
-                .strip_prefix(&format!("{key}/"))
-                .unwrap_or(full_id);
+            let id = full_id.strip_prefix(&format!("{key}/")).unwrap_or(full_id);
 
             let name = model_data
                 .get("name")
@@ -247,7 +242,10 @@ fn generate_models() -> Result<()> {
         eprintln!(
             "  {}: {} models",
             provider_name,
-            entries.iter().filter(|e| e.provider == provider_name).count()
+            entries
+                .iter()
+                .filter(|e| e.provider == provider_name)
+                .count()
         );
     }
 
@@ -266,11 +264,7 @@ fn generate_models() -> Result<()> {
                 .any(|e| e.id == addition.id && e.provider == addition.provider)
             {
                 let cost_output = addition.cost.output.unwrap_or(0.0);
-                let cost_thinking = if addition.reasoning {
-                    cost_output
-                } else {
-                    0.0
-                };
+                let cost_thinking = if addition.reasoning { cost_output } else { 0.0 };
                 eprintln!("  + Adding override: {}", addition.id);
                 entries.push(ModelEntryData {
                     id: addition.id,
@@ -406,12 +400,7 @@ fn generate_source(entries: &[ModelEntryData]) -> String {
         writeln!(out, "        reasoning: {},", entry.reasoning).unwrap();
         writeln!(out, "        input_text: {},", entry.input_text).unwrap();
         writeln!(out, "        input_image: {},", entry.input_image).unwrap();
-        writeln!(
-            out,
-            "        cost_input: {},",
-            format_f64(entry.cost_input)
-        )
-        .unwrap();
+        writeln!(out, "        cost_input: {},", format_f64(entry.cost_input)).unwrap();
         writeln!(
             out,
             "        cost_output: {},",

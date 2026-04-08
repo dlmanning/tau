@@ -13,10 +13,10 @@ pub mod tool;
 pub mod transport;
 
 pub use agent::{Agent, AgentConfig, DequeueMode};
+pub use compaction::{CompactionConfig, CompactionReason};
 pub use conversation::{AgentState, Conversation};
 pub use error::Error;
-pub use handle::AgentHandle;
-pub use compaction::{CompactionConfig, CompactionReason};
 pub use events::AgentEvent;
+pub use handle::AgentHandle;
 pub use tool::{ProgressSender, Tool, ToolResult};
 pub use transport::Transport;

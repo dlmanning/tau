@@ -1,9 +1,12 @@
 //! Session management for saving and loading conversations
 
+use std::{
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, Write},
+    path::PathBuf,
+};
+
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
 use tau_ai::Message;
 
 /// Session entry types for JSONL format
@@ -132,8 +135,10 @@ impl SessionManager {
 
         // If there was a compaction, rebuild context
         let (messages, previous_summary) = if let Some((summary, kept_index)) = last_compaction {
-            let summary_msg =
-                Message::user(format!("<context-summary>\n{}\n</context-summary>", summary));
+            let summary_msg = Message::user(format!(
+                "<context-summary>\n{}\n</context-summary>",
+                summary
+            ));
             let mut rebuilt = vec![summary_msg];
             if kept_index < all_messages.len() {
                 rebuilt.extend_from_slice(&all_messages[kept_index..]);

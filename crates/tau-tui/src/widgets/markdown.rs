@@ -1,11 +1,12 @@
 //! Markdown rendering for terminal UI
 
-use crate::theme::Theme;
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+
+use crate::theme::Theme;
 
 /// Convert markdown text to styled ratatui Lines
 pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<'a>> {

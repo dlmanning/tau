@@ -1,7 +1,5 @@
 //! Text input widget
 
-use crate::input::Action;
-use crate::theme::Theme;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -9,6 +7,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
+
+use crate::{input::Action, theme::Theme};
 
 /// Single-line text input widget
 #[derive(Debug, Default)]

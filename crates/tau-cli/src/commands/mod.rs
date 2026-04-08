@@ -8,10 +8,9 @@ mod thinking;
 pub use branch::BranchCommand;
 pub use model::ModelCommand;
 pub use session::SessionCommand;
-pub use thinking::ThinkingCommand;
-
 use tau_agent::Agent;
 use tau_ai::{Model, ReasoningLevel};
+pub use thinking::ThinkingCommand;
 
 /// Result of executing a slash command
 pub enum CommandResult {

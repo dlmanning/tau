@@ -1,10 +1,11 @@
 //! A cloneable handle for poking the agent from external code.
 
-use parking_lot::Mutex;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+use parking_lot::Mutex;
 use tau_ai::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -48,7 +49,10 @@ impl AgentHandle {
     pub fn steer(&self, message: Message) {
         let mut q = self.steering_queue.lock();
         if q.len() >= Self::MAX_QUEUE_SIZE {
-            tracing::warn!("Steering queue full ({} messages), dropping oldest", Self::MAX_QUEUE_SIZE);
+            tracing::warn!(
+                "Steering queue full ({} messages), dropping oldest",
+                Self::MAX_QUEUE_SIZE
+            );
             q.remove(0);
         }
         q.push(message);
@@ -58,7 +62,10 @@ impl AgentHandle {
     pub fn follow_up(&self, message: Message) {
         let mut q = self.follow_up_queue.lock();
         if q.len() >= Self::MAX_QUEUE_SIZE {
-            tracing::warn!("Follow-up queue full ({} messages), dropping oldest", Self::MAX_QUEUE_SIZE);
+            tracing::warn!(
+                "Follow-up queue full ({} messages), dropping oldest",
+                Self::MAX_QUEUE_SIZE
+            );
             q.remove(0);
         }
         q.push(message);

@@ -128,7 +128,12 @@ mod tests {
 
     #[test]
     fn test_retryable_typed_variants() {
-        assert!(Error::RateLimited { retry_after: Some(5) }.is_retryable());
+        assert!(
+            Error::RateLimited {
+                retry_after: Some(5)
+            }
+            .is_retryable()
+        );
         assert!(Error::Sse("connection reset".into()).is_retryable());
     }
 

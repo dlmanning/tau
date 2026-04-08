@@ -1,7 +1,8 @@
 //! /branch command - create a new branch from a conversation point
 
-use super::CommandResult;
 use tau_agent::Agent;
+
+use super::CommandResult;
 
 pub struct BranchCommand;
 

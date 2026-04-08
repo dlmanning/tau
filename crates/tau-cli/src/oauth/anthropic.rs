@@ -1,8 +1,9 @@
 //! Anthropic OAuth implementation using PKCE flow
 
-use super::storage::OAuthCredentials;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
+
+use super::storage::OAuthCredentials;
 
 // OAuth constants for Anthropic
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";

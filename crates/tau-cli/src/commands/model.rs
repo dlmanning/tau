@@ -1,7 +1,8 @@
 //! /model command - list and switch models
 
-use super::CommandResult;
 use tau_ai::Model;
+
+use super::CommandResult;
 
 pub struct ModelCommand;
 
