@@ -1,0 +1,327 @@
+//! Anthropic Claude API provider
+
+mod convert;
+mod request;
+mod streaming;
+#[cfg(test)]
+mod tests;
+
+use reqwest_eventsource::EventSource;
+use serde::Serialize;
+
+use crate::{
+    error::{Error, Result},
+    stream::MessageEventStream,
+    types::{Context, Model, StreamOptions},
+};
+
+use convert::{convert_messages, convert_tools, make_cache_control, split_system_prompt};
+use request::{AnthropicRequest, OutputConfig, SystemBlock, ThinkingConfig};
+use streaming::create_stream;
+
+/// Cache scope for prompt caching
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    /// Global scope — shared across all users/orgs (1P only)
+    Global,
+    /// Org scope — shared within an organization
+    Org,
+}
+
+/// Anthropic-specific streaming options
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicOptions {
+    /// Base streaming options
+    pub base: StreamOptions,
+    /// Enable extended thinking
+    pub thinking_enabled: bool,
+    /// Use adaptive thinking (model decides when to think)
+    pub thinking_adaptive: bool,
+    /// Budget for thinking tokens (used when not adaptive)
+    pub thinking_budget_tokens: Option<u32>,
+    /// Thinking display mode ("summarized" or "omitted")
+    pub thinking_display: Option<String>,
+    /// Tool choice strategy
+    pub tool_choice: Option<ToolChoice>,
+    /// Cache scope for prompt caching breakpoints
+    pub cache_scope: Option<CacheScope>,
+    /// Cache TTL (e.g. "1h", "5m")
+    pub cache_ttl: Option<String>,
+    /// Dynamic boundary marker for system prompt splitting
+    pub system_prompt_boundary: Option<String>,
+    /// Request metadata (e.g. `{"user_id": "..."}`)
+    pub metadata: Option<serde_json::Value>,
+    /// Service tier ("auto" or "standard_only")
+    pub service_tier: Option<String>,
+    /// Effort level ("low", "medium", "high", "max")
+    pub effort: Option<String>,
+    /// Structured output format (JSON schema)
+    pub output_format: Option<serde_json::Value>,
+    /// Container ID for code execution sandboxing
+    pub container: Option<String>,
+}
+
+/// Tool choice strategy
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    None,
+    Tool {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+}
+
+impl ToolChoice {
+    pub fn auto() -> Self {
+        Self::Auto {
+            disable_parallel_tool_use: None,
+        }
+    }
+    pub fn any() -> Self {
+        Self::Any {
+            disable_parallel_tool_use: None,
+        }
+    }
+    pub fn tool(name: impl Into<String>) -> Self {
+        Self::Tool {
+            name: name.into(),
+            disable_parallel_tool_use: None,
+        }
+    }
+}
+
+/// Anthropic API client
+pub struct AnthropicProvider {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+impl AnthropicProvider {
+    /// Create a new Anthropic provider with an API key
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key: api_key.into(),
+        }
+    }
+
+    /// Create from environment variable
+    pub fn from_env() -> Result<Self> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| Error::InvalidApiKey)?;
+        Ok(Self::new(api_key))
+    }
+
+    /// Stream a response from Claude
+    pub async fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&AnthropicOptions>,
+    ) -> Result<MessageEventStream> {
+        let default_options = AnthropicOptions::default();
+        let opts = options.unwrap_or(&default_options);
+
+        let request = self.build_request(model, context, opts)?;
+        let url = format!("{}/v1/messages", model.base_url);
+
+        tracing::debug!("Anthropic API URL: {}", url);
+
+        let is_oauth = self.api_key.contains("sk-ant-oat");
+        let mut headers = reqwest::header::HeaderMap::new();
+
+        // Build beta headers based on features in use
+        let mut betas = vec![
+            "fine-grained-tool-streaming-2025-05-14",
+            "token-efficient-tools-2026-03-28",
+        ];
+        if opts.thinking_enabled {
+            betas.push("interleaved-thinking-2025-05-14");
+        }
+        if matches!(opts.cache_scope, Some(CacheScope::Global)) {
+            betas.push("prompt-caching-scope-2026-01-05");
+        }
+
+        if is_oauth {
+            betas.insert(0, "oauth-2025-04-20");
+            headers.insert(
+                "Authorization",
+                format!("Bearer {}", self.api_key).parse().unwrap(),
+            );
+            headers.insert(
+                "anthropic-dangerous-direct-browser-access",
+                "true".parse().unwrap(),
+            );
+        } else {
+            headers.insert("x-api-key", self.api_key.parse().unwrap());
+        }
+        headers.insert("anthropic-beta", betas.join(",").parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+
+        // SDK identification headers (required for OAuth)
+        headers.insert("User-Agent", "Anthropic/JS 0.52.0".parse().unwrap());
+        headers.insert("X-Stainless-Lang", "js".parse().unwrap());
+        headers.insert("X-Stainless-Package-Version", "0.52.0".parse().unwrap());
+        headers.insert("X-Stainless-OS", "MacOS".parse().unwrap());
+        headers.insert("X-Stainless-Arch", "arm64".parse().unwrap());
+        headers.insert("X-Stainless-Runtime", "node".parse().unwrap());
+        headers.insert("X-Stainless-Runtime-Version", "v22.0.0".parse().unwrap());
+        headers.insert("X-Stainless-Retry-Count", "0".parse().unwrap());
+
+        // Add model-specific headers
+        for (key, value) in &model.headers {
+            if let (Ok(name), Ok(val)) = (
+                key.parse::<reqwest::header::HeaderName>(),
+                value.parse::<reqwest::header::HeaderValue>(),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+
+        let request_builder = self
+            .client
+            .post(&url)
+            .headers(headers.clone())
+            .json(&request);
+
+        let event_source = EventSource::new(request_builder)
+            .map_err(|e| Error::Sse(format!("Failed to create event source: {}", e)))?;
+
+        Ok(Box::pin(create_stream(event_source, model.clone())))
+    }
+
+    fn build_request(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: &AnthropicOptions,
+    ) -> Result<AnthropicRequest> {
+        let is_oauth = self.api_key.contains("sk-ant-oat");
+        let has_tools = !context.tools.is_empty();
+
+        // Build system blocks first so we can count cache breakpoints accurately.
+        let cache = || make_cache_control(&options.cache_scope, &options.cache_ttl);
+        let system_blocks: Option<Vec<SystemBlock>> = if is_oauth {
+            let mut blocks = vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                cache_control: Some(cache()),
+            }];
+            if let Some(ref system_prompt) = context.system_prompt {
+                blocks.extend(split_system_prompt(
+                    system_prompt,
+                    options.system_prompt_boundary.as_deref(),
+                    &options.cache_scope,
+                    &options.cache_ttl,
+                ));
+            }
+            Some(blocks)
+        } else {
+            context.system_prompt.as_ref().map(|sp| {
+                split_system_prompt(
+                    sp,
+                    options.system_prompt_boundary.as_deref(),
+                    &options.cache_scope,
+                    &options.cache_ttl,
+                )
+            })
+        };
+
+        // Count actual cache_control breakpoints in system blocks
+        let system_cache_blocks = system_blocks
+            .as_ref()
+            .map(|blocks| blocks.iter().filter(|b| b.cache_control.is_some()).count())
+            .unwrap_or(0);
+        let tool_cache_blocks: usize = if has_tools { 1 } else { 0 };
+
+        // Anthropic allows max 4 cache_control breakpoints total per request.
+        let message_cache_budget = 4_usize.saturating_sub(system_cache_blocks + tool_cache_blocks);
+        let messages = convert_messages(
+            &context.messages,
+            message_cache_budget,
+            &options.cache_scope,
+            &options.cache_ttl,
+        );
+        let tools = if has_tools {
+            Some(convert_tools(
+                &context.tools,
+                true,
+                &options.cache_scope,
+                &options.cache_ttl,
+            ))
+        } else {
+            None
+        };
+
+        let max_tokens = options.base.max_tokens.unwrap_or(model.max_tokens / 3);
+
+        // Build output_config if effort or format is specified
+        let output_config = if options.effort.is_some() || options.output_format.is_some() {
+            Some(OutputConfig {
+                effort: options.effort.clone(),
+                format: options.output_format.clone(),
+            })
+        } else {
+            None
+        };
+
+        let mut request = AnthropicRequest {
+            model: model.id.clone(),
+            messages,
+            max_tokens,
+            stream: true,
+            system: system_blocks,
+            temperature: options.base.temperature,
+            tools,
+            tool_choice: options.tool_choice.clone(),
+            thinking: None,
+            stop_sequences: options.base.stop_sequences.clone(),
+            metadata: options.metadata.clone(),
+            service_tier: options.service_tier.clone(),
+            output_config,
+            container: options.container.clone(),
+        };
+
+        // Enable thinking if requested
+        if options.thinking_enabled && model.reasoning {
+            let display = options.thinking_display.clone();
+            request.thinking = Some(if options.thinking_adaptive {
+                ThinkingConfig::Adaptive {
+                    thinking_type: "adaptive".to_string(),
+                    display,
+                }
+            } else {
+                ThinkingConfig::Enabled {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: options.thinking_budget_tokens.unwrap_or(1024),
+                    display,
+                }
+            });
+        }
+
+        Ok(request)
+    }
+}
+
+/// Stream a response from Anthropic Claude
+pub async fn stream_anthropic(
+    model: &Model,
+    context: &Context,
+    options: Option<&AnthropicOptions>,
+) -> Result<MessageEventStream> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| Error::InvalidApiKey)?;
+    let provider = AnthropicProvider::new(api_key);
+    provider.stream(model, context, options).await
+}
