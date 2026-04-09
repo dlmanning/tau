@@ -1,5 +1,6 @@
 //! Built-in tools for the coding agent
 
+pub mod agent;
 mod bash;
 mod edit;
 mod glob;
@@ -9,6 +10,7 @@ pub mod lsp;
 mod read;
 mod write;
 
+pub use agent::AgentTool;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;

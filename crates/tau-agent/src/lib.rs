@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod prompts;
+pub mod subagent;
 pub mod tool;
 pub mod transport;
 

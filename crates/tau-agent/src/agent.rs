@@ -193,6 +193,11 @@ impl Agent {
         &self.conversation.messages
     }
 
+    /// Get the tool list (as Arc clones).
+    pub fn tools(&self) -> &[BoxedTool] {
+        &self.tools
+    }
+
     /// Get a cloneable handle for poking the agent from external code.
     pub fn handle(&self) -> AgentHandle {
         self.handle.clone()

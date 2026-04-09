@@ -300,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
         cache_ttl,
         system_prompt_boundary,
     };
-    let mut agent = Agent::new(config, transport);
+    let mut agent = Agent::new(config, transport.clone());
 
     // Add tools
     agent.add_tool(Arc::new(tools::BashTool::new()));
@@ -316,6 +316,14 @@ async fn main() -> anyhow::Result<()> {
     if lsp_manager.is_available() {
         agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager)));
     }
+
+    // Add agent tool (subagent spawning)
+    let parent_tools: Vec<Arc<dyn tau_agent::tool::Tool>> = agent.tools().to_vec();
+    let agent_handle = agent.handle();
+    agent.add_tool(Arc::new(
+        tools::AgentTool::new(transport.clone(), parent_tools, agent.config().clone(), 0)
+            .with_handle(agent_handle),
+    ));
 
     // Build dynamic system prompt based on registered tools
     let tool_names = agent.tool_names();
