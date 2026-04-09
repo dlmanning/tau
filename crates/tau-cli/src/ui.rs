@@ -175,13 +175,30 @@ impl TuiState {
                 self.messages.push(ChatMessage::assistant(message.text()));
                 self.scroll_to_bottom();
             }
-            AgentEvent::ToolExecutionStart { tool_name, .. } => {
-                self.status = format!("Running {}...", tool_name);
+            AgentEvent::ToolExecutionStart {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                if tool_name == "agent" {
+                    let desc = arguments
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("subagent");
+                    self.status = format!("Agent: {}...", desc);
+                } else {
+                    self.status = format!("Running {}...", tool_name);
+                }
             }
             AgentEvent::ToolExecutionUpdate {
                 tool_name, content, ..
             } => {
-                self.status = format!("{}: {}", tool_name, content);
+                if tool_name == "agent" {
+                    // Subagent progress — show tool activity within the agent
+                    self.status = format!("Agent {}", content);
+                } else {
+                    self.status = format!("{}: {}", tool_name, content);
+                }
             }
             AgentEvent::ToolExecutionEnd {
                 tool_name,
@@ -189,9 +206,19 @@ impl TuiState {
                 is_error,
                 ..
             } => {
-                let preview = crate::utils::truncate_chars(&result, 200);
-                self.messages
-                    .push(ChatMessage::tool(&tool_name, preview, is_error));
+                if tool_name == "agent" {
+                    // Agent results go to the model as tool_result — the model
+                    // will summarize for the user. Only show errors in the TUI.
+                    if is_error {
+                        let preview = crate::utils::truncate_chars(&result, 500);
+                        self.messages
+                            .push(ChatMessage::tool("agent", preview, true));
+                    }
+                } else {
+                    let preview = crate::utils::truncate_chars(&result, 200);
+                    self.messages
+                        .push(ChatMessage::tool(&tool_name, preview, is_error));
+                }
                 self.scroll_to_bottom();
             }
             AgentEvent::TurnEnd { usage, .. } => {
