@@ -22,60 +22,35 @@ const STYLE: &str = include_str!("style.md");
 const OUTPUT_EFFICIENCY: &str = include_str!("output_efficiency.md");
 const OUTPUT_ACOLYTE: &str = include_str!("output_acolyte.md");
 
-/// Build the complete system prompt.
+/// Build the complete system prompt, including project context (CLAUDE.md / AGENTS.md).
 pub fn build_system_prompt(opts: &PromptOptions) -> String {
-    let mut sections: Vec<&str> = vec![INTRO, SYSTEM];
-
-    // Tasks section — base + optional acolyte additions
-    if opts.acolyte_mode {
-        let combined = format!("{}\n{}", TASKS, TASKS_ACOLYTE);
-        let tools = using_tools_section(opts.tool_names);
-
-        let style = if opts.acolyte_mode {
-            // Acolyte: no "short and concise" bullet, use richer output section
-            format!("{}\n\n{}", STYLE, OUTPUT_ACOLYTE)
-        } else {
-            format!(
-                "{}\n - Your responses should be short and concise.\n\n{}",
-                STYLE, OUTPUT_EFFICIENCY
-            )
-        };
-
-        let env = env_section(opts.cwd);
-
-        return [
-            INTRO,
-            SYSTEM,
-            &combined,
-            ACTIONS,
-            &tools,
-            &style,
-            &env,
-        ]
-        .join("\n\n");
-    }
-
-    sections.push(TASKS);
-    sections.push(ACTIONS);
+    let tasks = if opts.acolyte_mode {
+        format!("{}\n{}", TASKS, TASKS_ACOLYTE)
+    } else {
+        TASKS.to_string()
+    };
 
     let tools = using_tools_section(opts.tool_names);
-    let style = format!(
-        "{}\n - Your responses should be short and concise.",
-        STYLE
-    );
+
+    let style = if opts.acolyte_mode {
+        format!("{}\n\n{}", STYLE, OUTPUT_ACOLYTE)
+    } else {
+        format!(
+            "{}\n - Your responses should be short and concise.\n\n{}",
+            STYLE, OUTPUT_EFFICIENCY
+        )
+    };
+
     let env = env_section(opts.cwd);
 
-    [
-        INTRO,
-        SYSTEM,
-        TASKS,
-        ACTIONS,
-        &tools,
-        &style,
-        OUTPUT_EFFICIENCY,
-        &env,
-    ]
-    .join("\n\n")
+    let mut prompt = [INTRO, SYSTEM, &tasks, ACTIONS, &tools, &style, &env].join("\n\n");
+
+    // Append project context files (CLAUDE.md, AGENTS.md)
+    if let Some(context) = crate::context::load_context() {
+        prompt = format!("{}\n\n---\n\n# Project Context\n\n{}", prompt, context);
+    }
+
+    prompt
 }
 
 // ============================================================================

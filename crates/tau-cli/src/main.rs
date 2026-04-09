@@ -2,7 +2,6 @@
 
 mod commands;
 mod config;
-mod context;
 mod lsp;
 mod oauth;
 mod session;
@@ -329,17 +328,7 @@ async fn main() -> anyhow::Result<()> {
         cwd: &cwd,
         acolyte_mode,
     };
-    let mut system_prompt = tau_agent::prompts::build_system_prompt(&prompt_opts);
-
-    // Append project context (CLAUDE.md, AGENTS.md)
-    if let Some(context_content) = context::load_context() {
-        system_prompt = format!(
-            "{}\n\n---\n\n# Project Context\n\n{}",
-            system_prompt, context_content
-        );
-    }
-
-    agent.set_system_prompt(system_prompt);
+    agent.set_system_prompt(tau_agent::prompts::build_system_prompt(&prompt_opts));
 
     // Resume session if specified
     if let Some(ref session_id) = args.resume {

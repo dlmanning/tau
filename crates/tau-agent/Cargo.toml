@@ -24,6 +24,7 @@ tokio-util = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 jsonschema = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -2560,6 +2560,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "dirs",
  "futures",
  "jsonschema",
  "parking_lot",
