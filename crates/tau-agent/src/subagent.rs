@@ -1,9 +1,20 @@
 //! Subagent spawning — create independent agent instances for parallel work.
+//!
+//! ## Known limitations
+//!
+//! - The subagent's bash tool runs with the process's actual CWD, not the
+//!   worktree path. The system prompt tells the model the correct CWD, but
+//!   processes spawned by bash will inherit the parent's CWD. A future fix
+//!   would inject a CWD override into the bash tool.
+//!
+//! - Background agent notification uses XML-like tags (`<agent-completed>`)
+//!   that the parent model interprets as text, not structured data.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tau_ai::{Content, Message, Model};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentConfig};
 use crate::tool::BoxedTool;
@@ -11,6 +22,9 @@ use crate::transport::Transport;
 
 /// Maximum recursion depth for nested agent spawning.
 pub const MAX_AGENT_DEPTH: u32 = 3;
+
+/// Maximum turns a subagent can execute before being stopped.
+pub const MAX_SUBAGENT_TURNS: u32 = 30;
 
 /// Agent type determines tool set and system prompt.
 #[derive(Debug, Clone)]
@@ -21,7 +35,7 @@ pub enum AgentType {
 }
 
 impl AgentType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "general-purpose" => Some(Self::GeneralPurpose),
             "Explore" => Some(Self::Explore),
@@ -30,8 +44,23 @@ impl AgentType {
         }
     }
 
-    pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::Explore | Self::Plan)
+    /// Maximum turns before logging a warning.
+    fn max_turns(&self) -> u32 {
+        match self {
+            Self::GeneralPurpose => MAX_SUBAGENT_TURNS,
+            Self::Explore => 10,
+            Self::Plan => 15,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GeneralPurpose => write!(f, "general-purpose"),
+            Self::Explore => write!(f, "Explore"),
+            Self::Plan => write!(f, "Plan"),
+        }
     }
 }
 
@@ -48,9 +77,9 @@ pub struct SubagentConfig {
     pub all_tools: Vec<BoxedTool>,
     pub parent_config: AgentConfig,
     /// Factory for creating depth-limited Agent tools for recursive subagents.
-    /// Called with (depth) → tool. If None, general-purpose subagents won't
-    /// be able to spawn their own subagents.
     pub agent_tool_factory: Option<AgentToolFactory>,
+    /// Cancellation token — checked between turns.
+    pub cancel: CancellationToken,
 }
 
 /// Factory function to create a depth-limited Agent tool.
@@ -69,21 +98,56 @@ pub struct SubagentResult {
 }
 
 /// Run a subagent to completion and return its result.
+/// Worktree cleanup runs even if the agent fails.
 pub async fn run_subagent(config: SubagentConfig) -> crate::error::Result<SubagentResult> {
     let start = std::time::Instant::now();
     let agent_id = uuid::Uuid::new_v4().to_string();
 
     // Worktree setup
     let worktree = if config.isolation.as_deref() == Some("worktree") {
-        Some(
-            create_worktree(&agent_id)
-                .await
-                .map_err(|e| crate::error::Error::Other(format!("Worktree setup failed: {}", e)))?,
-        )
+        match create_worktree(&agent_id).await {
+            Ok(wt) => Some(wt),
+            Err(e) => {
+                return Err(crate::error::Error::Other(format!(
+                    "Worktree setup failed: {}",
+                    e
+                )));
+            }
+        }
     } else {
         None
     };
 
+    // Run the agent, capturing the result (success or failure)
+    let agent_result = run_agent_inner(&config, &agent_id, &worktree).await;
+
+    // Always cleanup worktree, even on failure
+    let (wt_path, wt_branch) = if let Some(wt) = &worktree {
+        match cleanup_worktree(wt).await {
+            Ok(true) => (None, None),
+            _ => (
+                Some(wt.path.display().to_string()),
+                Some(wt.branch.clone()),
+            ),
+        }
+    } else {
+        (None, None)
+    };
+
+    // Return result with worktree info
+    let mut result = agent_result?;
+    result.worktree_path = wt_path;
+    result.worktree_branch = wt_branch;
+    result.duration_ms = start.elapsed().as_millis() as u64;
+    Ok(result)
+}
+
+/// Inner agent execution — separated so worktree cleanup can run regardless.
+async fn run_agent_inner(
+    config: &SubagentConfig,
+    agent_id: &str,
+    worktree: &Option<WorktreeInfo>,
+) -> crate::error::Result<SubagentResult> {
     // Determine CWD
     let cwd = config
         .cwd
@@ -129,10 +193,24 @@ pub async fn run_subagent(config: SubagentConfig) -> crate::error::Result<Subage
     );
     agent.set_system_prompt(system_prompt);
 
-    // Run
-    agent
-        .prompt(&config.prompt)
-        .await?;
+    // Run the agent
+    agent.prompt(&config.prompt).await?;
+
+    // Log if turn count was high
+    let max_turns = config.agent_type.max_turns();
+    let assistant_count = agent
+        .messages()
+        .iter()
+        .filter(|m| matches!(m, Message::Assistant { .. }))
+        .count() as u32;
+    if assistant_count > max_turns {
+        tracing::warn!(
+            "Subagent {} ran {} turns (limit {})",
+            agent_id,
+            assistant_count,
+            max_turns
+        );
+    }
 
     // Collect result
     let text = extract_final_text(agent.messages());
@@ -150,28 +228,15 @@ pub async fn run_subagent(config: SubagentConfig) -> crate::error::Result<Subage
         })
         .sum::<usize>() as u32;
 
-    // Cleanup worktree
-    let (wt_path, wt_branch) = if let Some(wt) = worktree {
-        match cleanup_worktree(&wt).await {
-            Ok(true) => (None, None),
-            _ => (
-                Some(wt.path.display().to_string()),
-                Some(wt.branch.clone()),
-            ),
-        }
-    } else {
-        (None, None)
-    };
-
     Ok(SubagentResult {
-        agent_id,
+        agent_id: agent_id.to_string(),
         text,
         input_tokens: state.total_usage.input,
         output_tokens: state.total_usage.output,
         tool_use_count,
-        duration_ms: start.elapsed().as_millis() as u64,
-        worktree_path: wt_path,
-        worktree_branch: wt_branch,
+        duration_ms: 0, // filled in by caller
+        worktree_path: None,
+        worktree_branch: None,
     })
 }
 
@@ -201,7 +266,6 @@ fn build_tool_set(
                 .cloned()
                 .collect();
 
-            // Add depth-limited agent tool if under max depth and factory available
             if depth + 1 < MAX_AGENT_DEPTH {
                 if let Some(factory) = agent_tool_factory {
                     tools.push(factory(depth + 1));
@@ -271,10 +335,7 @@ fn extract_final_text(messages: &[Message]) -> String {
 struct WorktreeInfo {
     path: PathBuf,
     branch: String,
-    #[allow(dead_code)]
     head_commit: String,
-    #[allow(dead_code)]
-    git_root: PathBuf,
 }
 
 async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
@@ -289,11 +350,10 @@ async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
     }
 
     let git_root = PathBuf::from(String::from_utf8_lossy(&git_root_output.stdout).trim());
-    let slug = &agent_id[..8.min(agent_id.len())];
-    let branch = format!("worktree-agent-{}", slug);
-    let path = git_root.join(format!(".tau-worktrees/agent-{}", slug));
+    // Use full UUID to avoid branch name collisions
+    let branch = format!("worktree-agent-{}", agent_id);
+    let path = git_root.join(format!(".tau-worktrees/agent-{}", agent_id));
 
-    // Ensure parent directory exists
     tokio::fs::create_dir_all(path.parent().unwrap())
         .await
         .map_err(|e| format!("Failed to create worktree directory: {}", e))?;
@@ -331,28 +391,40 @@ async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
         path,
         branch,
         head_commit,
-        git_root,
     })
 }
 
 async fn cleanup_worktree(info: &WorktreeInfo) -> Result<bool, String> {
-    // Check for changes
+    let path_str = info.path.display().to_string();
+
+    // Check for tracked changes
     let diff = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            &info.path.display().to_string(),
-            "diff",
-            "--quiet",
-            &info.head_commit,
-        ])
+        .args(["-C", &path_str, "diff", "--quiet", &info.head_commit])
         .status()
         .await
         .map_err(|e| format!("git diff failed: {}", e))?;
 
-    if diff.success() {
+    // Check for untracked files
+    let untracked = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            &path_str,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("git ls-files failed: {}", e))?;
+
+    let has_untracked = !String::from_utf8_lossy(&untracked.stdout)
+        .trim()
+        .is_empty();
+
+    if diff.success() && !has_untracked {
         // No changes — clean up
         let _ = tokio::process::Command::new("git")
-            .args(["worktree", "remove", &info.path.display().to_string()])
+            .args(["worktree", "remove", &path_str])
             .output()
             .await;
         let _ = tokio::process::Command::new("git")

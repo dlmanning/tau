@@ -42,17 +42,17 @@ impl AgentTool {
     }
 
     /// Build the factory function for recursive subagent creation.
+    /// Propagates the agent handle so nested background agents can notify.
     fn make_factory(&self) -> AgentToolFactory {
         let transport = self.transport.clone();
         let tools = self.tools.clone();
         let config = self.parent_config.clone();
+        let handle = self.agent_handle.clone();
         Arc::new(move |depth| {
-            Arc::new(AgentTool::new(
-                transport.clone(),
-                tools.clone(),
-                config.clone(),
-                depth,
-            ))
+            let mut tool =
+                AgentTool::new(transport.clone(), tools.clone(), config.clone(), depth);
+            tool.agent_handle = handle.clone();
+            Arc::new(tool)
         })
     }
 }
@@ -112,7 +112,7 @@ impl Tool for AgentTool {
         &self,
         _tool_call_id: &str,
         arguments: serde_json::Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> ToolResult {
         let description = match arguments.get("description").and_then(|v| v.as_str()) {
             Some(d) => d.to_string(),
@@ -126,7 +126,7 @@ impl Tool for AgentTool {
         let agent_type = arguments
             .get("subagent_type")
             .and_then(|v| v.as_str())
-            .and_then(AgentType::from_str)
+            .and_then(AgentType::parse)
             .unwrap_or(AgentType::GeneralPurpose);
 
         let model = arguments
@@ -149,6 +149,46 @@ impl Tool for AgentTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        if run_in_background {
+            let bg_cancel = CancellationToken::new();
+            let config = SubagentConfig {
+                agent_type,
+                prompt,
+                description: description.clone(),
+                model,
+                cwd,
+                isolation,
+                depth: self.depth,
+                transport: self.transport.clone(),
+                all_tools: self.tools.clone(),
+                parent_config: self.parent_config.clone(),
+                agent_tool_factory: Some(self.make_factory()),
+                cancel: bg_cancel.clone(),
+            };
+
+            let handle = self.agent_handle.clone();
+            let desc = description.clone();
+
+            // Store cancel token so parent abort can propagate
+            let parent_cancel = cancel.clone();
+            tokio::spawn(async move {
+                let result = tokio::select! {
+                    r = run_subagent(config) => r,
+                    _ = parent_cancel.cancelled() => {
+                        Err(tau_agent::error::Error::Other("Cancelled by parent".into()))
+                    }
+                };
+
+                if let Some(handle) = handle {
+                    let msg = format_notification(&desc, &result);
+                    handle.follow_up(tau_ai::Message::user(msg));
+                }
+            });
+
+            return ToolResult::text(format!("Agent launched in background: {}", description));
+        }
+
+        // Foreground execution
         let config = SubagentConfig {
             agent_type,
             prompt,
@@ -161,45 +201,16 @@ impl Tool for AgentTool {
             all_tools: self.tools.clone(),
             parent_config: self.parent_config.clone(),
             agent_tool_factory: Some(self.make_factory()),
+            cancel,
         };
 
-        if run_in_background {
-            let handle = self.agent_handle.clone();
-            let desc = description.clone();
-            tokio::spawn(async move {
-                let result = run_subagent(config).await;
-                if let Some(handle) = handle {
-                    let msg = match &result {
-                        Ok(r) => format!(
-                            "<agent-completed description=\"{}\">\n{}\n\
-                             [Agent {} | {} in + {} out tokens | {} tool calls | {}ms]\n\
-                             </agent-completed>",
-                            desc, r.text, r.agent_id,
-                            r.input_tokens, r.output_tokens,
-                            r.tool_use_count, r.duration_ms,
-                        ),
-                        Err(e) => format!(
-                            "<agent-failed description=\"{}\">\nError: {}\n</agent-failed>",
-                            desc, e,
-                        ),
-                    };
-                    handle.follow_up(tau_ai::Message::user(msg));
-                }
-            });
-            return ToolResult::text(format!("Agent launched in background: {}", description));
-        }
-
-        // Foreground execution
         match run_subagent(config).await {
             Ok(result) => {
                 let mut output = result.text.clone();
                 let mut meta = format!(
                     "\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms",
-                    result.agent_id,
-                    result.input_tokens,
-                    result.output_tokens,
-                    result.tool_use_count,
-                    result.duration_ms,
+                    result.agent_id, result.input_tokens, result.output_tokens,
+                    result.tool_use_count, result.duration_ms,
                 );
                 if let Some(ref p) = result.worktree_path {
                     meta.push_str(&format!(" | worktree: {}", p));
@@ -215,3 +226,21 @@ impl Tool for AgentTool {
         }
     }
 }
+
+fn format_notification(description: &str, result: &tau_agent::error::Result<tau_agent::subagent::SubagentResult>) -> String {
+    match result {
+        Ok(r) => format!(
+            "<agent-completed description=\"{}\">\n{}\n\
+             [Agent {} | {} in + {} out tokens | {} tool calls | {}ms]\n\
+             </agent-completed>",
+            description, r.text, r.agent_id,
+            r.input_tokens, r.output_tokens,
+            r.tool_use_count, r.duration_ms,
+        ),
+        Err(e) => format!(
+            "<agent-failed description=\"{}\">\nError: {}\n</agent-failed>",
+            description, e,
+        ),
+    }
+}
+
