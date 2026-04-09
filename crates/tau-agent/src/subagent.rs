@@ -10,10 +10,13 @@
 //! - Background agent notification uses XML-like tags (`<agent-completed>`)
 //!   that the parent model interprets as text, not structured data.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tau_ai::{Content, Message, Model};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentConfig};
@@ -91,6 +94,7 @@ pub struct SubagentConfig {
 pub type AgentToolFactory = Arc<dyn Fn(u32) -> BoxedTool + Send + Sync>;
 
 /// Result from a completed subagent.
+#[derive(Debug)]
 pub struct SubagentResult {
     pub agent_id: String,
     pub text: String,
@@ -102,9 +106,193 @@ pub struct SubagentResult {
     pub worktree_branch: Option<String>,
 }
 
-/// Run a subagent to completion and return its result.
-/// Worktree cleanup runs even if the agent fails.
-pub async fn run_subagent(config: SubagentConfig) -> crate::error::Result<SubagentResult> {
+// ============================================================================
+// Agent registry — keeps completed agents alive for resumption
+// ============================================================================
+
+/// Maximum number of agents to keep in the registry before evicting oldest.
+#[allow(dead_code)] // used inside async methods
+const MAX_REGISTRY_SIZE: usize = 20;
+
+/// Registry of completed agents that can be resumed with new messages.
+pub struct AgentRegistry {
+    agents: Mutex<HashMap<String, AgentEntry>>,
+}
+
+struct AgentEntry {
+    agent: Agent,
+    description: String,
+}
+
+impl AgentRegistry {
+    pub fn new() -> Self {
+        Self {
+            agents: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Store a completed agent for later resumption.
+    /// Evicts an arbitrary entry if the registry is at capacity.
+    pub async fn store(&self, id: String, agent: Agent, description: String) {
+        let mut agents = self.agents.lock().await;
+        if agents.len() >= MAX_REGISTRY_SIZE {
+            if let Some(evict_id) = agents.keys().next().cloned() {
+                agents.remove(&evict_id);
+            }
+        }
+        agents.insert(id, AgentEntry { agent, description });
+    }
+
+    /// Resume a previously stored agent with a new message.
+    /// Temporarily removes the agent from the registry while it runs
+    /// to avoid holding the lock across API calls.
+    pub async fn resume(
+        &self,
+        id: &str,
+        message: &str,
+        on_progress: Option<&ProgressCallback>,
+    ) -> crate::error::Result<SubagentResult> {
+        let start = std::time::Instant::now();
+
+        // Take the agent out so we don't hold the lock during prompt()
+        let mut entry = {
+            let mut agents = self.agents.lock().await;
+            agents.remove(id).ok_or_else(|| {
+                crate::error::Error::Other(format!(
+                    "No agent with ID '{}'. It may have been evicted, never stored, or is currently running.",
+                    id
+                ))
+            })?
+        };
+
+        // Forward progress events if callback provided
+        let progress_task = if let Some(cb) = on_progress {
+            let mut events = entry.agent.subscribe();
+            let cb = cb.clone();
+            Some(tokio::spawn(async move {
+                while let Ok(event) = events.recv().await {
+                    match &event {
+                        crate::events::AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                            cb(&format!("[{}...]", tool_name));
+                        }
+                        crate::events::AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
+                            if *is_error {
+                                cb(&format!("[{} error]", tool_name));
+                            } else {
+                                cb(&format!("[{} done]", tool_name));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        let prompt_result = entry.agent.prompt(message).await;
+
+        if let Some(task) = progress_task {
+            task.abort();
+        }
+
+        // Collect data before re-inserting (avoids borrow-after-move)
+        let text = extract_final_text(entry.agent.messages());
+        let input_tokens = entry.agent.state().total_usage.input;
+        let output_tokens = entry.agent.state().total_usage.output;
+        let tool_use_count = entry
+            .agent
+            .messages()
+            .iter()
+            .map(|m| match m {
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .filter(|c| matches!(c, Content::ToolCall { .. }))
+                    .count(),
+                _ => 0,
+            })
+            .sum::<usize>() as u32;
+
+        // Record transcript
+        record_transcript(id, entry.agent.messages()).await;
+
+        // Put it back regardless of success/failure
+        self.agents.lock().await.insert(id.to_string(), entry);
+
+        // Propagate error after re-inserting
+        prompt_result?;
+
+        Ok(SubagentResult {
+            agent_id: id.to_string(),
+            text,
+            input_tokens,
+            output_tokens,
+            tool_use_count,
+            duration_ms: start.elapsed().as_millis() as u64,
+            worktree_path: None,
+            worktree_branch: None,
+        })
+    }
+
+    /// List all stored agents (id, description).
+    pub async fn list(&self) -> Vec<(String, String)> {
+        self.agents
+            .lock()
+            .await
+            .iter()
+            .map(|(id, e)| (id.clone(), e.description.clone()))
+            .collect()
+    }
+
+    /// Number of stored agents.
+    pub async fn len(&self) -> usize {
+        self.agents.lock().await.len()
+    }
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Transcript recording
+// ============================================================================
+
+/// Record a subagent's conversation to disk for debugging.
+/// Writes JSONL to `~/.local/share/tau/agent-transcripts/{agent_id}.jsonl`.
+/// Failures are logged and silently ignored.
+pub async fn record_transcript(agent_id: &str, messages: &[Message]) {
+    let dir = match dirs::data_dir() {
+        Some(d) => d.join("tau/agent-transcripts"),
+        None => return,
+    };
+
+    if tokio::fs::create_dir_all(&dir).await.is_err() {
+        return;
+    }
+
+    let path = dir.join(format!("{}.jsonl", agent_id));
+    let mut file = match tokio::fs::File::create(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("Failed to create transcript file: {}", e);
+            return;
+        }
+    };
+
+    for msg in messages {
+        if let Ok(json) = serde_json::to_string(msg) {
+            let _ = file.write_all(format!("{}\n", json).as_bytes()).await;
+        }
+    }
+}
+
+/// Run a subagent to completion and return its result plus the agent
+/// (for optional storage in a registry). Worktree cleanup runs even if the agent fails.
+/// Transcripts are recorded to `~/.local/share/tau/agent-transcripts/`.
+pub async fn run_subagent(config: SubagentConfig) -> crate::error::Result<(SubagentResult, Agent)> {
     let start = std::time::Instant::now();
     let agent_id = uuid::Uuid::new_v4().to_string();
 
@@ -139,12 +327,15 @@ pub async fn run_subagent(config: SubagentConfig) -> crate::error::Result<Subage
         (None, None)
     };
 
-    // Return result with worktree info
-    let mut result = agent_result?;
+    let (mut result, agent) = agent_result?;
+
+    // Record transcript
+    record_transcript(&agent_id, agent.messages()).await;
+
     result.worktree_path = wt_path;
     result.worktree_branch = wt_branch;
     result.duration_ms = start.elapsed().as_millis() as u64;
-    Ok(result)
+    Ok((result, agent))
 }
 
 /// Inner agent execution — separated so worktree cleanup can run regardless.
@@ -152,7 +343,7 @@ async fn run_agent_inner(
     config: &SubagentConfig,
     agent_id: &str,
     worktree: &Option<WorktreeInfo>,
-) -> crate::error::Result<SubagentResult> {
+) -> crate::error::Result<(SubagentResult, Agent)> {
     // Determine CWD
     let cwd = config
         .cwd
@@ -271,7 +462,7 @@ async fn run_agent_inner(
         })
         .sum::<usize>() as u32;
 
-    Ok(SubagentResult {
+    let result = SubagentResult {
         agent_id: agent_id.to_string(),
         text,
         input_tokens: state.total_usage.input,
@@ -280,7 +471,8 @@ async fn run_agent_inner(
         duration_ms: 0, // filled in by caller
         worktree_path: None,
         worktree_branch: None,
-    })
+    };
+    Ok((result, agent))
 }
 
 // ============================================================================
@@ -778,5 +970,130 @@ mod tests {
         assert_eq!(msgs[1], "[bash done]");
         assert_eq!(msgs[2], "[read...]");
         assert_eq!(msgs[3], "[read error]");
+    }
+
+    // ── AgentRegistry ──
+
+    // Minimal transport that never gets called (agent is stored, not run)
+    struct DummyTransport;
+
+    #[async_trait]
+    impl crate::transport::Transport for DummyTransport {
+        async fn run(
+            &self,
+            _messages: Vec<tau_ai::Message>,
+            _config: &crate::transport::AgentRunConfig,
+            _cancel: CancellationToken,
+        ) -> tau_ai::Result<crate::transport::AgentEventStream> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_registry_store_and_list() {
+        use crate::compaction::CompactionConfig;
+
+        let registry = AgentRegistry::new();
+        assert_eq!(registry.len().await, 0);
+
+        let transport: Arc<dyn crate::transport::Transport> = Arc::new(DummyTransport);
+        let config = AgentConfig {
+            system_prompt: None,
+            model: tau_ai::Model {
+                id: "test".into(),
+                name: "test".into(),
+                api: tau_ai::Api::AnthropicMessages,
+                provider: tau_ai::Provider::Anthropic,
+                base_url: "http://localhost".into(),
+                reasoning: false,
+                input_types: vec![],
+                cost: tau_ai::CostInfo::default(),
+                context_window: 200000,
+                max_tokens: 4096,
+                headers: Default::default(),
+            },
+            reasoning: tau_ai::ReasoningLevel::Off,
+            thinking_adaptive: false,
+            max_tokens: None,
+            compaction: CompactionConfig::default(),
+            steering_mode: crate::agent::DequeueMode::All,
+            follow_up_mode: crate::agent::DequeueMode::All,
+            cache_scope: None,
+            cache_ttl: None,
+            system_prompt_boundary: None,
+        };
+        let agent = Agent::new(config, transport);
+
+        registry.store("abc123".into(), agent, "test agent".into()).await;
+        assert_eq!(registry.len().await, 1);
+
+        let list = registry.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "abc123");
+        assert_eq!(list[0].1, "test agent");
+    }
+
+    #[tokio::test]
+    async fn test_registry_resume_nonexistent() {
+        let registry = AgentRegistry::new();
+        let result = registry.resume("nonexistent", "hello", None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("No agent with ID"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_registry_eviction() {
+        use crate::compaction::CompactionConfig;
+
+        let registry = AgentRegistry::new();
+
+        let make_agent = || {
+            let transport: Arc<dyn crate::transport::Transport> = Arc::new(DummyTransport);
+            let config = AgentConfig {
+                system_prompt: None,
+                model: tau_ai::Model {
+                    id: "test".into(),
+                    name: "test".into(),
+                    api: tau_ai::Api::AnthropicMessages,
+                    provider: tau_ai::Provider::Anthropic,
+                    base_url: "http://localhost".into(),
+                    reasoning: false,
+                    input_types: vec![],
+                    cost: tau_ai::CostInfo::default(),
+                    context_window: 200000,
+                    max_tokens: 4096,
+                    headers: Default::default(),
+                },
+                reasoning: tau_ai::ReasoningLevel::Off,
+                thinking_adaptive: false,
+                max_tokens: None,
+                compaction: CompactionConfig::default(),
+                steering_mode: crate::agent::DequeueMode::All,
+                follow_up_mode: crate::agent::DequeueMode::All,
+                cache_scope: None,
+                cache_ttl: None,
+                system_prompt_boundary: None,
+            };
+            Agent::new(config, transport)
+        };
+
+        // Fill to capacity
+        for i in 0..MAX_REGISTRY_SIZE {
+            registry
+                .store(format!("agent-{}", i), make_agent(), format!("desc-{}", i))
+                .await;
+        }
+        assert_eq!(registry.len().await, MAX_REGISTRY_SIZE);
+
+        // One more should evict
+        registry
+            .store("agent-overflow".into(), make_agent(), "overflow".into())
+            .await;
+        assert_eq!(registry.len().await, MAX_REGISTRY_SIZE);
+
+        // The new one should be present
+        let list = registry.list().await;
+        assert!(list.iter().any(|(id, _)| id == "agent-overflow"));
     }
 }

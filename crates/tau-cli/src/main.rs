@@ -320,9 +320,16 @@ async fn main() -> anyhow::Result<()> {
     // Add agent tool (subagent spawning)
     let parent_tools: Vec<Arc<dyn tau_agent::tool::Tool>> = agent.tools().to_vec();
     let agent_handle = agent.handle();
+    let agent_registry = Arc::new(tau_agent::subagent::AgentRegistry::new());
     agent.add_tool(Arc::new(
-        tools::AgentTool::new(transport.clone(), parent_tools, agent.config().clone(), 0)
-            .with_handle(agent_handle),
+        tools::AgentTool::new(
+            transport.clone(),
+            parent_tools,
+            agent.config().clone(),
+            0,
+            agent_registry,
+        )
+        .with_handle(agent_handle),
     ));
 
     // Build dynamic system prompt based on registered tools
