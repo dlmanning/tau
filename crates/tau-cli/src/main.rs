@@ -5,7 +5,6 @@ mod config;
 mod context;
 mod lsp;
 mod oauth;
-mod prompts;
 mod session;
 mod tools;
 mod ui;
@@ -325,12 +324,12 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let acolyte_mode = cfg.acolyte_mode.unwrap_or(false);
-    let prompt_opts = prompts::PromptOptions {
+    let prompt_opts = tau_agent::prompts::PromptOptions {
         tool_names: &tool_names,
         cwd: &cwd,
         acolyte_mode,
     };
-    let mut system_prompt = prompts::build_system_prompt(&prompt_opts);
+    let mut system_prompt = tau_agent::prompts::build_system_prompt(&prompt_opts);
 
     // Append project context (CLAUDE.md, AGENTS.md)
     if let Some(context_content) = context::load_context() {

@@ -9,6 +9,7 @@ pub mod conversation;
 pub mod error;
 pub mod events;
 pub mod handle;
+pub mod prompts;
 pub mod tool;
 pub mod transport;
 
