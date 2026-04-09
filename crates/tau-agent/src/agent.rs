@@ -39,6 +39,9 @@ pub struct AgentConfig {
     pub thinking_adaptive: bool,
     /// Maximum tokens per response
     pub max_tokens: Option<u32>,
+    /// Maximum number of turns before the agent loop stops.
+    /// None means unlimited (default for the main agent).
+    pub max_turns: Option<u32>,
     /// Context compaction configuration
     pub compaction: CompactionConfig,
     /// How to drain the steering queue
@@ -606,6 +609,15 @@ impl Agent {
         let result = loop {
             turn += 1;
 
+            // Enforce turn limit if set (used by subagents)
+            if let Some(max) = self.config.max_turns {
+                if turn > max {
+                    tracing::info!("Agent reached max turns ({}), stopping", max);
+                    turn -= 1; // correct the count — this turn didn't execute
+                    break Ok(());
+                }
+            }
+
             // Build context for this turn
             let context_messages = self.build_context(&messages_to_add);
 
@@ -1010,6 +1022,7 @@ mod tests {
             reasoning: tau_ai::ReasoningLevel::Off,
             thinking_adaptive: false,
             max_tokens: None,
+            max_turns: None,
             compaction: CompactionConfig::default(),
             steering_mode: DequeueMode::All,
             follow_up_mode: DequeueMode::All,
@@ -1342,6 +1355,69 @@ mod tests {
         assert_eq!(
             count_after_first, count_after_second,
             "hook should not be called after clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_turns_stops_agent() {
+        // The agent gets two responses queued. With max_turns=1, only the first
+        // should be used. The follow-up triggers a second turn which gets blocked.
+        let responses = vec![
+            Message::Assistant {
+                content: vec![Content::text("first response")],
+                metadata: AssistantMetadata::default(),
+            },
+            Message::Assistant {
+                content: vec![Content::text("second response")],
+                metadata: AssistantMetadata::default(),
+            },
+        ];
+
+        let transport = Arc::new(MockTransport::new(responses));
+        let config = AgentConfig {
+            system_prompt: Some("test".into()),
+            model: tau_ai::Model {
+                id: "test".into(),
+                name: "test".into(),
+                api: tau_ai::Api::AnthropicMessages,
+                provider: tau_ai::Provider::Anthropic,
+                base_url: "http://localhost".into(),
+                reasoning: false,
+                input_types: vec![],
+                cost: tau_ai::CostInfo::default(),
+                context_window: 200000,
+                max_tokens: 4096,
+                headers: Default::default(),
+            },
+            reasoning: tau_ai::ReasoningLevel::Off,
+            thinking_adaptive: false,
+            max_tokens: None,
+            max_turns: Some(1), // Only allow 1 turn
+            compaction: CompactionConfig::default(),
+            steering_mode: DequeueMode::All,
+            follow_up_mode: DequeueMode::All,
+            cache_scope: None,
+            cache_ttl: None,
+            system_prompt_boundary: None,
+        };
+        let mut agent = Agent::new(config, transport);
+
+        // Queue a follow-up so the agent would normally do 2 turns
+        agent.handle().follow_up(Message::user("follow up question"));
+
+        agent.prompt("hello").await.unwrap();
+
+        // Should only have 1 assistant message (turn limit stopped the second)
+        let assistant_msgs: Vec<_> = agent
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant { .. }))
+            .collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "Expected 1 assistant message with max_turns=1, got {}",
+            assistant_msgs.len()
         );
     }
 }

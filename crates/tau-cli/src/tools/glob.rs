@@ -9,11 +9,16 @@ use tau_agent::tool::{Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 /// Tool for finding files matching a glob pattern
-pub struct GlobTool;
+pub struct GlobTool {
+    cwd: Option<PathBuf>,
+}
 
 impl GlobTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: Some(cwd.into()) }
     }
 }
 
@@ -68,7 +73,8 @@ impl Tool for GlobTool {
         let cwd = arguments
             .get("cwd")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            .or_else(|| self.cwd.clone());
 
         let limit = arguments
             .get("limit")

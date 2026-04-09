@@ -11,11 +11,16 @@ use tau_agent::tool::{Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 /// Tool for listing directory contents
-pub struct ListTool;
+pub struct ListTool {
+    cwd: Option<PathBuf>,
+}
 
 impl ListTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: Some(cwd.into()) }
     }
 }
 
@@ -69,8 +74,10 @@ impl Tool for ListTool {
         let path = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+            .map(|p| super::resolve_path(p, &self.cwd))
+            .unwrap_or_else(|| {
+                self.cwd.clone().unwrap_or_else(|| PathBuf::from("."))
+            });
 
         let recursive = arguments
             .get("recursive")

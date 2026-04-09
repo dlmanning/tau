@@ -12,11 +12,16 @@ const MAX_LINES: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 
 /// Tool for reading file contents
-pub struct ReadTool;
+pub struct ReadTool {
+    cwd: Option<PathBuf>,
+}
 
 impl ReadTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: Some(cwd.into()) }
     }
 }
 
@@ -78,7 +83,7 @@ impl Tool for ReadTool {
         } else if path_str == "~" {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
         } else {
-            PathBuf::from(path_str)
+            super::resolve_path(path_str, &self.cwd)
         };
 
         // Check for cancellation

@@ -10,11 +10,16 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 /// Tool for editing files with find/replace
-pub struct EditTool;
+pub struct EditTool {
+    cwd: Option<PathBuf>,
+}
 
 impl EditTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: Some(cwd.into()) }
     }
 }
 
@@ -84,7 +89,7 @@ impl Tool for EditTool {
                 PathBuf::from(path_str)
             }
         } else {
-            PathBuf::from(path_str)
+            super::resolve_path(path_str, &self.cwd)
         };
 
         // Check for cancellation

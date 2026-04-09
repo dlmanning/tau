@@ -17,11 +17,20 @@ const MAX_OUTPUT_SIZE: usize = 30_000; // 30KB
 const MAX_OUTPUT_LINES: usize = 500;
 
 /// Tool for executing bash commands
-pub struct BashTool;
+pub struct BashTool {
+    cwd: Option<std::path::PathBuf>,
+}
 
 impl BashTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+
+    /// Create a BashTool that runs commands in a specific directory.
+    pub fn with_cwd(cwd: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            cwd: Some(cwd.into()),
+        }
     }
 }
 
@@ -168,12 +177,15 @@ impl Tool for BashTool {
             ("sh", "-c")
         };
 
-        let mut child = match Command::new(shell)
-            .arg(shell_arg)
+        let mut cmd = Command::new(shell);
+        cmd.arg(shell_arg)
             .arg(command)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        if let Some(ref cwd) = self.cwd {
+            cmd.current_dir(cwd);
+        }
+        let mut child = match cmd.spawn()
         {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),

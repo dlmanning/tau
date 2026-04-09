@@ -9,11 +9,16 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 /// Tool for writing file contents
-pub struct WriteTool;
+pub struct WriteTool {
+    cwd: Option<PathBuf>,
+}
 
 impl WriteTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: Some(cwd.into()) }
     }
 }
 
@@ -76,7 +81,7 @@ impl Tool for WriteTool {
         } else if path_str == "~" {
             return ToolResult::error("Cannot write to home directory itself");
         } else {
-            PathBuf::from(path_str)
+            super::resolve_path(path_str, &self.cwd)
         };
 
         // Check for cancellation

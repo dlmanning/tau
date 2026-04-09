@@ -47,7 +47,12 @@ impl AgentType {
         }
     }
 
-    /// Maximum turns before logging a warning.
+    /// Whether this agent type only gets read-only tools.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::Explore | Self::Plan)
+    }
+
+    /// Maximum turns before the agent loop stops.
     fn max_turns(&self) -> u32 {
         match self {
             Self::GeneralPurpose => MAX_SUBAGENT_TURNS,
@@ -88,6 +93,10 @@ pub struct SubagentConfig {
     pub cancel: CancellationToken,
     /// Optional progress callback — receives tool execution updates.
     pub on_progress: Option<ProgressCallback>,
+    /// Factory to create CWD-aware tools. Called with the effective CWD
+    /// (worktree path or cwd override). Returns tools that replace parent tools by name.
+    /// If None, tools inherit the parent process's CWD.
+    pub cwd_tool_factory: Option<Arc<dyn Fn(&str) -> Vec<BoxedTool> + Send + Sync>>,
 }
 
 /// Factory function to create a depth-limited Agent tool.
@@ -355,17 +364,26 @@ async fn run_agent_inner(
                 .unwrap_or_else(|_| ".".into())
         });
 
+    // Build CWD-aware tool overrides if factory available
+    let tool_overrides = if let Some(ref factory) = config.cwd_tool_factory {
+        factory(&cwd)
+    } else {
+        vec![]
+    };
+
     // Build tool set
     let tools = build_tool_set(
         &config.agent_type,
         &config.all_tools,
         config.depth,
         &config.agent_tool_factory,
+        &tool_overrides,
     );
 
     // Create agent
     let mut agent_cfg = config.parent_config.clone();
     agent_cfg.system_prompt = None;
+    agent_cfg.max_turns = Some(config.agent_type.max_turns());
     if let Some(ref model) = config.model {
         agent_cfg.model = model.clone();
     }
@@ -420,31 +438,15 @@ async fn run_agent_inner(
         None
     };
 
-    // Run the agent
-    let result = agent.prompt(&config.prompt).await;
+    // Run the agent (max_turns enforced by the agent loop)
+    let prompt_result = agent.prompt(&config.prompt).await;
 
     // Abort progress forwarder before returning
     if let Some(task) = progress_task {
         task.abort();
     }
 
-    result?;
-
-    // Log if turn count was high
-    let max_turns = config.agent_type.max_turns();
-    let assistant_count = agent
-        .messages()
-        .iter()
-        .filter(|m| matches!(m, Message::Assistant { .. }))
-        .count() as u32;
-    if assistant_count > max_turns {
-        tracing::warn!(
-            "Subagent {} ran {} turns (limit {})",
-            agent_id,
-            assistant_count,
-            max_turns
-        );
-    }
+    prompt_result?;
 
     // Collect result
     let text = extract_final_text(agent.messages());
@@ -484,8 +486,10 @@ fn build_tool_set(
     all_tools: &[BoxedTool],
     depth: u32,
     agent_tool_factory: &Option<AgentToolFactory>,
+    tool_overrides: &[BoxedTool],
 ) -> Vec<BoxedTool> {
-    match agent_type {
+    // Determine which tools are allowed for this agent type
+    let allowed: Vec<BoxedTool> = match agent_type {
         AgentType::Explore | AgentType::Plan => {
             let read_only = ["read", "glob", "grep", "list", "lsp"];
             all_tools
@@ -495,42 +499,49 @@ fn build_tool_set(
                 .collect()
         }
         AgentType::GeneralPurpose => {
-            let mut tools: Vec<BoxedTool> = all_tools
+            all_tools
                 .iter()
                 .filter(|t| t.name() != "agent")
                 .cloned()
-                .collect();
+                .collect()
+        }
+    };
 
-            if depth + 1 < MAX_AGENT_DEPTH {
-                if let Some(factory) = agent_tool_factory {
-                    tools.push(factory(depth + 1));
-                }
+    // Replace tools with overrides where names match
+    let mut tools: Vec<BoxedTool> = allowed
+        .into_iter()
+        .map(|t| {
+            if let Some(ovr) = tool_overrides.iter().find(|o| o.name() == t.name()) {
+                ovr.clone()
+            } else {
+                t
             }
+        })
+        .collect();
 
-            tools
+    // Add recursive agent tool for general-purpose agents
+    if matches!(agent_type, AgentType::GeneralPurpose) && depth + 1 < MAX_AGENT_DEPTH {
+        if let Some(factory) = agent_tool_factory {
+            tools.push(factory(depth + 1));
         }
     }
+
+    tools
 }
 
 // ============================================================================
 // System prompt suffixes
 // ============================================================================
 
+const AGENT_GENERAL_PROMPT: &str = include_str!("prompts/agent_general.md");
+const AGENT_EXPLORE_PROMPT: &str = include_str!("prompts/agent_explore.md");
+const AGENT_PLAN_PROMPT: &str = include_str!("prompts/agent_plan.md");
+
 fn agent_type_suffix(agent_type: &AgentType) -> &'static str {
     match agent_type {
-        AgentType::GeneralPurpose => {
-            "You are a subagent. Complete the task fully — don't gold-plate, but don't \
-             leave it half-done. When done, respond with a concise report covering what \
-             was done and any key findings."
-        }
-        AgentType::Explore => {
-            "You are a fast exploration agent. Use read-only tools to search the codebase \
-             and answer questions. Be thorough but concise. Report what you found."
-        }
-        AgentType::Plan => {
-            "You are a planning agent. Design implementation strategies. Identify critical \
-             files, consider trade-offs, and present a concrete step-by-step plan."
-        }
+        AgentType::GeneralPurpose => AGENT_GENERAL_PROMPT,
+        AgentType::Explore => AGENT_EXPLORE_PROMPT,
+        AgentType::Plan => AGENT_PLAN_PROMPT,
     }
 }
 
@@ -754,7 +765,7 @@ mod tests {
     #[test]
     fn test_explore_gets_read_only_tools() {
         let all = mock_tools();
-        let filtered = build_tool_set(&AgentType::Explore, &all, 0, &None);
+        let filtered = build_tool_set(&AgentType::Explore, &all, 0, &None, &[]);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -770,7 +781,7 @@ mod tests {
     #[test]
     fn test_plan_gets_read_only_tools() {
         let all = mock_tools();
-        let filtered = build_tool_set(&AgentType::Plan, &all, 0, &None);
+        let filtered = build_tool_set(&AgentType::Plan, &all, 0, &None, &[]);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert_eq!(names.len(), 5);
         assert!(!names.contains(&"bash"));
@@ -780,7 +791,7 @@ mod tests {
     #[test]
     fn test_general_purpose_gets_all_except_agent() {
         let all = mock_tools();
-        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &None);
+        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &None, &[]);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read"));
@@ -794,7 +805,7 @@ mod tests {
         let factory: AgentToolFactory = Arc::new(|_depth| {
             Arc::new(MockTool { tool_name: "agent" })
         });
-        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory));
+        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory), &[]);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"agent")); // added by factory
     }
@@ -811,6 +822,7 @@ mod tests {
             &all,
             MAX_AGENT_DEPTH - 1,
             &Some(factory),
+            &[],
         );
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"agent")); // depth exceeded
@@ -1015,6 +1027,7 @@ mod tests {
             reasoning: tau_ai::ReasoningLevel::Off,
             thinking_adaptive: false,
             max_tokens: None,
+            max_turns: None,
             compaction: CompactionConfig::default(),
             steering_mode: crate::agent::DequeueMode::All,
             follow_up_mode: crate::agent::DequeueMode::All,
@@ -1068,6 +1081,7 @@ mod tests {
                 reasoning: tau_ai::ReasoningLevel::Off,
                 thinking_adaptive: false,
                 max_tokens: None,
+                max_turns: None,
                 compaction: CompactionConfig::default(),
                 steering_mode: crate::agent::DequeueMode::All,
                 follow_up_mode: crate::agent::DequeueMode::All,

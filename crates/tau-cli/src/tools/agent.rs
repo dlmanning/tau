@@ -13,6 +13,11 @@ use tau_agent::tool::{BoxedTool, ProgressSender, Tool, ToolResult};
 use tau_agent::transport::Transport;
 use tokio_util::sync::CancellationToken;
 
+use super::{
+    bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool,
+    list::ListTool, read::ReadTool, write::WriteTool,
+};
+
 /// Tool for spawning independent subagents.
 pub struct AgentTool {
     transport: Arc<dyn Transport>,
@@ -190,6 +195,20 @@ impl Tool for AgentTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Factory for creating CWD-aware tools in worktree/cwd-override subagents
+        let cwd_factory: Option<Arc<dyn Fn(&str) -> Vec<BoxedTool> + Send + Sync>> =
+            Some(Arc::new(|cwd: &str| -> Vec<BoxedTool> {
+                vec![
+                    Arc::new(BashTool::with_cwd(cwd)),
+                    Arc::new(ReadTool::with_cwd(cwd)),
+                    Arc::new(WriteTool::with_cwd(cwd)),
+                    Arc::new(EditTool::with_cwd(cwd)),
+                    Arc::new(GlobTool::with_cwd(cwd)),
+                    Arc::new(GrepTool::with_cwd(cwd)),
+                    Arc::new(ListTool::with_cwd(cwd)),
+                ]
+            }));
+
         if run_in_background {
             let bg_cancel = CancellationToken::new();
             let config = SubagentConfig {
@@ -206,6 +225,7 @@ impl Tool for AgentTool {
                 agent_tool_factory: Some(self.make_factory()),
                 cancel: bg_cancel.clone(),
                 on_progress: None,
+                cwd_tool_factory: cwd_factory.clone(),
             };
 
             let handle = self.agent_handle.clone();
@@ -267,6 +287,7 @@ impl Tool for AgentTool {
             agent_tool_factory: Some(self.make_factory()),
             cancel,
             on_progress: Some(progress_cb),
+            cwd_tool_factory: cwd_factory,
         };
 
         match run_subagent(config).await {

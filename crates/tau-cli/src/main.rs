@@ -293,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         reasoning,
         thinking_adaptive,
         max_tokens: None,
+        max_turns: None,
         compaction,
         steering_mode: tau_agent::DequeueMode::All,
         follow_up_mode: tau_agent::DequeueMode::All,

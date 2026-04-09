@@ -17,11 +17,16 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LINE_LENGTH: usize = 500;
 
 /// Tool for searching file contents with regex
-pub struct GrepTool;
+pub struct GrepTool {
+    cwd: Option<PathBuf>,
+}
 
 impl GrepTool {
     pub fn new() -> Self {
-        Self
+        Self { cwd: None }
+    }
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: Some(cwd.into()) }
     }
 }
 
@@ -104,8 +109,10 @@ impl Tool for GrepTool {
         let path = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+            .map(|p| super::resolve_path(p, &self.cwd))
+            .unwrap_or_else(|| {
+                self.cwd.clone().unwrap_or_else(|| PathBuf::from("."))
+            });
 
         let glob_pattern = arguments.get("glob").and_then(|v| v.as_str());
 
