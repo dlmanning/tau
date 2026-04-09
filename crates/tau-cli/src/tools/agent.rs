@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use tau_agent::agent::AgentConfig;
 use tau_agent::handle::AgentHandle;
-use tau_agent::subagent::{AgentToolFactory, AgentType, SubagentConfig, run_subagent};
-use tau_agent::tool::{BoxedTool, Tool, ToolResult};
+use tau_agent::subagent::{
+    AgentToolFactory, AgentType, ProgressCallback, SubagentConfig, run_subagent,
+};
+use tau_agent::tool::{BoxedTool, ProgressSender, Tool, ToolResult};
 use tau_agent::transport::Transport;
 use tokio_util::sync::CancellationToken;
 
@@ -110,9 +112,24 @@ impl Tool for AgentTool {
 
     async fn execute(
         &self,
+        tool_call_id: &str,
+        arguments: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> ToolResult {
+        // Delegate to execute_with_progress with a dummy sender.
+        // In practice, the agent loop calls execute_with_progress directly.
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let progress = ProgressSender::new(tx, tool_call_id, self.name());
+        self.execute_with_progress(tool_call_id, arguments, cancel, progress)
+            .await
+    }
+
+    async fn execute_with_progress(
+        &self,
         _tool_call_id: &str,
         arguments: serde_json::Value,
         cancel: CancellationToken,
+        progress: ProgressSender,
     ) -> ToolResult {
         let description = match arguments.get("description").and_then(|v| v.as_str()) {
             Some(d) => d.to_string(),
@@ -164,6 +181,7 @@ impl Tool for AgentTool {
                 parent_config: self.parent_config.clone(),
                 agent_tool_factory: Some(self.make_factory()),
                 cancel: bg_cancel.clone(),
+                on_progress: None, // background — no streaming progress
             };
 
             let handle = self.agent_handle.clone();
@@ -188,7 +206,10 @@ impl Tool for AgentTool {
             return ToolResult::text(format!("Agent launched in background: {}", description));
         }
 
-        // Foreground execution
+        // Foreground execution — wire progress callback to parent's ProgressSender
+        let progress_cb: ProgressCallback = Arc::new(move |msg: &str| {
+            progress.send(msg);
+        });
         let config = SubagentConfig {
             agent_type,
             prompt,
@@ -202,6 +223,7 @@ impl Tool for AgentTool {
             parent_config: self.parent_config.clone(),
             agent_tool_factory: Some(self.make_factory()),
             cancel,
+            on_progress: Some(progress_cb),
         };
 
         match run_subagent(config).await {

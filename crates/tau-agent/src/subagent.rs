@@ -64,6 +64,9 @@ impl std::fmt::Display for AgentType {
     }
 }
 
+/// Callback for receiving progress updates from a running subagent.
+pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Configuration for spawning a subagent.
 pub struct SubagentConfig {
     pub agent_type: AgentType,
@@ -80,6 +83,8 @@ pub struct SubagentConfig {
     pub agent_tool_factory: Option<AgentToolFactory>,
     /// Cancellation token — checked between turns.
     pub cancel: CancellationToken,
+    /// Optional progress callback — receives tool execution updates.
+    pub on_progress: Option<ProgressCallback>,
 }
 
 /// Factory function to create a depth-limited Agent tool.
@@ -193,8 +198,46 @@ async fn run_agent_inner(
     );
     agent.set_system_prompt(system_prompt);
 
+    // Forward progress events if callback provided
+    let progress_task = if let Some(ref on_progress) = config.on_progress {
+        let mut events = agent.subscribe();
+        let cb = on_progress.clone();
+        Some(tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                match &event {
+                    crate::events::AgentEvent::ToolExecutionStart {
+                        tool_name, ..
+                    } => {
+                        cb(&format!("[{}...]", tool_name));
+                    }
+                    crate::events::AgentEvent::ToolExecutionEnd {
+                        tool_name,
+                        is_error,
+                        ..
+                    } => {
+                        if *is_error {
+                            cb(&format!("[{} error]", tool_name));
+                        } else {
+                            cb(&format!("[{} done]", tool_name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Run the agent
-    agent.prompt(&config.prompt).await?;
+    let result = agent.prompt(&config.prompt).await;
+
+    // Abort progress forwarder before returning
+    if let Some(task) = progress_task {
+        task.abort();
+    }
+
+    result?;
 
     // Log if turn count was high
     let max_turns = config.agent_type.max_turns();
@@ -643,5 +686,97 @@ mod tests {
         assert_ne!(gp, ex);
         assert_ne!(gp, pl);
         assert_ne!(ex, pl);
+    }
+
+    // ── Progress callback ──
+
+    #[test]
+    fn test_progress_callback_type() {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let cb: ProgressCallback = Arc::new(move |msg: &str| {
+            received_clone.lock().unwrap().push(msg.to_string());
+        });
+
+        cb("[bash...]");
+        cb("[bash done]");
+        cb("[read...]");
+
+        let msgs = received.lock().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], "[bash...]");
+        assert_eq!(msgs[1], "[bash done]");
+        assert_eq!(msgs[2], "[read...]");
+    }
+
+    #[tokio::test]
+    async fn test_progress_forwarding_from_agent_events() {
+        // Simulate the progress forwarding logic from run_agent_inner:
+        // subscribe to an event channel, emit tool events, verify callback is called
+        use crate::events::AgentEvent;
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let cb: ProgressCallback = Arc::new(move |msg: &str| {
+            received_clone.lock().unwrap().push(msg.to_string());
+        });
+
+        // Subscribe and spawn forwarder (same logic as run_agent_inner)
+        let mut events = tx.subscribe();
+        let cb_clone = cb.clone();
+        let task = tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                match &event {
+                    AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                        cb_clone(&format!("[{}...]", tool_name));
+                    }
+                    AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
+                        if *is_error {
+                            cb_clone(&format!("[{} error]", tool_name));
+                        } else {
+                            cb_clone(&format!("[{} done]", tool_name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Emit events
+        tx.send(AgentEvent::ToolExecutionStart {
+            tool_call_id: "c1".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }).unwrap();
+        tx.send(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "c1".into(),
+            tool_name: "bash".into(),
+            result: "ok".into(),
+            is_error: false,
+        }).unwrap();
+        tx.send(AgentEvent::ToolExecutionStart {
+            tool_call_id: "c2".into(),
+            tool_name: "read".into(),
+            arguments: serde_json::json!({}),
+        }).unwrap();
+        tx.send(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "c2".into(),
+            tool_name: "read".into(),
+            result: "failed".into(),
+            is_error: true,
+        }).unwrap();
+
+        // Drop sender to close channel, which ends the forwarder
+        drop(tx);
+        let _ = task.await;
+
+        let msgs = received.lock().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0], "[bash...]");
+        assert_eq!(msgs[1], "[bash done]");
+        assert_eq!(msgs[2], "[read...]");
+        assert_eq!(msgs[3], "[read error]");
     }
 }
