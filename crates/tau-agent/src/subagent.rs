@@ -436,3 +436,212 @@ async fn cleanup_worktree(info: &WorktreeInfo) -> Result<bool, String> {
         Ok(false) // kept — has changes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::Tool;
+    use async_trait::async_trait;
+    use tau_ai::{AssistantMetadata, Content, Message};
+
+    // Minimal mock tool for testing tool filtering
+    struct MockTool {
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str {
+            self.tool_name
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _args: serde_json::Value,
+            _cancel: CancellationToken,
+        ) -> crate::tool::ToolResult {
+            crate::tool::ToolResult::text("")
+        }
+    }
+
+    fn mock_tools() -> Vec<BoxedTool> {
+        vec![
+            Arc::new(MockTool { tool_name: "bash" }),
+            Arc::new(MockTool { tool_name: "read" }),
+            Arc::new(MockTool { tool_name: "write" }),
+            Arc::new(MockTool { tool_name: "edit" }),
+            Arc::new(MockTool { tool_name: "glob" }),
+            Arc::new(MockTool { tool_name: "grep" }),
+            Arc::new(MockTool { tool_name: "list" }),
+            Arc::new(MockTool { tool_name: "lsp" }),
+            Arc::new(MockTool { tool_name: "agent" }),
+        ]
+    }
+
+    // ── AgentType ──
+
+    #[test]
+    fn test_parse_valid_types() {
+        assert!(matches!(AgentType::parse("general-purpose"), Some(AgentType::GeneralPurpose)));
+        assert!(matches!(AgentType::parse("Explore"), Some(AgentType::Explore)));
+        assert!(matches!(AgentType::parse("Plan"), Some(AgentType::Plan)));
+    }
+
+    #[test]
+    fn test_parse_invalid_type() {
+        assert!(AgentType::parse("unknown").is_none());
+        assert!(AgentType::parse("explore").is_none()); // case-sensitive
+        assert!(AgentType::parse("").is_none());
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!(AgentType::GeneralPurpose.to_string(), "general-purpose");
+        assert_eq!(AgentType::Explore.to_string(), "Explore");
+        assert_eq!(AgentType::Plan.to_string(), "Plan");
+    }
+
+    #[test]
+    fn test_max_turns() {
+        assert_eq!(AgentType::GeneralPurpose.max_turns(), 30);
+        assert_eq!(AgentType::Explore.max_turns(), 10);
+        assert_eq!(AgentType::Plan.max_turns(), 15);
+    }
+
+    // ── Tool filtering ──
+
+    #[test]
+    fn test_explore_gets_read_only_tools() {
+        let all = mock_tools();
+        let filtered = build_tool_set(&AgentType::Explore, &all, 0, &None);
+        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"glob"));
+        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"list"));
+        assert!(names.contains(&"lsp"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"write"));
+        assert!(!names.contains(&"edit"));
+        assert!(!names.contains(&"agent"));
+    }
+
+    #[test]
+    fn test_plan_gets_read_only_tools() {
+        let all = mock_tools();
+        let filtered = build_tool_set(&AgentType::Plan, &all, 0, &None);
+        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 5);
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"agent"));
+    }
+
+    #[test]
+    fn test_general_purpose_gets_all_except_agent() {
+        let all = mock_tools();
+        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &None);
+        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"write"));
+        assert!(!names.contains(&"agent")); // removed, no factory
+    }
+
+    #[test]
+    fn test_general_purpose_gets_agent_tool_from_factory() {
+        let all = mock_tools();
+        let factory: AgentToolFactory = Arc::new(|_depth| {
+            Arc::new(MockTool { tool_name: "agent" })
+        });
+        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory));
+        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"agent")); // added by factory
+    }
+
+    #[test]
+    fn test_depth_limit_excludes_agent_tool() {
+        let all = mock_tools();
+        let factory: AgentToolFactory = Arc::new(|_depth| {
+            Arc::new(MockTool { tool_name: "agent" })
+        });
+        // At MAX_AGENT_DEPTH - 1, the next level would be MAX_AGENT_DEPTH → excluded
+        let filtered = build_tool_set(
+            &AgentType::GeneralPurpose,
+            &all,
+            MAX_AGENT_DEPTH - 1,
+            &Some(factory),
+        );
+        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"agent")); // depth exceeded
+    }
+
+    // ── extract_final_text ──
+
+    #[test]
+    fn test_extract_final_text_from_assistant() {
+        let messages = vec![
+            Message::user("hello"),
+            Message::Assistant {
+                content: vec![Content::text("first response")],
+                metadata: AssistantMetadata::default(),
+            },
+            Message::user("follow up"),
+            Message::Assistant {
+                content: vec![Content::text("second response")],
+                metadata: AssistantMetadata::default(),
+            },
+        ];
+        assert_eq!(extract_final_text(&messages), "second response");
+    }
+
+    #[test]
+    fn test_extract_final_text_skips_tool_calls() {
+        let messages = vec![
+            Message::Assistant {
+                content: vec![
+                    Content::text("here is my answer"),
+                    Content::tool_call("c1", "bash", serde_json::json!({})),
+                ],
+                metadata: AssistantMetadata::default(),
+            },
+        ];
+        assert_eq!(extract_final_text(&messages), "here is my answer");
+    }
+
+    #[test]
+    fn test_extract_final_text_empty_conversation() {
+        let messages: Vec<Message> = vec![];
+        assert_eq!(extract_final_text(&messages), "");
+    }
+
+    #[test]
+    fn test_extract_final_text_no_assistant() {
+        let messages = vec![Message::user("hello")];
+        assert_eq!(extract_final_text(&messages), "");
+    }
+
+    // ── agent_type_suffix ──
+
+    #[test]
+    fn test_suffixes_are_nonempty() {
+        assert!(!agent_type_suffix(&AgentType::GeneralPurpose).is_empty());
+        assert!(!agent_type_suffix(&AgentType::Explore).is_empty());
+        assert!(!agent_type_suffix(&AgentType::Plan).is_empty());
+    }
+
+    #[test]
+    fn test_suffixes_are_distinct() {
+        let gp = agent_type_suffix(&AgentType::GeneralPurpose);
+        let ex = agent_type_suffix(&AgentType::Explore);
+        let pl = agent_type_suffix(&AgentType::Plan);
+        assert_ne!(gp, ex);
+        assert_ne!(gp, pl);
+        assert_ne!(ex, pl);
+    }
+}
