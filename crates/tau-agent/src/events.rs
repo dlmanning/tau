@@ -70,10 +70,18 @@ pub enum AgentEvent {
 
     /// Error occurred
     Error { message: String },
+
+    /// Event from a subagent, wrapped with identity.
+    Subagent {
+        agent_id: String,
+        description: String,
+        event: Box<AgentEvent>,
+    },
 }
 
 impl AgentEvent {
-    /// Check if this is a terminal event
+    /// Check if this is a terminal event.
+    /// A `Subagent` event is never terminal for the parent even if the inner event is.
     pub fn is_terminal(&self) -> bool {
         matches!(self, AgentEvent::AgentEnd { .. } | AgentEvent::Error { .. })
     }

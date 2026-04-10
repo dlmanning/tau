@@ -272,6 +272,22 @@ impl Content {
     }
 }
 
+/// Source of a system-injected message (not from user or model).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectionSource {
+    /// A subagent completed successfully.
+    SubagentCompleted {
+        agent_id: String,
+        description: String,
+    },
+    /// A subagent failed.
+    SubagentFailed {
+        agent_id: String,
+        description: String,
+    },
+}
+
 /// Message roles
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -297,6 +313,13 @@ pub enum Message {
         is_error: bool,
         #[serde(default)]
         timestamp: i64,
+    },
+    /// System-injected message (e.g. subagent completion notification).
+    /// Not from the user or the model. Converted to a user-role message
+    /// before being sent to LLM APIs.
+    SystemInjection {
+        content: Vec<Content>,
+        source: InjectionSource,
     },
 }
 
@@ -358,21 +381,53 @@ impl Message {
         }
     }
 
+    /// Create a system injection message for subagent completion.
+    pub fn subagent_completed(
+        agent_id: impl Into<String>,
+        description: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self::SystemInjection {
+            content: vec![Content::text(text)],
+            source: InjectionSource::SubagentCompleted {
+                agent_id: agent_id.into(),
+                description: description.into(),
+            },
+        }
+    }
+
+    /// Create a system injection message for subagent failure.
+    pub fn subagent_failed(
+        agent_id: impl Into<String>,
+        description: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::SystemInjection {
+            content: vec![Content::text(error)],
+            source: InjectionSource::SubagentFailed {
+                agent_id: agent_id.into(),
+                description: description.into(),
+            },
+        }
+    }
+
     /// Get the role as a string
     pub fn role(&self) -> &'static str {
         match self {
             Self::User { .. } => "user",
             Self::Assistant { .. } => "assistant",
             Self::ToolResult { .. } => "tool_result",
+            Self::SystemInjection { .. } => "system_injection",
         }
     }
 
     /// Get the content blocks
     pub fn content(&self) -> &[Content] {
         match self {
-            Self::User { content, .. } => content,
-            Self::Assistant { content, .. } => content,
-            Self::ToolResult { content, .. } => content,
+            Self::User { content, .. }
+            | Self::Assistant { content, .. }
+            | Self::ToolResult { content, .. }
+            | Self::SystemInjection { content, .. } => content,
         }
     }
 
@@ -390,7 +445,7 @@ impl Message {
                     _ => None,
                 })
                 .collect(),
-            _ => vec![],
+            Self::User { .. } | Self::ToolResult { .. } | Self::SystemInjection { .. } => vec![],
         }
     }
 

@@ -7,20 +7,15 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 /// Tool for listing directory contents
-pub struct ListTool {
-    cwd: Option<PathBuf>,
-}
+pub struct ListTool;
 
 impl ListTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: Some(cwd.into()) }
+        Self
     }
 }
 
@@ -67,17 +62,14 @@ impl Tool for ListTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let path = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|p| super::resolve_path(p, &self.cwd))
-            .unwrap_or_else(|| {
-                self.cwd.clone().unwrap_or_else(|| PathBuf::from("."))
-            });
+            .map(|p| super::resolve_path(p, &ctx.cwd))
+            .unwrap_or_else(|| ctx.cwd.clone());
 
         let recursive = arguments
             .get("recursive")
@@ -105,12 +97,12 @@ impl Tool for ListTool {
         let mut entries = Vec::new();
 
         if recursive {
-            collect_recursive(&path, &path, show_hidden, &cancel, &mut entries, limit);
+            collect_recursive(&path, &path, show_hidden, &ctx.cancel, &mut entries, limit);
         } else {
-            collect_flat(&path, show_hidden, &cancel, &mut entries, limit);
+            collect_flat(&path, show_hidden, &ctx.cancel, &mut entries, limit);
         }
 
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return ToolResult::error("List cancelled");
         }
 

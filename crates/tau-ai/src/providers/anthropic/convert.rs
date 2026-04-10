@@ -185,6 +185,27 @@ pub(super) fn convert_messages(
                     content: serde_json::Value::Array(vec![tool_result]),
                 });
             }
+            Message::SystemInjection { content, source } => {
+                // Convert to user message with source context prefix
+                let prefix = match source {
+                    crate::types::InjectionSource::SubagentCompleted { description, .. } => {
+                        format!("[Subagent \"{}\" completed]\n", description)
+                    }
+                    crate::types::InjectionSource::SubagentFailed { description, .. } => {
+                        format!("[Subagent \"{}\" failed]\n", description)
+                    }
+                };
+                let text: String = content
+                    .iter()
+                    .filter_map(|c| c.as_text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let block = serde_json::json!({ "type": "text", "text": format!("{}{}", prefix, text) });
+                result.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::Value::Array(vec![block]),
+                });
+            }
         }
     }
 

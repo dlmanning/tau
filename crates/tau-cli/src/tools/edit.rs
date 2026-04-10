@@ -5,21 +5,15 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
-use tau_agent::tool::{Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio::fs;
-use tokio_util::sync::CancellationToken;
 
 /// Tool for editing files with find/replace
-pub struct EditTool {
-    cwd: Option<PathBuf>,
-}
+pub struct EditTool;
 
 impl EditTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: Some(cwd.into()) }
+        Self
     }
 }
 
@@ -54,6 +48,10 @@ impl Tool for EditTool {
                 "new_text": {
                     "type": "string",
                     "description": "New text to replace the old text with"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace all occurrences instead of requiring a unique match (default: false)"
                 }
             },
             "required": ["path", "old_text", "new_text"]
@@ -62,9 +60,8 @@ impl Tool for EditTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -89,11 +86,11 @@ impl Tool for EditTool {
                 PathBuf::from(path_str)
             }
         } else {
-            super::resolve_path(path_str, &self.cwd)
+            super::resolve_path(path_str, &ctx.cwd)
         };
 
         // Check for cancellation
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
@@ -103,6 +100,11 @@ impl Tool for EditTool {
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
 
+        let replace_all = arguments
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Check if old text exists
         if !content.contains(old_text) {
             return ToolResult::error(format!(
@@ -111,17 +113,19 @@ impl Tool for EditTool {
             ));
         }
 
-        // Count occurrences
         let occurrences = content.matches(old_text).count();
-        if occurrences > 1 {
-            return ToolResult::error(format!(
-                "Found {} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique.",
-                occurrences, path_str
-            ));
-        }
 
         // Perform replacement
-        let new_content = content.replacen(old_text, new_text, 1);
+        let new_content = if replace_all {
+            content.replace(old_text, new_text)
+        } else if occurrences > 1 {
+            return ToolResult::error(format!(
+                "Found {} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique, or set replace_all to true.",
+                occurrences, path_str
+            ));
+        } else {
+            content.replacen(old_text, new_text, 1)
+        };
 
         // Check that something changed
         if content == new_content {
@@ -135,20 +139,24 @@ impl Tool for EditTool {
         let diff = generate_diff(&content, &new_content);
 
         // Check for cancellation before writing
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
         // Write the file
         match fs::write(&path, &new_content).await {
             Ok(()) => {
-                let result = format!(
-                    "Successfully replaced text in {}. Changed {} characters to {} characters.\n\nDiff:\n{}",
-                    path_str,
-                    old_text.len(),
-                    new_text.len(),
-                    diff
-                );
+                let result = if replace_all && occurrences > 1 {
+                    format!(
+                        "Successfully replaced {} occurrences in {}.\n\nDiff:\n{}",
+                        occurrences, path_str, diff
+                    )
+                } else {
+                    format!(
+                        "Successfully replaced text in {}. Changed {} characters to {} characters.\n\nDiff:\n{}",
+                        path_str, old_text.len(), new_text.len(), diff
+                    )
+                };
                 ToolResult::text(result).with_details(json!({ "diff": diff }))
             }
             Err(e) => ToolResult::error(format!("Failed to write file: {}", e)),

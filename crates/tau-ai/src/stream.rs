@@ -5,7 +5,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 
-use crate::types::{Content, Message, StopReason, Usage};
+use crate::types::{Api, AssistantMetadata, Content, Message, Provider, StopReason, Usage};
 
 /// Events emitted during message streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +289,483 @@ impl MessageBuilder {
                 .push(ContentBuffer::Text(String::new()));
         }
         self.content_buffers[index] = default;
+    }
+}
+
+// ============================================================================
+// Stream accumulator — producer-side event generation
+// ============================================================================
+
+/// Tracks streaming content blocks and emits [`MessageEvent`]s.
+///
+/// Providers parse their SSE format and feed deltas into the accumulator,
+/// which handles start/end event lifecycle and final [`Message`] construction.
+/// This eliminates duplicated state-tracking and message-building logic
+/// across providers.
+pub struct StreamAccumulator {
+    blocks: Vec<AccBlock>,
+    usage: Usage,
+    stop_reason: Option<StopReason>,
+    error: Option<String>,
+    api: Api,
+    provider: Provider,
+    model_id: String,
+}
+
+#[derive(Debug, Default)]
+enum AccBlock {
+    #[default]
+    Empty,
+    Text {
+        text: String,
+        started: bool,
+        ended: bool,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+        started: bool,
+        ended: bool,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args_json: String,
+        started: bool,
+        ended: bool,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+}
+
+impl StreamAccumulator {
+    /// Create a new accumulator and the initial [`MessageEvent::Start`] event.
+    pub fn new(api: Api, provider: Provider, model_id: String) -> (Self, MessageEvent) {
+        let acc = Self {
+            blocks: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: None,
+            error: None,
+            api,
+            provider,
+            model_id: model_id.clone(),
+        };
+        let start = MessageEvent::Start {
+            message: Message::Assistant {
+                content: vec![],
+                metadata: AssistantMetadata {
+                    model: Some(model_id),
+                    ..Default::default()
+                },
+            },
+        };
+        (acc, start)
+    }
+
+    // ---- text ----
+
+    /// Append a text delta. Auto-creates and starts the block if needed.
+    pub fn text_delta(&mut self, index: usize, delta: &str) -> Vec<MessageEvent> {
+        self.ensure_block(index);
+        let mut events = Vec::new();
+
+        if matches!(self.blocks[index], AccBlock::Empty) {
+            self.blocks[index] = AccBlock::Text {
+                text: String::new(),
+                started: false,
+                ended: false,
+            };
+        }
+
+        if let AccBlock::Text {
+            ref mut text,
+            ref mut started,
+            ..
+        } = self.blocks[index]
+        {
+            if !*started {
+                *started = true;
+                events.push(MessageEvent::TextStart {
+                    content_index: index,
+                });
+            }
+            text.push_str(delta);
+            events.push(MessageEvent::TextDelta {
+                content_index: index,
+                delta: delta.to_string(),
+            });
+        }
+        events
+    }
+
+    /// Explicitly start a text block (Anthropic content_block_start).
+    pub fn text_start(&mut self, index: usize) -> Vec<MessageEvent> {
+        self.ensure_block(index);
+        self.blocks[index] = AccBlock::Text {
+            text: String::new(),
+            started: true,
+            ended: false,
+        };
+        vec![MessageEvent::TextStart {
+            content_index: index,
+        }]
+    }
+
+    /// Explicitly end a text block.
+    pub fn text_end(&mut self, index: usize) -> Vec<MessageEvent> {
+        if let Some(AccBlock::Text {
+            text, ended, ..
+        }) = self.blocks.get_mut(index)
+        {
+            *ended = true;
+            vec![MessageEvent::TextEnd {
+                content_index: index,
+                text: text.clone(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    // ---- thinking ----
+
+    /// Start a thinking block.
+    pub fn thinking_start(&mut self, index: usize) -> Vec<MessageEvent> {
+        self.ensure_block(index);
+        self.blocks[index] = AccBlock::Thinking {
+            thinking: String::new(),
+            signature: None,
+            started: true,
+            ended: false,
+        };
+        vec![MessageEvent::ThinkingStart {
+            content_index: index,
+        }]
+    }
+
+    /// Append a thinking delta.
+    pub fn thinking_delta(&mut self, index: usize, delta: &str) -> Vec<MessageEvent> {
+        if let Some(AccBlock::Thinking {
+            thinking, ..
+        }) = self.blocks.get_mut(index)
+        {
+            thinking.push_str(delta);
+            vec![MessageEvent::ThinkingDelta {
+                content_index: index,
+                delta: delta.to_string(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Accumulate a signature delta (no events emitted).
+    pub fn thinking_signature_delta(&mut self, index: usize, sig_delta: &str) {
+        if let Some(AccBlock::Thinking {
+            signature, ..
+        }) = self.blocks.get_mut(index)
+        {
+            match signature {
+                Some(s) => s.push_str(sig_delta),
+                None => *signature = Some(sig_delta.to_string()),
+            }
+        }
+    }
+
+    /// End a thinking block. `override_signature` replaces any accumulated signature.
+    pub fn thinking_end(
+        &mut self,
+        index: usize,
+        override_signature: Option<String>,
+    ) -> Vec<MessageEvent> {
+        if let Some(AccBlock::Thinking {
+            thinking,
+            signature,
+            ended,
+            ..
+        }) = self.blocks.get_mut(index)
+        {
+            if let Some(sig) = override_signature {
+                *signature = Some(sig);
+            }
+            *ended = true;
+            vec![MessageEvent::ThinkingEnd {
+                content_index: index,
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    // ---- tool calls ----
+
+    /// Start a tool call block.
+    pub fn tool_call_start(
+        &mut self,
+        index: usize,
+        id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Vec<MessageEvent> {
+        self.ensure_block(index);
+        let id = id.into();
+        let name = name.into();
+        self.blocks[index] = AccBlock::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            args_json: String::new(),
+            started: true,
+            ended: false,
+        };
+        vec![MessageEvent::ToolCallStart {
+            content_index: index,
+            id,
+            name,
+        }]
+    }
+
+    /// Append a tool call arguments delta.
+    pub fn tool_call_delta(&mut self, index: usize, delta: &str) -> Vec<MessageEvent> {
+        if let Some(AccBlock::ToolCall {
+            args_json, ..
+        }) = self.blocks.get_mut(index)
+        {
+            args_json.push_str(delta);
+            vec![MessageEvent::ToolCallDelta {
+                content_index: index,
+                delta: delta.to_string(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Explicitly end a tool call block.
+    pub fn tool_call_end(&mut self, index: usize) -> Vec<MessageEvent> {
+        if let Some(AccBlock::ToolCall {
+            id,
+            name,
+            args_json,
+            ended,
+            ..
+        }) = self.blocks.get_mut(index)
+        {
+            *ended = true;
+            let arguments =
+                serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+            vec![MessageEvent::ToolCallEnd {
+                content_index: index,
+                id: id.clone(),
+                name: name.clone(),
+                arguments,
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    // ---- special blocks ----
+
+    /// Record a redacted thinking block (no events emitted).
+    pub fn add_redacted_thinking(&mut self, index: usize, data: String) {
+        self.ensure_block(index);
+        self.blocks[index] = AccBlock::RedactedThinking { data };
+    }
+
+    /// Record a server tool use block (no events emitted).
+    pub fn add_server_tool_use(
+        &mut self,
+        index: usize,
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    ) {
+        self.ensure_block(index);
+        self.blocks[index] = AccBlock::ServerToolUse { id, name, input };
+    }
+
+    // ---- state ----
+
+    /// Mutable reference to usage for incremental updates.
+    pub fn usage_mut(&mut self) -> &mut Usage {
+        &mut self.usage
+    }
+
+    /// Set the stop reason.
+    pub fn set_stop_reason(&mut self, reason: StopReason) {
+        self.stop_reason = Some(reason);
+    }
+
+    /// Record an error. When [`finish`](Self::finish) is called, it will emit
+    /// [`MessageEvent::Error`] instead of [`MessageEvent::Done`].
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
+        self.stop_reason = Some(StopReason::Error);
+    }
+
+    // ---- generic block end (for Anthropic content_block_stop) ----
+
+    /// End the block at `index`, dispatching to the appropriate end method.
+    /// `override_signature` is applied only to thinking blocks.
+    pub fn end_block(
+        &mut self,
+        index: usize,
+        override_signature: Option<String>,
+    ) -> Vec<MessageEvent> {
+        if index >= self.blocks.len() {
+            return vec![];
+        }
+        let is_text = matches!(self.blocks[index], AccBlock::Text { .. });
+        let is_thinking = matches!(self.blocks[index], AccBlock::Thinking { .. });
+        let is_tool = matches!(self.blocks[index], AccBlock::ToolCall { .. });
+
+        if is_thinking {
+            self.thinking_end(index, override_signature)
+        } else if is_text {
+            self.text_end(index)
+        } else if is_tool {
+            self.tool_call_end(index)
+        } else {
+            vec![]
+        }
+    }
+
+    // ---- terminal ----
+
+    /// Create an error event for immediate yield-and-return (without calling finish).
+    pub fn error_event(msg: impl Into<String>) -> MessageEvent {
+        MessageEvent::Error {
+            message: msg.into(),
+        }
+    }
+
+    /// End all open blocks, build the final message, and return terminal events.
+    pub fn finish(self) -> Vec<MessageEvent> {
+        let Self {
+            blocks,
+            usage,
+            stop_reason,
+            error,
+            api,
+            provider,
+            model_id,
+        } = self;
+
+        let mut events = Vec::new();
+
+        if let Some(error_msg) = error {
+            events.push(MessageEvent::Error {
+                message: error_msg,
+            });
+            return events;
+        }
+
+        // Single pass: emit End events for open blocks and collect content
+        let mut content = Vec::new();
+        for (index, block) in blocks.into_iter().enumerate() {
+            match block {
+                AccBlock::Empty => {}
+                AccBlock::Text {
+                    text,
+                    started,
+                    ended,
+                } => {
+                    if started && !ended {
+                        events.push(MessageEvent::TextEnd {
+                            content_index: index,
+                            text: text.clone(),
+                        });
+                    }
+                    if !text.is_empty() {
+                        content.push(Content::Text { text });
+                    }
+                }
+                AccBlock::Thinking {
+                    thinking,
+                    signature,
+                    started,
+                    ended,
+                } => {
+                    if started && !ended {
+                        events.push(MessageEvent::ThinkingEnd {
+                            content_index: index,
+                            thinking: thinking.clone(),
+                            signature: signature.clone(),
+                        });
+                    }
+                    content.push(Content::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+                AccBlock::ToolCall {
+                    id,
+                    name,
+                    args_json,
+                    started,
+                    ended,
+                } => {
+                    let arguments = serde_json::from_str(&args_json)
+                        .unwrap_or(serde_json::Value::Null);
+                    if started && !ended {
+                        events.push(MessageEvent::ToolCallEnd {
+                            content_index: index,
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
+                    }
+                    content.push(Content::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+                AccBlock::RedactedThinking { data } => {
+                    content.push(Content::RedactedThinking { data });
+                }
+                AccBlock::ServerToolUse { id, name, input } => {
+                    content.push(Content::ServerToolUse { id, name, input });
+                }
+            }
+        }
+
+        let stop_reason = stop_reason.unwrap_or(StopReason::Stop);
+        let final_message = Message::Assistant {
+            content,
+            metadata: AssistantMetadata {
+                api: Some(api),
+                provider: Some(provider),
+                model: Some(model_id),
+                usage: usage.clone(),
+                stop_reason: Some(stop_reason),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                ..Default::default()
+            },
+        };
+
+        events.push(MessageEvent::Done {
+            message: final_message,
+            stop_reason,
+            usage,
+        });
+
+        events
+    }
+
+    // ---- private ----
+
+    fn ensure_block(&mut self, index: usize) {
+        while self.blocks.len() <= index {
+            self.blocks.push(AccBlock::Empty);
+        }
     }
 }
 

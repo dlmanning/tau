@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Error, Result},
-    stream::{MessageEvent, MessageEventStream},
-    types::{AssistantMetadata, Content, Context, Message, Model, StopReason, Usage},
+    messages::ensure_tool_result_pairing,
+    stream::{MessageEvent, MessageEventStream, StreamAccumulator},
+    types::{Content, Context, Message, Model, StopReason},
 };
 
 /// Google Generative AI client
@@ -96,8 +97,12 @@ impl GoogleProvider {
     fn build_request(&self, model: &Model, context: &Context) -> Result<GeminiRequest> {
         let mut contents = Vec::new();
 
+        // Repair tool_use/tool_result pairing before conversion
+        let mut context_messages = context.messages.clone();
+        ensure_tool_result_pairing(&mut context_messages);
+
         // Convert messages
-        for msg in &context.messages {
+        for msg in &context_messages {
             if let Some(content) = convert_message(msg) {
                 contents.push(content);
             }
@@ -231,6 +236,27 @@ fn convert_message(msg: &Message) -> Option<GeminiContent> {
                 }],
             })
         }
+        Message::SystemInjection { content, source } => {
+            let prefix = match source {
+                crate::types::InjectionSource::SubagentCompleted { description, .. } => {
+                    format!("[Subagent \"{}\" completed]\n", description)
+                }
+                crate::types::InjectionSource::SubagentFailed { description, .. } => {
+                    format!("[Subagent \"{}\" failed]\n", description)
+                }
+            };
+            let text: String = content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(GeminiContent {
+                role: Some("user".to_string()),
+                parts: vec![GeminiPart::Text {
+                    text: format!("{}{}", prefix, text),
+                }],
+            })
+        }
     }
 }
 
@@ -239,22 +265,14 @@ fn create_stream(
     model: Model,
 ) -> impl futures::Stream<Item = MessageEvent> {
     stream! {
-        let mut accumulated_text = String::new();
-        let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new(); // (id, name, args)
-        let mut finish_reason: Option<String> = None;
-        let mut total_input_tokens = 0u32;
-        let mut total_output_tokens = 0u32;
-        let mut text_started = false;
+        let (mut acc, start) = StreamAccumulator::new(
+            crate::Api::GoogleGenerativeAI,
+            crate::Provider::Google,
+            model.id.clone(),
+        );
+        yield start;
 
-        // Emit start event
-        let start_message = Message::Assistant {
-            content: vec![],
-            metadata: AssistantMetadata {
-                model: Some(model.id.clone()),
-                ..Default::default()
-            },
-        };
-        yield MessageEvent::Start { message: start_message };
+        let mut tool_count = 0usize;
 
         while let Some(event) = event_source.next().await {
             match event {
@@ -264,138 +282,61 @@ fn create_stream(
                         continue;
                     }
 
-                    let chunk: std::result::Result<GeminiStreamResponse, _> = serde_json::from_str(&msg.data);
-                    match chunk {
+                    match serde_json::from_str::<GeminiStreamResponse>(&msg.data) {
                         Ok(response) => {
                             for candidate in &response.candidates {
                                 if let Some(ref content) = candidate.content {
                                     for part in &content.parts {
                                         match part {
                                             GeminiResponsePart::Text { text } => {
-                                                if !text_started {
-                                                    text_started = true;
-                                                    yield MessageEvent::TextStart { content_index: 0 };
-                                                }
-                                                accumulated_text.push_str(text);
-                                                yield MessageEvent::TextDelta {
-                                                    content_index: 0,
-                                                    delta: text.clone(),
-                                                };
+                                                for ev in acc.text_delta(0, text) { yield ev; }
                                             }
                                             GeminiResponsePart::FunctionCall { function_call } => {
-                                                // Generate a unique ID since Gemini doesn't provide one
-                                                let id = format!("call_{}", tool_calls.len());
-                                                let name = function_call.name.clone();
-                                                let args = function_call.args.clone();
-
-                                                yield MessageEvent::ToolCallStart {
-                                                    content_index: tool_calls.len(),
-                                                    id: id.clone(),
-                                                    name: name.clone(),
-                                                };
-
-                                                let args_str = serde_json::to_string(&args).unwrap_or_default();
-                                                yield MessageEvent::ToolCallDelta {
-                                                    content_index: tool_calls.len(),
-                                                    delta: args_str,
-                                                };
-
-                                                tool_calls.push((id, name, args));
+                                                let idx = tool_count;
+                                                tool_count += 1;
+                                                let id = format!("call_{}", idx);
+                                                for ev in acc.tool_call_start(idx, &id, &function_call.name) { yield ev; }
+                                                let args_str = serde_json::to_string(&function_call.args).unwrap_or_default();
+                                                for ev in acc.tool_call_delta(idx, &args_str) { yield ev; }
                                             }
                                         }
                                     }
                                 }
 
-                                // Capture finish reason
                                 if let Some(ref reason) = candidate.finish_reason {
-                                    finish_reason = Some(reason.clone());
+                                    acc.set_stop_reason(match reason.as_str() {
+                                        "STOP" => StopReason::Stop,
+                                        "MAX_TOKENS" => StopReason::Length,
+                                        "SAFETY" | "RECITATION" => StopReason::Stop,
+                                        _ => StopReason::Stop,
+                                    });
                                 }
                             }
 
-                            // Handle usage metadata
                             if let Some(ref usage) = response.usage_metadata {
-                                total_input_tokens = usage.prompt_token_count.unwrap_or(0);
-                                total_output_tokens = usage.candidates_token_count.unwrap_or(0);
+                                let u = acc.usage_mut();
+                                u.input = usage.prompt_token_count.unwrap_or(0);
+                                u.output = usage.candidates_token_count.unwrap_or(0);
                             }
                         }
                         Err(e) => {
-                            // Try to parse as error response
                             if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&msg.data) {
-                                yield MessageEvent::Error {
-                                    message: error_response.error.message,
-                                };
+                                yield StreamAccumulator::error_event(error_response.error.message);
                                 return;
                             }
-                            yield MessageEvent::Error {
-                                message: format!("Failed to parse chunk: {}", e),
-                            };
+                            yield StreamAccumulator::error_event(format!("Failed to parse chunk: {}", e));
                             return;
                         }
                     }
                 }
                 Err(e) => {
-                    yield MessageEvent::Error {
-                        message: format!("SSE error: {}", e),
-                    };
+                    yield StreamAccumulator::error_event(format!("SSE error: {}", e));
                     return;
                 }
             }
         }
 
-        // Build final content
-        let mut content = Vec::new();
-
-        if !accumulated_text.is_empty() {
-            content.push(Content::Text {
-                text: accumulated_text.clone(),
-            });
-        }
-
-        for (id, name, args) in tool_calls {
-            content.push(Content::ToolCall {
-                id,
-                name,
-                arguments: args,
-            });
-        }
-
-        let stop_reason = match finish_reason.as_deref() {
-            Some("STOP") => Some(StopReason::Stop),
-            Some("MAX_TOKENS") => Some(StopReason::Length),
-            Some("SAFETY") => Some(StopReason::Stop),
-            Some("RECITATION") => Some(StopReason::Stop),
-            _ => None,
-        };
-
-        let final_message = Message::Assistant {
-            content,
-            metadata: AssistantMetadata {
-                api: Some(crate::Api::GoogleGenerativeAI),
-                provider: Some(crate::Provider::Google),
-                model: Some(model.id.clone()),
-                stop_reason,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                ..Default::default()
-            },
-        };
-
-        // Emit TextEnd if we started text
-        if text_started {
-            yield MessageEvent::TextEnd {
-                content_index: 0,
-                text: accumulated_text.clone(),
-            };
-        }
-
-        yield MessageEvent::Done {
-            message: final_message,
-            stop_reason: stop_reason.unwrap_or(StopReason::Stop),
-            usage: Usage {
-                input: total_input_tokens,
-                output: total_output_tokens,
-                ..Default::default()
-            },
-        };
+        for ev in acc.finish() { yield ev; }
     }
 }
 

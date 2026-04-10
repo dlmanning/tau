@@ -1,7 +1,8 @@
 //! Agent state management and execution
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
 
@@ -82,6 +83,13 @@ pub struct Agent {
     // --- Schema validator cache ---
     /// Cached compiled JSON schema validators keyed by tool name
     schema_cache: HashMap<String, Arc<jsonschema::Validator>>,
+
+    // --- File tracking for read-before-write guard ---
+    /// Working directory override (set for subagents with custom CWDs).
+    cwd: Option<PathBuf>,
+    /// Files that have been read in this conversation.
+    /// Write/Edit tools require a prior read for existing files.
+    read_files: HashSet<PathBuf>,
 }
 
 impl Agent {
@@ -97,12 +105,19 @@ impl Agent {
             handle: AgentHandle::new(),
             transform_context: None,
             schema_cache: HashMap::new(),
+            cwd: None,
+            read_files: HashSet::new(),
         }
     }
 
     /// Subscribe to agent events
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Get a clone of the event sender (used by AgentManager to forward events).
+    pub fn event_sender(&self) -> broadcast::Sender<AgentEvent> {
+        self.event_tx.clone()
     }
 
     /// Get the current state
@@ -118,6 +133,18 @@ impl Agent {
     /// Set the system prompt
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         self.config.system_prompt = Some(prompt.into());
+    }
+
+    /// Set the working directory for path resolution and tool execution.
+    pub fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.cwd = Some(cwd.into());
+    }
+
+    /// Get the effective CWD (explicit override or process CWD).
+    fn effective_cwd(&self) -> PathBuf {
+        self.cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
     }
 
     /// Set the model
@@ -179,11 +206,13 @@ impl Agent {
         self.conversation.total_usage = Usage::default();
         self.conversation.error = None;
         self.conversation.previous_summary = None;
+        self.read_files.clear();
     }
 
     /// Set messages (for loading from session)
     pub fn set_messages(&mut self, messages: Vec<Message>) {
         self.conversation.messages = messages;
+        self.rebuild_read_files();
     }
 
     /// Set the previous summary (for session resume after compaction)
@@ -267,7 +296,7 @@ impl Agent {
 
     /// Run compaction on the current conversation
     pub async fn run_compaction(&mut self, reason: CompactionReason) -> crate::error::Result<()> {
-        let _ = self.event_tx.send(AgentEvent::CompactionStart { reason });
+        send_event(&self.event_tx, AgentEvent::CompactionStart { reason });
 
         let tokens_before = compaction::estimate_total_tokens(&self.conversation.messages);
 
@@ -292,10 +321,13 @@ impl Agent {
         self.conversation.previous_summary = Some(result.summary);
 
         let tokens_after = compaction::estimate_total_tokens(&self.conversation.messages);
-        let _ = self.event_tx.send(AgentEvent::CompactionEnd {
-            tokens_before,
-            tokens_after,
-        });
+        send_event(
+            &self.event_tx,
+            AgentEvent::CompactionEnd {
+                tokens_before,
+                tokens_after,
+            },
+        );
 
         Ok(())
     }
@@ -346,18 +378,24 @@ impl Agent {
         tool_results: &mut Vec<Message>,
     ) {
         for (skip_id, skip_name, _) in tool_calls {
-            let _ = self.event_tx.send(AgentEvent::ToolExecutionStart {
-                tool_call_id: skip_id.clone(),
-                tool_name: skip_name.clone(),
-                arguments: serde_json::Value::Null,
-            });
+            send_event(
+                &self.event_tx,
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: skip_id.clone(),
+                    tool_name: skip_name.clone(),
+                    arguments: serde_json::Value::Null,
+                },
+            );
             let skip_result = ToolResult::error("Skipped due to steering message");
-            let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
-                tool_call_id: skip_id.clone(),
-                tool_name: skip_name.clone(),
-                result: skip_result.text_content(),
-                is_error: skip_result.is_error,
-            });
+            send_event(
+                &self.event_tx,
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: skip_id.clone(),
+                    tool_name: skip_name.clone(),
+                    result: skip_result.text_content(),
+                    is_error: skip_result.is_error,
+                },
+            );
             tool_results.push(Message::tool_result(
                 skip_id,
                 skip_name,
@@ -414,7 +452,7 @@ impl Agent {
         let mut error: Option<String> = None;
 
         while let Some(event) = event_stream.next().await {
-            let _ = self.event_tx.send(event.clone());
+            send_event(&self.event_tx, event.clone());
 
             match event {
                 AgentEvent::MessageUpdate { message } => {
@@ -476,82 +514,349 @@ impl Agent {
         false
     }
 
-    /// Execute tool calls, checking the steering queue between each.
-    /// Returns (tool_result_messages, was_steered).
+    /// Resolve a path from tool arguments: expand `~/`, join relative paths with
+    /// the given CWD (or process CWD), and canonicalize if the file exists
+    /// (to normalize symlinks and `..` components).
+    fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
+        let path_str = args.get("path").and_then(|v| v.as_str())?;
+        let path = if let Some(rest) = path_str.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(path_str))
+        } else if path_str == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            let p = PathBuf::from(path_str);
+            if p.is_absolute() {
+                p
+            } else {
+                let base = cwd
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_default();
+                base.join(p)
+            }
+        };
+        // Canonicalize to normalize symlinks and .. components.
+        // Falls back to the un-canonicalized path for new files.
+        Some(std::fs::canonicalize(&path).unwrap_or(path))
+    }
+
+    /// Rebuild `read_files` from conversation messages (used after session restore).
+    fn rebuild_read_files(&mut self) {
+        self.read_files.clear();
+        let cwd = self.cwd.clone();
+        // Scan assistant messages for read tool calls that have successful results
+        for msg in &self.conversation.messages {
+            if let Message::Assistant { content, .. } = msg {
+                for c in content {
+                    if let Content::ToolCall { name, arguments, id } = c {
+                        if name == "read" {
+                            let has_success = self.conversation.messages.iter().any(|m| {
+                                matches!(m, Message::ToolResult { tool_call_id, is_error, .. }
+                                    if tool_call_id == id && !is_error)
+                            });
+                            if has_success {
+                                if let Some(path) = Self::resolve_tool_path(arguments, &cwd) {
+                                    self.read_files.insert(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute tool calls using concurrency-aware scheduling.
+    ///
+    /// Groups consecutive `Parallel` tools together and runs them concurrently
+    /// via JoinSet. Sequential tools run one at a time. Steering queue is checked
+    /// between groups. Read-before-write guard is applied uniformly.
     async fn execute_tool_calls(
-        &self,
+        &mut self,
         tool_calls: Vec<(String, String, serde_json::Value)>,
     ) -> (Vec<Message>, bool) {
+        use crate::tool::Concurrency;
+
+        // Build groups: consecutive Parallel tools form a group, Sequential is singleton.
+        let mut groups: Vec<Vec<usize>> = vec![];
+        let mut current_group: Vec<usize> = vec![];
+        let mut current_is_parallel = false;
+
+        for (idx, (_, name, _)) in tool_calls.iter().enumerate() {
+            let is_parallel = self
+                .tools
+                .iter()
+                .find(|t| t.name() == name.as_str())
+                .map(|t| t.concurrency() == Concurrency::Parallel)
+                .unwrap_or(false);
+
+            if idx == 0 {
+                current_is_parallel = is_parallel;
+                current_group.push(idx);
+            } else if is_parallel && current_is_parallel {
+                // Extend current parallel group
+                current_group.push(idx);
+            } else {
+                // Flush current group, start new one
+                groups.push(current_group);
+                current_group = vec![idx];
+                current_is_parallel = is_parallel;
+            }
+        }
+        if !current_group.is_empty() {
+            groups.push(current_group);
+        }
+
         let mut tool_results = vec![];
         let mut steered = false;
 
-        for idx in 0..tool_calls.len() {
-            let (ref id, ref name, ref args) = tool_calls[idx];
-
-            // Check steering queue before executing (except for the first tool)
-            if idx > 0 {
+        for group in &groups {
+            // Check steering queue before each group (except the first)
+            if !tool_results.is_empty() {
                 let steering_msgs =
                     self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
                 if !steering_msgs.is_empty() {
-                    self.skip_remaining_tools(&tool_calls[idx..], &mut tool_results);
+                    let first_in_group = *group.first().unwrap();
+                    let remaining: Vec<_> = tool_calls[first_in_group..]
+                        .iter()
+                        .map(|(id, name, args)| (id.clone(), name.clone(), args.clone()))
+                        .collect();
+                    self.skip_remaining_tools(&remaining, &mut tool_results);
                     tool_results.extend(steering_msgs);
                     steered = true;
                     break;
                 }
             }
 
-            let tool = self.tools.iter().find(|t| t.name() == name.as_str());
+            if group.len() == 1 {
+                // Sequential execution — single tool
+                let idx = group[0];
+                let (ref id, ref name, ref args) = tool_calls[idx];
 
-            let _ = self.event_tx.send(AgentEvent::ToolExecutionStart {
-                tool_call_id: id.clone(),
-                tool_name: name.clone(),
-                arguments: args.clone(),
-            });
+                let tool = self.tools.iter().find(|t| t.name() == name.as_str());
 
-            let result = if let Some(tool) = tool {
-                let validation_error = self
-                    .schema_cache
-                    .get(name.as_str())
-                    .and_then(|validator| validate_with_validator(args, validator));
+                send_event(
+                    &self.event_tx,
+                    AgentEvent::ToolExecutionStart {
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        arguments: args.clone(),
+                    },
+                );
 
-                if let Some(err) = validation_error {
-                    ToolResult::error(err)
+                // Read-before-write guard
+                let guard_error = if name == "write" || name == "edit" {
+                    if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
+                        if path.exists() && !self.read_files.contains(&path) {
+                            Some(format!(
+                                "You must read this file before {}ing it. Use the read tool first.",
+                                name
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 } else {
-                    let cancel = self.handle.cancel.lock().clone();
-                    let progress = crate::tool::ProgressSender::new(
-                        self.event_tx.clone(),
-                        id.clone(),
-                        name.clone(),
-                    );
-                    tool.execute_with_progress(id, args.clone(), cancel, progress)
-                        .await
+                    None
+                };
+
+                let result = if let Some(err) = guard_error {
+                    ToolResult::error(err)
+                } else if let Some(tool) = tool {
+                    let validation_error = self
+                        .schema_cache
+                        .get(name.as_str())
+                        .and_then(|validator| validate_with_validator(args, validator));
+
+                    if let Some(err) = validation_error {
+                        ToolResult::error(err)
+                    } else {
+                        let ctx = crate::tool::ExecutionContext {
+                            cwd: self.effective_cwd(),
+                            cancel: self.handle.cancel.lock().clone(),
+                            progress: crate::tool::ProgressSender::new(
+                                self.event_tx.clone(),
+                                id.clone(),
+                                name.clone(),
+                            ),
+                        };
+                        tool.execute(args.clone(), ctx).await
+                    }
+                } else {
+                    ToolResult::error(format!("Tool not found: {}", name))
+                };
+
+                // Track successful reads
+                if name == "read" && !result.is_error {
+                    if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
+                        self.read_files.insert(path);
+                    }
+                }
+
+                send_event(
+                    &self.event_tx,
+                    AgentEvent::ToolExecutionEnd {
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        result: result.text_content(),
+                        is_error: result.is_error,
+                    },
+                );
+
+                tool_results.push(Message::tool_result(id, name, result.content, result.is_error));
+
+                // Check steering after each sequential tool
+                let steering_msgs =
+                    self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
+                if !steering_msgs.is_empty() {
+                    let remaining: Vec<_> = tool_calls[idx + 1..]
+                        .iter()
+                        .map(|(id, name, args)| (id.clone(), name.clone(), args.clone()))
+                        .collect();
+                    self.skip_remaining_tools(&remaining, &mut tool_results);
+                    tool_results.extend(steering_msgs);
+                    steered = true;
+                    break;
                 }
             } else {
-                ToolResult::error(format!("Tool not found: {}", name))
-            };
+                // Parallel execution — run group concurrently via JoinSet
+                use tokio::task::JoinSet;
+                let mut join_set = JoinSet::new();
+                let cwd = self.effective_cwd();
 
-            let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
-                tool_call_id: id.clone(),
-                tool_name: name.clone(),
-                result: result.text_content(),
-                is_error: result.is_error,
-            });
+                // Pre-check read-before-write guard for each tool (must be sync)
+                let mut guard_errors: std::collections::HashMap<usize, String> =
+                    std::collections::HashMap::new();
+                for &idx in group {
+                    let (_, ref name, ref args) = tool_calls[idx];
+                    if name == "write" || name == "edit" {
+                        if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
+                            if path.exists() && !self.read_files.contains(&path) {
+                                guard_errors.insert(
+                                    idx,
+                                    format!(
+                                        "You must read this file before {}ing it. Use the read tool first.",
+                                        name
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
 
-            tool_results.push(Message::tool_result(
-                id,
-                name,
-                result.content,
-                result.is_error,
-            ));
+                for &idx in group {
+                    let (ref id, ref name, ref args) = tool_calls[idx];
+                    let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
+                    let event_tx = self.event_tx.clone();
+                    let cancel = self.handle.cancel.lock().clone();
+                    let id = id.clone();
+                    let name = name.clone();
+                    let args = args.clone();
+                    let validator = self.schema_cache.get(name.as_str()).cloned();
+                    let cwd = cwd.clone();
+                    let guard_err = guard_errors.remove(&idx);
 
-            // Check steering queue after each tool
-            let steering_msgs =
-                self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
-            if !steering_msgs.is_empty() {
-                self.skip_remaining_tools(&tool_calls[idx + 1..], &mut tool_results);
-                tool_results.extend(steering_msgs);
-                steered = true;
-                break;
+                    join_set.spawn(async move {
+                        send_event(
+                            &event_tx,
+                            AgentEvent::ToolExecutionStart {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                arguments: args.clone(),
+                            },
+                        );
+
+                        let result = if let Some(err) = guard_err {
+                            ToolResult::error(err)
+                        } else if let Some(tool) = tool {
+                            let validation_error =
+                                validator.and_then(|v| validate_with_validator(&args, &v));
+                            if let Some(err) = validation_error {
+                                ToolResult::error(err)
+                            } else {
+                                let ctx = crate::tool::ExecutionContext {
+                                    cwd,
+                                    cancel,
+                                    progress: crate::tool::ProgressSender::new(
+                                        event_tx.clone(),
+                                        id.clone(),
+                                        name.clone(),
+                                    ),
+                                };
+                                tool.execute(args, ctx).await
+                            }
+                        } else {
+                            ToolResult::error(format!("Tool not found: {}", name))
+                        };
+
+                        send_event(
+                            &event_tx,
+                            AgentEvent::ToolExecutionEnd {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                result: result.text_content(),
+                                is_error: result.is_error,
+                            },
+                        );
+
+                        (idx, id, name, result)
+                    });
+                }
+
+                // Collect in original order
+                let mut results_map = std::collections::HashMap::new();
+                while let Some(join_result) = join_set.join_next().await {
+                    match join_result {
+                        Ok((idx, id, name, result)) => {
+                            results_map.insert(idx, (id, name, result));
+                        }
+                        Err(e) => {
+                            tracing::error!("Parallel tool task panicked: {}", e);
+                        }
+                    }
+                }
+
+                for &idx in group {
+                    let (ref orig_id, ref orig_name, ref orig_args) = tool_calls[idx];
+                    let (_, _, result) = results_map.remove(&idx).unwrap_or_else(|| {
+                        (
+                            orig_id.clone(),
+                            orig_name.clone(),
+                            ToolResult::error("Task failed (panicked or cancelled)"),
+                        )
+                    });
+                    // Track successful reads from parallel execution
+                    if orig_name == "read" && !result.is_error {
+                        if let Some(path) = Self::resolve_tool_path(orig_args, &self.cwd) {
+                            self.read_files.insert(path);
+                        }
+                    }
+                    tool_results.push(Message::tool_result(
+                        orig_id,
+                        orig_name,
+                        result.content,
+                        result.is_error,
+                    ));
+                }
+
+                // Check steering after parallel group
+                let steering_msgs =
+                    self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
+                if !steering_msgs.is_empty() {
+                    let last_idx = *group.last().unwrap();
+                    let remaining: Vec<_> = tool_calls[last_idx + 1..]
+                        .iter()
+                        .map(|(id, name, args)| (id.clone(), name.clone(), args.clone()))
+                        .collect();
+                    self.skip_remaining_tools(&remaining, &mut tool_results);
+                    tool_results.extend(steering_msgs);
+                    steered = true;
+                    break;
+                }
             }
         }
 
@@ -600,7 +905,7 @@ impl Agent {
         let run_config = self.build_run_config();
         self.conversation.is_streaming = true;
         self.conversation.error = None;
-        let _ = self.event_tx.send(AgentEvent::AgentStart);
+        send_event(&self.event_tx, AgentEvent::AgentStart);
 
         let mut turn = 0u32;
         let mut messages_to_add: Vec<Message> = initial_messages;
@@ -609,10 +914,52 @@ impl Agent {
         let result = loop {
             turn += 1;
 
-            // Enforce turn limit if set (used by subagents)
+            // Check cancellation before starting a new turn
+            if self.handle.cancel.lock().is_cancelled() {
+                turn -= 1;
+                break Ok(());
+            }
+
+            // Enforce turn limit if set (used by subagents).
+            // When hitting the limit with pending tool results, run one final
+            // turn with tools disabled so the model produces a text summary
+            // rather than leaving the conversation mid-tool-call.
             if let Some(max) = self.config.max_turns {
                 if turn > max {
-                    tracing::info!("Agent reached max turns ({}), stopping", max);
+                    let last_has_tool_calls = self
+                        .conversation
+                        .messages
+                        .last()
+                        .is_some_and(|m| !m.tool_calls().is_empty());
+                    if last_has_tool_calls && !messages_to_add.is_empty() {
+                        tracing::info!(
+                            "Agent reached max turns ({}), running final summary turn",
+                            max
+                        );
+                        messages_to_add.push(Message::user(format!(
+                            "[System: You have reached the maximum of {} turns. \
+                             Summarize your findings so far. Do not call any tools.]",
+                            max
+                        )));
+                        let context_messages = self.build_context(&messages_to_add);
+                        let mut final_config = run_config.clone();
+                        final_config.tools.clear();
+                        let cancel_token = self.handle.cancel.lock().clone();
+                        if let Ok(mut stream) = self
+                            .transport
+                            .run(context_messages, &final_config, cancel_token)
+                            .await
+                        {
+                            let (msg, usage, _) = self.process_stream(&mut stream).await;
+                            self.accumulate_usage(&usage);
+                            self.flush_pending(&mut messages_to_add);
+                            if let Some(msg) = msg {
+                                self.conversation.messages.push(msg);
+                            }
+                        }
+                    } else {
+                        tracing::info!("Agent reached max turns ({}), stopping", max);
+                    }
                     turn -= 1; // correct the count — this turn didn't execute
                     break Ok(());
                 }
@@ -645,9 +992,12 @@ impl Agent {
                         continue;
                     }
                     self.conversation.error = Some(error_msg.clone());
-                    let _ = self.event_tx.send(AgentEvent::Error {
-                        message: error_msg.clone(),
-                    });
+                    send_event(
+                        &self.event_tx,
+                        AgentEvent::Error {
+                            message: error_msg.clone(),
+                        },
+                    );
                     break Err(crate::error::Error::Other(error_msg));
                 }
             };
@@ -730,10 +1080,13 @@ impl Agent {
             }
         }
 
-        let _ = self.event_tx.send(AgentEvent::AgentEnd {
-            total_turns: turn,
-            total_usage: self.conversation.total_usage.clone(),
-        });
+        send_event(
+            &self.event_tx,
+            AgentEvent::AgentEnd {
+                total_turns: turn,
+                total_usage: self.conversation.total_usage.clone(),
+            },
+        );
 
         self.handle.is_running.store(false, Ordering::Release);
         self.handle.idle_notify.notify_waiters();
@@ -742,14 +1095,22 @@ impl Agent {
     }
 }
 
+/// Send an agent event, logging at debug level if all receivers have been dropped or lagged.
+pub(crate) fn send_event(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
+    if tx.send(event).is_err() {
+        tracing::debug!("Event dropped: no active receivers or buffer full");
+    }
+}
+
 /// Check if a message has meaningful content worth preserving.
 /// Returns true if the message contains non-whitespace text, thinking blocks,
 /// or tool calls with a name.
 fn has_meaningful_content(message: &Message) -> bool {
     let content = match message {
-        Message::Assistant { content, .. } => content,
-        Message::User { content, .. } => content,
-        Message::ToolResult { content, .. } => content,
+        Message::Assistant { content, .. }
+        | Message::User { content, .. }
+        | Message::ToolResult { content, .. }
+        | Message::SystemInjection { content, .. } => content,
     };
 
     content.iter().any(|c| match c {
@@ -1150,9 +1511,8 @@ mod tests {
         }
         async fn execute(
             &self,
-            _tool_call_id: &str,
             _arguments: serde_json::Value,
-            _cancel: CancellationToken,
+            _ctx: crate::tool::ExecutionContext,
         ) -> ToolResult {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

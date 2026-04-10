@@ -10,18 +10,16 @@ pub mod lsp;
 mod read;
 mod write;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Resolve a path against an optional CWD override.
+/// Resolve a path against a CWD.
 /// Absolute paths are returned as-is. Relative paths are joined with `cwd`.
-pub(crate) fn resolve_path(path_str: &str, cwd: &Option<PathBuf>) -> PathBuf {
+pub(crate) fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
     let path = PathBuf::from(path_str);
     if path.is_absolute() {
         path
-    } else if let Some(base) = cwd {
-        base.join(path)
     } else {
-        path
+        cwd.join(path)
     }
 }
 

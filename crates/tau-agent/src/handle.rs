@@ -72,6 +72,10 @@ impl AgentHandle {
     }
 
     /// Wait until the agent loop becomes idle (finishes running).
+    ///
+    /// The ordering here is intentional and not a TOCTOU race: `notified()` registers
+    /// the waiter *before* checking `is_running`, so if the agent finishes between
+    /// registration and the check, the notification is already captured by the future.
     pub async fn wait_for_idle(&self) {
         let notified = self.idle_notify.notified();
         if !self.is_running.load(Ordering::Acquire) {

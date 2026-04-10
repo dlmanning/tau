@@ -71,9 +71,10 @@ struct CutPointResult {
 /// Estimate token count for a single message (chars/4 heuristic)
 pub fn estimate_tokens(message: &Message) -> u32 {
     let char_count: usize = match message {
-        Message::User { content, .. } => content_char_count(content),
-        Message::Assistant { content, .. } => content_char_count(content),
-        Message::ToolResult { content, .. } => content_char_count(content),
+        Message::User { content, .. }
+        | Message::Assistant { content, .. }
+        | Message::ToolResult { content, .. }
+        | Message::SystemInjection { content, .. } => content_char_count(content),
     };
     (char_count / 4) as u32
 }
@@ -182,6 +183,14 @@ fn serialize_messages_for_summary(messages: &[Message]) -> String {
                     out.push_str(&text);
                 }
                 out.push('\n');
+            }
+            Message::SystemInjection { content, .. } => {
+                let text = content_to_text(content);
+                if !text.is_empty() {
+                    out.push_str("[System]: ");
+                    out.push_str(&text);
+                    out.push('\n');
+                }
             }
         }
     }
@@ -320,7 +329,7 @@ fn find_cut_point(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPo
     let mut first_kept = cut_index;
     while first_kept < messages.len() {
         match &messages[first_kept] {
-            Message::User { .. } => break,
+            Message::User { .. } | Message::SystemInjection { .. } => break,
             Message::Assistant { .. } => break,
             Message::ToolResult { .. } => {
                 // Can't start here — tool results must follow their assistant message

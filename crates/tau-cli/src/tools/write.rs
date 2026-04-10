@@ -4,21 +4,15 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio::fs;
-use tokio_util::sync::CancellationToken;
 
 /// Tool for writing file contents
-pub struct WriteTool {
-    cwd: Option<PathBuf>,
-}
+pub struct WriteTool;
 
 impl WriteTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: Some(cwd.into()) }
+        Self
     }
 }
 
@@ -57,9 +51,8 @@ impl Tool for WriteTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -81,11 +74,11 @@ impl Tool for WriteTool {
         } else if path_str == "~" {
             return ToolResult::error("Cannot write to home directory itself");
         } else {
-            super::resolve_path(path_str, &self.cwd)
+            super::resolve_path(path_str, &ctx.cwd)
         };
 
         // Check for cancellation
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 

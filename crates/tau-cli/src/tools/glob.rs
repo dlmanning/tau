@@ -5,20 +5,14 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use glob::glob;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
-use tokio_util::sync::CancellationToken;
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 /// Tool for finding files matching a glob pattern
-pub struct GlobTool {
-    cwd: Option<PathBuf>,
-}
+pub struct GlobTool;
 
 impl GlobTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: Some(cwd.into()) }
+        Self
     }
 }
 
@@ -61,9 +55,8 @@ impl Tool for GlobTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let pattern = match arguments.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -74,7 +67,8 @@ impl Tool for GlobTool {
             .get("cwd")
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
-            .or_else(|| self.cwd.clone());
+            .unwrap_or_else(|| ctx.cwd.clone());
+        let cwd = Some(cwd);
 
         let limit = arguments
             .get("limit")
@@ -95,7 +89,7 @@ impl Tool for GlobTool {
 
         let mut results = Vec::new();
         for entry in entries {
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() {
                 return ToolResult::error("Glob cancelled");
             }
 

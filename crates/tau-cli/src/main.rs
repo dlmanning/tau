@@ -293,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
         reasoning,
         thinking_adaptive,
         max_tokens: None,
-        max_turns: None,
+        max_turns: Some(200),
         compaction,
         steering_mode: tau_agent::DequeueMode::All,
         follow_up_mode: tau_agent::DequeueMode::All,
@@ -321,16 +321,25 @@ async fn main() -> anyhow::Result<()> {
     // Add agent tool (subagent spawning)
     let parent_tools: Vec<Arc<dyn tau_agent::tool::Tool>> = agent.tools().to_vec();
     let agent_handle = agent.handle();
-    let agent_registry = Arc::new(tau_agent::subagent::AgentRegistry::new());
+    let manager = Arc::new(tau_agent::agent_manager::AgentManager::new(
+        agent.event_sender(),
+        parent_tools,
+        agent.config().clone(),
+        transport.clone(),
+        20,
+    ));
+
+    // Create factory that makes AgentTools referencing this manager
+    let mgr_for_factory = manager.clone();
+    let handle_for_factory = agent_handle.clone();
+    manager.set_agent_tool_factory(Arc::new(move |depth| {
+        let tool = tools::AgentTool::new(mgr_for_factory.clone(), depth)
+            .with_handle(handle_for_factory.clone());
+        Arc::new(tool)
+    }));
+
     agent.add_tool(Arc::new(
-        tools::AgentTool::new(
-            transport.clone(),
-            parent_tools,
-            agent.config().clone(),
-            0,
-            agent_registry,
-        )
-        .with_handle(agent_handle),
+        tools::AgentTool::new(manager, 0).with_handle(agent_handle),
     ));
 
     // Build dynamic system prompt based on registered tools
@@ -561,6 +570,7 @@ async fn run_interactive(
                                     tau_ai::Message::User { .. } => "user",
                                     tau_ai::Message::Assistant { .. } => "assistant",
                                     tau_ai::Message::ToolResult { .. } => "tool",
+                                    tau_ai::Message::SystemInjection { .. } => "system",
                                 };
                                 let text = msg.text();
                                 let preview: String = text.chars().take(60).collect();

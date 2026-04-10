@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Error, Result},
-    stream::{MessageEvent, MessageEventStream},
-    types::{AssistantMetadata, Content, Context, Message, Model, StopReason, Usage},
+    messages::ensure_tool_result_pairing,
+    stream::{MessageEvent, MessageEventStream, StreamAccumulator},
+    types::{Content, Context, Message, Model, StopReason},
 };
 
 /// OpenAI API client
@@ -103,8 +104,12 @@ impl OpenAIProvider {
             });
         }
 
+        // Repair tool_use/tool_result pairing before conversion
+        let mut context_messages = context.messages.clone();
+        ensure_tool_result_pairing(&mut context_messages);
+
         // Convert messages
-        for msg in &context.messages {
+        for msg in &context_messages {
             messages.extend(convert_message(msg));
         }
 
@@ -255,6 +260,27 @@ fn convert_message(msg: &Message) -> Vec<OpenAIMessage> {
                 tool_call_id: Some(tool_call_id.clone()),
             }]
         }
+        Message::SystemInjection { content, source } => {
+            let prefix = match source {
+                crate::types::InjectionSource::SubagentCompleted { description, .. } => {
+                    format!("[Subagent \"{}\" completed]\n", description)
+                }
+                crate::types::InjectionSource::SubagentFailed { description, .. } => {
+                    format!("[Subagent \"{}\" failed]\n", description)
+                }
+            };
+            let text: String = content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(format!("{}{}", prefix, text))),
+                tool_calls: None,
+                tool_call_id: None,
+            }]
+        }
     }
 }
 
@@ -263,22 +289,12 @@ fn create_stream(
     model: Model,
 ) -> impl futures::Stream<Item = MessageEvent> {
     stream! {
-        let mut accumulated_text = String::new();
-        let mut tool_calls: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
-        let mut current_tool_index: Option<usize> = None;
-        let mut finish_reason: Option<String> = None;
-        let mut usage = Usage::default();
-        let mut text_started = false;
-
-        // Emit start event
-        let start_message = Message::Assistant {
-            content: vec![],
-            metadata: AssistantMetadata {
-                model: Some(model.id.clone()),
-                ..Default::default()
-            },
-        };
-        yield MessageEvent::Start { message: start_message };
+        let (mut acc, start) = StreamAccumulator::new(
+            crate::Api::OpenAICompletions,
+            crate::Provider::OpenAI,
+            model.id.clone(),
+        );
+        yield start;
 
         while let Some(event) = event_source.next().await {
             match event {
@@ -288,152 +304,58 @@ fn create_stream(
                         break;
                     }
 
-                    let chunk: std::result::Result<StreamChunk, _> = serde_json::from_str(&msg.data);
-                    match chunk {
+                    match serde_json::from_str::<StreamChunk>(&msg.data) {
                         Ok(chunk) => {
                             for choice in &chunk.choices {
-                                // Handle text delta
                                 if let Some(ref content) = choice.delta.content {
-                                    if !text_started {
-                                        text_started = true;
-                                        yield MessageEvent::TextStart { content_index: 0 };
-                                    }
-                                    accumulated_text.push_str(content);
-                                    yield MessageEvent::TextDelta {
-                                        content_index: 0,
-                                        delta: content.clone(),
-                                    };
+                                    for ev in acc.text_delta(0, content) { yield ev; }
                                 }
 
-                                // Handle tool calls
                                 if let Some(ref tcs) = choice.delta.tool_calls {
                                     for tc in tcs {
                                         let idx = tc.index as usize;
-
-                                        // Ensure we have space for this tool call
-                                        while tool_calls.len() <= idx {
-                                            tool_calls.push((String::new(), String::new(), String::new()));
-                                        }
-
-                                        // Update tool call data
-                                        if let Some(ref id) = tc.id {
-                                            tool_calls[idx].0 = id.clone();
-                                        }
                                         if let Some(ref function) = tc.function {
                                             if let Some(ref name) = function.name {
-                                                tool_calls[idx].1 = name.clone();
+                                                let id = tc.id.as_deref().unwrap_or("");
+                                                for ev in acc.tool_call_start(idx, id, name) { yield ev; }
                                             }
                                             if let Some(ref args) = function.arguments {
-                                                tool_calls[idx].2.push_str(args);
-                                            }
-                                        }
-
-                                        // Track current tool for delta events
-                                        if current_tool_index != Some(idx) {
-                                            current_tool_index = Some(idx);
-                                        }
-
-                                        // Emit tool call start when we have the name
-                                        if let Some(ref function) = tc.function {
-                                            if function.name.is_some() && !tool_calls[idx].1.is_empty() {
-                                                yield MessageEvent::ToolCallStart {
-                                                    content_index: idx,
-                                                    id: tool_calls[idx].0.clone(),
-                                                    name: tool_calls[idx].1.clone(),
-                                                };
-                                            }
-                                            // Emit tool call delta for arguments
-                                            if let Some(ref args) = function.arguments {
-                                                yield MessageEvent::ToolCallDelta {
-                                                    content_index: idx,
-                                                    delta: args.clone(),
-                                                };
+                                                for ev in acc.tool_call_delta(idx, args) { yield ev; }
                                             }
                                         }
                                     }
                                 }
 
-                                // Capture finish reason
                                 if let Some(ref reason) = choice.finish_reason {
-                                    finish_reason = Some(reason.clone());
+                                    acc.set_stop_reason(match reason.as_str() {
+                                        "stop" => StopReason::Stop,
+                                        "length" => StopReason::Length,
+                                        "tool_calls" => StopReason::ToolUse,
+                                        _ => StopReason::Stop,
+                                    });
                                 }
                             }
 
-                            // Handle usage in final chunk
                             if let Some(ref stream_usage) = chunk.usage {
-                                usage.input = stream_usage.prompt_tokens;
-                                usage.output = stream_usage.completion_tokens;
+                                let u = acc.usage_mut();
+                                u.input = stream_usage.prompt_tokens;
+                                u.output = stream_usage.completion_tokens;
                             }
                         }
                         Err(e) => {
-                            yield MessageEvent::Error {
-                                message: format!("Failed to parse chunk: {}", e),
-                            };
+                            yield StreamAccumulator::error_event(format!("Failed to parse chunk: {}", e));
                             return;
                         }
                     }
                 }
                 Err(e) => {
-                    yield MessageEvent::Error {
-                        message: format!("SSE error: {}", e),
-                    };
+                    yield StreamAccumulator::error_event(format!("SSE error: {}", e));
                     return;
                 }
             }
         }
 
-        // Build final content
-        let mut content = Vec::new();
-
-        if !accumulated_text.is_empty() {
-            content.push(Content::Text {
-                text: accumulated_text.clone(),
-            });
-        }
-
-        for (id, name, args) in tool_calls {
-            if !id.is_empty() && !name.is_empty() {
-                let arguments = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
-                content.push(Content::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                });
-            }
-        }
-
-        let stop_reason = match finish_reason.as_deref() {
-            Some("stop") => Some(StopReason::Stop),
-            Some("length") => Some(StopReason::Length),
-            Some("tool_calls") => Some(StopReason::ToolUse),
-            _ => None,
-        };
-
-        let final_message = Message::Assistant {
-            content,
-            metadata: AssistantMetadata {
-                api: Some(crate::Api::OpenAICompletions),
-                provider: Some(crate::Provider::OpenAI),
-                model: Some(model.id.clone()),
-                stop_reason,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                ..Default::default()
-            },
-        };
-
-        // Emit TextEnd if we started text
-        if text_started {
-            yield MessageEvent::TextEnd {
-                content_index: 0,
-                text: accumulated_text.clone(),
-            };
-        }
-
-        yield MessageEvent::Done {
-            message: final_message,
-            stop_reason: stop_reason.unwrap_or(StopReason::Stop),
-            usage,
-        };
+        for ev in acc.finish() { yield ev; }
     }
 }
 

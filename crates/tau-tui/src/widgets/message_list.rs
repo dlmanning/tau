@@ -14,7 +14,7 @@ use crate::{theme::Theme, widgets::markdown::render_markdown};
 /// A single message in the chat
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
-    /// Role: "user", "assistant", "tool", "system"
+    /// Role: "user", "assistant", "tool", "system", "agent"
     pub role: String,
     /// Message content
     pub content: String,
@@ -22,6 +22,8 @@ pub struct ChatMessage {
     pub is_error: bool,
     /// Whether this is currently streaming
     pub is_streaming: bool,
+    /// Optional ID for updating specific messages (e.g. active subagents)
+    pub id: Option<String>,
 }
 
 impl ChatMessage {
@@ -32,6 +34,7 @@ impl ChatMessage {
             content: content.into(),
             is_error: false,
             is_streaming: false,
+            id: None,
         }
     }
 
@@ -42,6 +45,7 @@ impl ChatMessage {
             content: content.into(),
             is_error: false,
             is_streaming: false,
+            id: None,
         }
     }
 
@@ -52,6 +56,7 @@ impl ChatMessage {
             content: content.into(),
             is_error: false,
             is_streaming: true,
+            id: None,
         }
     }
 
@@ -62,6 +67,7 @@ impl ChatMessage {
             content: content.into(),
             is_error,
             is_streaming: false,
+            id: None,
         }
     }
 
@@ -72,6 +78,7 @@ impl ChatMessage {
             content: content.into(),
             is_error: false,
             is_streaming: false,
+            id: None,
         }
     }
 }
@@ -110,6 +117,15 @@ impl<'a> MessageList<'a> {
                 self.theme.success_style().add_modifier(Modifier::BOLD),
                 "◀ ",
             ),
+            r if r.starts_with("agent:") => {
+                let desc = &r[6..];
+                let style = if msg.is_error {
+                    self.theme.error_style()
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                (desc, style, "◇ ")
+            }
             "system" => ("System", self.theme.dim_style(), "● "),
             r if r.starts_with("tool:") => {
                 let tool_name = &r[5..];
@@ -163,6 +179,24 @@ impl<'a> MessageList<'a> {
                     lines.push(Line::from(indented_spans));
                 }
             }
+        } else if msg.role.starts_with("agent:") && msg.is_streaming {
+            // Active agent — show content with animated spinner
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let frame_idx = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                / 80) as usize
+                % frames.len();
+            let display = if msg.content.is_empty() {
+                format!("  {} working...", frames[frame_idx])
+            } else {
+                format!("  {} {}", frames[frame_idx], msg.content)
+            };
+            lines.push(Line::from(Span::styled(
+                display,
+                Style::default().fg(Color::Cyan),
+            )));
         } else {
             // Plain text with wrapping for other messages
             let content_style = if msg.is_error {
@@ -221,9 +255,8 @@ impl Widget for MessageList<'_> {
 }
 
 /// Calculate total height of messages
-pub fn calculate_message_height(messages: &[ChatMessage], width: usize) -> usize {
+pub fn calculate_message_height(messages: &[ChatMessage], width: usize, theme: &Theme) -> usize {
     let mut total = 0;
-    let theme = Theme::dark(); // Use default theme for calculation
     let content_width = width.saturating_sub(2);
 
     for msg in messages {

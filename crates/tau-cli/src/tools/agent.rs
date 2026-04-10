@@ -4,70 +4,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::agent::AgentConfig;
 use tau_agent::handle::AgentHandle;
-use tau_agent::subagent::{
-    AgentRegistry, AgentToolFactory, AgentType, ProgressCallback, SubagentConfig, run_subagent,
-};
-use tau_agent::tool::{BoxedTool, ProgressSender, Tool, ToolResult};
-use tau_agent::transport::Transport;
-use tokio_util::sync::CancellationToken;
-
-use super::{
-    bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool,
-    list::ListTool, read::ReadTool, write::WriteTool,
-};
+use tau_agent::agent_manager::{AgentManager, AgentType, SpawnRequest};
+use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 
 /// Tool for spawning independent subagents.
 pub struct AgentTool {
-    transport: Arc<dyn Transport>,
-    tools: Vec<BoxedTool>,
-    parent_config: AgentConfig,
+    manager: Arc<AgentManager>,
     depth: u32,
     agent_handle: Option<AgentHandle>,
-    registry: Arc<AgentRegistry>,
 }
 
 impl AgentTool {
-    pub fn new(
-        transport: Arc<dyn Transport>,
-        tools: Vec<BoxedTool>,
-        parent_config: AgentConfig,
-        depth: u32,
-        registry: Arc<AgentRegistry>,
-    ) -> Self {
+    pub fn new(manager: Arc<AgentManager>, depth: u32) -> Self {
         Self {
-            transport,
-            tools,
-            parent_config,
+            manager,
             depth,
             agent_handle: None,
-            registry,
         }
     }
 
     pub fn with_handle(mut self, handle: AgentHandle) -> Self {
         self.agent_handle = Some(handle);
         self
-    }
-
-    fn make_factory(&self) -> AgentToolFactory {
-        let transport = self.transport.clone();
-        let tools = self.tools.clone();
-        let config = self.parent_config.clone();
-        let handle = self.agent_handle.clone();
-        let registry = self.registry.clone();
-        Arc::new(move |depth| {
-            let mut tool = AgentTool::new(
-                transport.clone(),
-                tools.clone(),
-                config.clone(),
-                depth,
-                registry.clone(),
-            );
-            tool.agent_handle = handle.clone();
-            Arc::new(tool)
-        })
     }
 }
 
@@ -82,6 +41,10 @@ impl Tool for AgentTool {
          previously spawned agent. The subagent makes its own API calls and has its \
          own tool set. Use for parallel work, codebase exploration, or isolating \
          changes in a git worktree."
+    }
+
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Parallel
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -123,29 +86,11 @@ impl Tool for AgentTool {
                     "description": "Run in background and return immediately"
                 }
             },
-            "required": ["prompt"]
+            "required": ["description", "prompt"]
         })
     }
 
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        arguments: serde_json::Value,
-        cancel: CancellationToken,
-    ) -> ToolResult {
-        let (tx, _rx) = tokio::sync::broadcast::channel(1);
-        let progress = ProgressSender::new(tx, tool_call_id, self.name());
-        self.execute_with_progress(tool_call_id, arguments, cancel, progress)
-            .await
-    }
-
-    async fn execute_with_progress(
-        &self,
-        _tool_call_id: &str,
-        arguments: serde_json::Value,
-        cancel: CancellationToken,
-        progress: ProgressSender,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
         let prompt = match arguments.get("prompt").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => return ToolResult::error("Missing 'prompt'"),
@@ -153,16 +98,12 @@ impl Tool for AgentTool {
 
         // Resume existing agent
         if let Some(agent_id) = arguments.get("to").and_then(|v| v.as_str()) {
-            let progress_cb: ProgressCallback = Arc::new(move |msg: &str| {
-                progress.send(msg);
-            });
-            return match self.registry.resume(agent_id, &prompt, Some(&progress_cb)).await {
+            return match self.manager.send(agent_id, &prompt, ctx.cancel).await {
                 Ok(result) => ToolResult::text(format_result(&result)),
                 Err(e) => ToolResult::error(format!("Resume failed: {}", e)),
             };
         }
 
-        // New agent spawn
         let description = arguments
             .get("description")
             .and_then(|v| v.as_str())
@@ -178,102 +119,24 @@ impl Tool for AgentTool {
         let model = arguments
             .get("model")
             .and_then(|v| v.as_str())
-            .and_then(|id| tau_ai::models::get_model_by_id(id));
+            .and_then(tau_ai::models::get_model_by_id);
 
         let cwd = arguments
             .get("cwd")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(str::to_string);
 
         let isolation = arguments
             .get("isolation")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(str::to_string);
 
         let run_in_background = arguments
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Factory for creating CWD-aware tools in worktree/cwd-override subagents
-        let cwd_factory: Option<Arc<dyn Fn(&str) -> Vec<BoxedTool> + Send + Sync>> =
-            Some(Arc::new(|cwd: &str| -> Vec<BoxedTool> {
-                vec![
-                    Arc::new(BashTool::with_cwd(cwd)),
-                    Arc::new(ReadTool::with_cwd(cwd)),
-                    Arc::new(WriteTool::with_cwd(cwd)),
-                    Arc::new(EditTool::with_cwd(cwd)),
-                    Arc::new(GlobTool::with_cwd(cwd)),
-                    Arc::new(GrepTool::with_cwd(cwd)),
-                    Arc::new(ListTool::with_cwd(cwd)),
-                ]
-            }));
-
-        if run_in_background {
-            let bg_cancel = CancellationToken::new();
-            let config = SubagentConfig {
-                agent_type,
-                prompt,
-                description: description.clone(),
-                model,
-                cwd,
-                isolation,
-                depth: self.depth,
-                transport: self.transport.clone(),
-                all_tools: self.tools.clone(),
-                parent_config: self.parent_config.clone(),
-                agent_tool_factory: Some(self.make_factory()),
-                cancel: bg_cancel.clone(),
-                on_progress: None,
-                cwd_tool_factory: cwd_factory.clone(),
-            };
-
-            let handle = self.agent_handle.clone();
-            let desc = description.clone();
-            let registry = self.registry.clone();
-            let parent_cancel = cancel.clone();
-
-            tokio::spawn(async move {
-                let result = tokio::select! {
-                    r = run_subagent(config) => r,
-                    _ = parent_cancel.cancelled() => {
-                        Err(tau_agent::error::Error::Other("Cancelled by parent".into()))
-                    }
-                };
-
-                match result {
-                    Ok((subresult, agent)) => {
-                        if let Some(handle) = handle {
-                            handle.follow_up(tau_ai::Message::user(format!(
-                                "<agent-completed description=\"{}\">\n{}\n\
-                                 [Agent {} | {} in + {} out tokens | {} tool calls | {}ms]\n\
-                                 </agent-completed>",
-                                desc, subresult.text, subresult.agent_id,
-                                subresult.input_tokens, subresult.output_tokens,
-                                subresult.tool_use_count, subresult.duration_ms,
-                            )));
-                        }
-                        registry.store(subresult.agent_id, agent, desc).await;
-                    }
-                    Err(e) => {
-                        if let Some(handle) = handle {
-                            handle.follow_up(tau_ai::Message::user(format!(
-                                "<agent-failed description=\"{}\">\nError: {}\n</agent-failed>",
-                                desc, e,
-                            )));
-                        }
-                    }
-                }
-            });
-
-            return ToolResult::text(format!("Agent launched in background: {}", description));
-        }
-
-        // Foreground execution
-        let progress_cb: ProgressCallback = Arc::new(move |msg: &str| {
-            progress.send(msg);
-        });
-        let config = SubagentConfig {
+        let request = SpawnRequest {
             agent_type,
             prompt,
             description: description.clone(),
@@ -281,35 +144,36 @@ impl Tool for AgentTool {
             cwd,
             isolation,
             depth: self.depth,
-            transport: self.transport.clone(),
-            all_tools: self.tools.clone(),
-            parent_config: self.parent_config.clone(),
-            agent_tool_factory: Some(self.make_factory()),
-            cancel,
-            on_progress: Some(progress_cb),
-            cwd_tool_factory: cwd_factory,
         };
 
-        match run_subagent(config).await {
-            Ok((result, agent)) => {
-                // Store for potential resumption
-                let agent_id = result.agent_id.clone();
-                let desc = description.clone();
-                self.registry.store(agent_id, agent, desc).await;
-
-                ToolResult::text(format_result(&result))
+        if run_in_background {
+            if let Some(ref handle) = self.agent_handle {
+                let agent_id = self
+                    .manager
+                    .spawn_background(request, handle.clone(), ctx.cancel)
+                    .await;
+                ToolResult::text(format!(
+                    "Agent launched in background ({}): {}",
+                    agent_id, description
+                ))
+            } else {
+                ToolResult::error("Cannot run background agent: no parent handle")
             }
-            Err(e) => ToolResult::error(format!("Agent failed: {}", e)),
+        } else {
+            match self.manager.spawn(request, ctx.cancel).await {
+                Ok(result) => ToolResult::text(format_result(&result)),
+                Err(e) => ToolResult::error(format!("Agent failed: {}", e)),
+            }
         }
     }
 }
 
-fn format_result(result: &tau_agent::subagent::SubagentResult) -> String {
+fn format_result(result: &tau_agent::agent_manager::SubagentResult) -> String {
     let mut output = result.text.clone();
     let mut meta = format!(
         "\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms",
-        result.agent_id, result.input_tokens, result.output_tokens,
-        result.tool_use_count, result.duration_ms,
+        result.agent_id, result.input_tokens, result.output_tokens, result.tool_use_count,
+        result.duration_ms,
     );
     if let Some(ref p) = result.worktree_path {
         meta.push_str(&format!(" | worktree: {}", p));

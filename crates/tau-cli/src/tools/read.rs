@@ -4,24 +4,18 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio::fs;
-use tokio_util::sync::CancellationToken;
 
 const MAX_LINES: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 
 /// Tool for reading file contents
-pub struct ReadTool {
-    cwd: Option<PathBuf>,
-}
+pub struct ReadTool;
 
 impl ReadTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: Some(cwd.into()) }
+        Self
     }
 }
 
@@ -38,7 +32,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. Supports text files. For large files, use offset and limit parameters."
+        "Read the contents of a file. Output uses cat -n format with line numbers. For large files, use offset and limit parameters."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -64,9 +58,8 @@ impl Tool for ReadTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -83,11 +76,11 @@ impl Tool for ReadTool {
         } else if path_str == "~" {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
         } else {
-            super::resolve_path(path_str, &self.cwd)
+            super::resolve_path(path_str, &ctx.cwd)
         };
 
         // Check for cancellation
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
@@ -125,17 +118,21 @@ impl Tool for ReadTool {
         let end = (offset + limit).min(total_lines);
         let selected_lines = &lines[offset..end];
 
-        // Truncate long lines
+        // Format with line numbers (cat -n style) and truncate long lines
         let mut had_truncated = false;
+        let num_width = total_lines.max(1).to_string().len().max(6);
         let formatted: Vec<String> = selected_lines
             .iter()
-            .map(|line| {
-                if line.len() > MAX_LINE_LENGTH {
+            .enumerate()
+            .map(|(i, line)| {
+                let line_num = offset + i + 1; // 1-indexed
+                let content = if line.len() > MAX_LINE_LENGTH {
                     had_truncated = true;
-                    line[..MAX_LINE_LENGTH].to_string()
+                    &line[..MAX_LINE_LENGTH]
                 } else {
-                    line.to_string()
-                }
+                    line
+                };
+                format!("{:>width$}\t{}", line_num, content, width = num_width)
             })
             .collect();
 

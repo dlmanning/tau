@@ -8,8 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
-use tokio_util::sync::CancellationToken;
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 /// Maximum matches to return by default
 const DEFAULT_LIMIT: usize = 50;
@@ -17,16 +16,11 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LINE_LENGTH: usize = 500;
 
 /// Tool for searching file contents with regex
-pub struct GrepTool {
-    cwd: Option<PathBuf>,
-}
+pub struct GrepTool;
 
 impl GrepTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: Some(cwd.into()) }
+        Self
     }
 }
 
@@ -81,9 +75,8 @@ impl Tool for GrepTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let pattern_str = match arguments.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -109,10 +102,8 @@ impl Tool for GrepTool {
         let path = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|p| super::resolve_path(p, &self.cwd))
-            .unwrap_or_else(|| {
-                self.cwd.clone().unwrap_or_else(|| PathBuf::from("."))
-            });
+            .map(|p| super::resolve_path(p, &ctx.cwd))
+            .unwrap_or_else(|| ctx.cwd.clone());
 
         let glob_pattern = arguments.get("glob").and_then(|v| v.as_str());
 
@@ -133,7 +124,7 @@ impl Tool for GrepTool {
         let mut total_matches = 0;
 
         for file_path in files {
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() {
                 return ToolResult::error("Search cancelled");
             }
 

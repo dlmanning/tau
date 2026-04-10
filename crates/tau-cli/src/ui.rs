@@ -55,6 +55,8 @@ pub enum UiMessage {
 pub struct TuiState {
     /// Chat messages
     messages: Vec<ChatMessage>,
+    /// Set of active subagent tool_call_ids (messages found by id field)
+    active_agents: std::collections::HashSet<String>,
     /// Input box
     input: InputBox,
     /// Current scroll position
@@ -114,6 +116,7 @@ impl TuiState {
 
         Self {
             messages: vec![],
+            active_agents: std::collections::HashSet::new(),
             input,
             scroll: 0,
             is_processing: false,
@@ -177,28 +180,16 @@ impl TuiState {
             }
             AgentEvent::ToolExecutionStart {
                 tool_name,
-                arguments,
                 ..
             } => {
-                if tool_name == "agent" {
-                    let desc = arguments
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("subagent");
-                    self.status = format!("Agent: {}...", desc);
-                } else {
-                    self.status = format!("Running {}...", tool_name);
-                }
+                self.status = format!("Running {}...", tool_name);
             }
             AgentEvent::ToolExecutionUpdate {
-                tool_name, content, ..
+                tool_name,
+                content,
+                ..
             } => {
-                if tool_name == "agent" {
-                    // Subagent progress — show tool activity within the agent
-                    self.status = format!("Agent {}", content);
-                } else {
-                    self.status = format!("{}: {}", tool_name, content);
-                }
+                self.status = format!("{}: {}", tool_name, content);
             }
             AgentEvent::ToolExecutionEnd {
                 tool_name,
@@ -206,19 +197,9 @@ impl TuiState {
                 is_error,
                 ..
             } => {
-                if tool_name == "agent" {
-                    // Agent results go to the model as tool_result — the model
-                    // will summarize for the user. Only show errors in the TUI.
-                    if is_error {
-                        let preview = crate::utils::truncate_chars(&result, 500);
-                        self.messages
-                            .push(ChatMessage::tool("agent", preview, true));
-                    }
-                } else {
-                    let preview = crate::utils::truncate_chars(&result, 200);
-                    self.messages
-                        .push(ChatMessage::tool(&tool_name, preview, is_error));
-                }
+                let preview = crate::utils::truncate_chars(&result, 200);
+                self.messages
+                    .push(ChatMessage::tool(&tool_name, preview, is_error));
                 self.scroll_to_bottom();
             }
             AgentEvent::TurnEnd { usage, .. } => {
@@ -253,6 +234,7 @@ impl TuiState {
                     content: format!("Error: {}", message),
                     is_error: true,
                     is_streaming: false,
+                    id: None,
                 });
             }
             AgentEvent::CompactionStart { reason } => {
@@ -270,6 +252,93 @@ impl TuiState {
                     tokens_before, tokens_after
                 )));
                 self.scroll_to_bottom();
+            }
+            // Subagent events — dispatch inner event with agent context
+            AgentEvent::Subagent {
+                agent_id,
+                description,
+                event,
+            } => {
+                match *event {
+                    AgentEvent::AgentStart => {
+                        let msg = ChatMessage {
+                            role: format!("agent:{}", description),
+                            content: "starting...".to_string(),
+                            is_error: false,
+                            is_streaming: true,
+                            id: Some(agent_id.clone()),
+                        };
+                        self.messages.push(msg);
+                        self.active_agents.insert(agent_id);
+                        self.scroll_to_bottom();
+                        self.status = format!("Agent: {}...", description);
+                    }
+                    AgentEvent::ToolExecutionStart { ref tool_name, .. } => {
+                        if let Some(msg) = self
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m.id.as_deref() == Some(&agent_id))
+                        {
+                            msg.content = format!("[{}...]", tool_name);
+                        }
+                        self.status = format!("Agent [{}...]", tool_name);
+                        self.scroll_to_bottom();
+                    }
+                    AgentEvent::ToolExecutionEnd {
+                        ref tool_name,
+                        is_error,
+                        ..
+                    } => {
+                        if let Some(msg) = self
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m.id.as_deref() == Some(&agent_id))
+                        {
+                            if is_error {
+                                msg.content = format!("[{} error]", tool_name);
+                            } else {
+                                msg.content = format!("[{} done]", tool_name);
+                            }
+                        }
+                        self.scroll_to_bottom();
+                    }
+                    AgentEvent::TurnEnd { ref usage, .. } => {
+                        self.total_input_tokens += usage.input;
+                        self.total_output_tokens += usage.output;
+                        self.total_cache_read += usage.cache_read;
+                        self.total_cache_write += usage.cache_write;
+                        let cost = usage.calculate_cost(&self.model);
+                        self.total_cost += cost.total;
+                    }
+                    AgentEvent::AgentEnd { .. } => {
+                        self.active_agents.remove(&agent_id);
+                        if let Some(msg) = self
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m.id.as_deref() == Some(&agent_id))
+                        {
+                            msg.is_streaming = false;
+                            msg.content = "done".to_string();
+                        }
+                    }
+                    AgentEvent::Error { ref message } => {
+                        self.active_agents.remove(&agent_id);
+                        if let Some(msg) = self
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m.id.as_deref() == Some(&agent_id))
+                        {
+                            msg.is_streaming = false;
+                            msg.is_error = true;
+                            msg.content = format!("error: {}", message);
+                        }
+                    }
+                    _ => {}
+                }
             }
             // Ignore turn/message start events (we handle updates/ends)
             AgentEvent::TurnStart { .. } | AgentEvent::MessageStart { .. } => {}
@@ -422,6 +491,7 @@ impl TuiState {
             Action::Clear => {
                 let _ = self.ui_tx.send(UiMessage::Clear).await;
                 self.messages.clear();
+                self.active_agents.clear();
                 self.total_input_tokens = 0;
                 self.total_output_tokens = 0;
                 self.total_cache_read = 0;
@@ -448,21 +518,21 @@ impl TuiState {
     pub fn render(&mut self, frame: &mut Frame) {
         let size = frame.area();
 
-        // Layout: messages (flex), status bar (1), input (3)
+        // Layout: status bar (1), messages (flex), input (3)
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),    // Messages
                 Constraint::Length(1), // Status
+                Constraint::Min(1),    // Messages
                 Constraint::Length(3), // Input
             ])
             .split(size);
 
-        // Render messages
-        self.render_messages(frame, chunks[0]);
-
         // Render status bar
-        self.render_status(frame, chunks[1]);
+        self.render_status(frame, chunks[0]);
+
+        // Render messages
+        self.render_messages(frame, chunks[1]);
 
         // Render input
         self.input
@@ -525,17 +595,9 @@ impl TuiState {
     }
 
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
-        let model_name = self
-            .model
-            .id
-            .split('/')
-            .next_back()
-            .unwrap_or(&self.model.id);
-        let title = format!(" tau │ {} ", model_name);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(self.theme.border_style())
-            .title(title);
+            .border_style(self.theme.border_style());
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -615,6 +677,7 @@ impl TuiState {
         let content_height = tau_tui::widgets::message_list::calculate_message_height(
             &self.messages,
             inner.width as usize,
+            &self.theme,
         );
 
         if self.scroll == usize::MAX {
@@ -914,6 +977,7 @@ pub async fn run_tui(
                                     state.total_cache_read = 0;
                                     state.total_cache_write = 0;
                                     state.total_cost = 0.0;
+                                    state.active_agents.clear();
                                     state.status = "Cleared".to_string();
                                 }
                                 CommandResult::ChangeModel(new_model) => {
@@ -985,6 +1049,7 @@ pub async fn run_tui(
                                             state.total_cache_read = 0;
                                             state.total_cache_write = 0;
                                             state.total_cost = 0.0;
+                                            state.active_agents.clear();
                                         }
                                         Err(e) => {
                                             state.show_system_message(&format!("Failed to create branch: {}", e));
@@ -1010,6 +1075,7 @@ pub async fn run_tui(
                         state.total_cache_read = 0;
                         state.total_cache_write = 0;
                         state.total_cost = 0.0;
+                        state.active_agents.clear();
                         state.status = "Cleared".to_string();
                     }
                     Some(UiMessage::Abort) => {

@@ -21,6 +21,7 @@ const ACTIONS: &str = include_str!("actions.md");
 const STYLE: &str = include_str!("style.md");
 const OUTPUT_EFFICIENCY: &str = include_str!("output_efficiency.md");
 const OUTPUT_ACOLYTE: &str = include_str!("output_acolyte.md");
+const AGENTS: &str = include_str!("agents.md");
 
 /// Build the complete system prompt, including project context (CLAUDE.md / AGENTS.md).
 pub fn build_system_prompt(opts: &PromptOptions) -> String {
@@ -43,7 +44,17 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 
     let env = env_section(opts.cwd);
 
-    let mut prompt = [INTRO, SYSTEM, &tasks, ACTIONS, &tools, &style, &env].join("\n\n");
+    let mut sections = vec![INTRO, SYSTEM, &tasks, ACTIONS, &tools];
+
+    // Add agent instructions if the agent tool is available
+    if opts.tool_names.contains(&"agent") {
+        sections.push(AGENTS);
+    }
+
+    sections.push(&style);
+    sections.push(&env);
+
+    let mut prompt = sections.join("\n\n");
 
     // Append project context files (CLAUDE.md, AGENTS.md)
     if let Some(context) = crate::context::load_context() {

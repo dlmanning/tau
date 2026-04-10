@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
-use tokio_util::sync::CancellationToken;
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 use crate::lsp::LspManager;
 
@@ -61,9 +60,8 @@ impl Tool for LspTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        _cancel: CancellationToken,
+        _ctx: ExecutionContext,
     ) -> ToolResult {
         let operation = match arguments.get("operation").and_then(|v| v.as_str()) {
             Some(op) => op,

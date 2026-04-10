@@ -1,5 +1,6 @@
 //! Tool trait and execution
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use tau_ai::Content;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::send_event;
 use crate::events::AgentEvent;
 
 /// Result of a tool execution
@@ -92,12 +94,43 @@ impl ProgressSender {
 
     /// Send a progress update.
     pub fn send(&self, content: impl Into<String>) {
-        let _ = self.tx.send(AgentEvent::ToolExecutionUpdate {
-            tool_call_id: self.tool_call_id.clone(),
-            tool_name: self.tool_name.clone(),
-            content: content.into(),
-        });
+        send_event(
+            &self.tx,
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id: self.tool_call_id.clone(),
+                tool_name: self.tool_name.clone(),
+                content: content.into(),
+            },
+        );
     }
+
+    /// Emit a raw event on the parent's event channel.
+    /// Used by the agent tool to forward subagent events (e.g. TurnEnd for usage).
+    pub fn emit(&self, event: AgentEvent) {
+        send_event(&self.tx, event);
+    }
+}
+
+/// Whether a tool can run concurrently with others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Concurrency {
+    /// Must run alone (default for most tools).
+    Sequential,
+    /// Safe to run concurrently with other Parallel tools.
+    Parallel,
+}
+
+/// Context passed to every tool execution.
+///
+/// Replaces the previous pattern of baking CWD into tool instances and passing
+/// cancel/progress as separate parameters.
+pub struct ExecutionContext {
+    /// Working directory for this execution. Tools resolve relative paths against this.
+    pub cwd: PathBuf,
+    /// Cancellation token — tools should check this periodically for long operations.
+    pub cancel: CancellationToken,
+    /// Progress sender — tools can emit updates during execution.
+    pub progress: ProgressSender,
 }
 
 /// Trait for executable tools
@@ -117,27 +150,13 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for parameters
     fn parameters_schema(&self) -> serde_json::Value;
 
-    /// Execute the tool with the given arguments
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        arguments: serde_json::Value,
-        cancel: CancellationToken,
-    ) -> ToolResult;
-
-    /// Execute the tool with progress reporting support.
-    ///
-    /// Default implementation ignores the progress sender and delegates to `execute()`.
-    /// Tools can override this to emit progress updates during execution.
-    async fn execute_with_progress(
-        &self,
-        tool_call_id: &str,
-        arguments: serde_json::Value,
-        cancel: CancellationToken,
-        _progress: ProgressSender,
-    ) -> ToolResult {
-        self.execute(tool_call_id, arguments, cancel).await
+    /// Whether this tool can run concurrently with other Parallel tools.
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
     }
+
+    /// Execute the tool with the given arguments and execution context.
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult;
 }
 
 /// Type alias for a boxed tool
@@ -177,9 +196,8 @@ mod tests {
         }
         async fn execute(
             &self,
-            _tool_call_id: &str,
             arguments: serde_json::Value,
-            _cancel: CancellationToken,
+            _ctx: ExecutionContext,
         ) -> ToolResult {
             let text = arguments
                 .get("text")
@@ -190,16 +208,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_with_progress_default_delegates() {
+    async fn test_execute_with_context() {
         let tool = EchoTool;
         let (tx, _rx) = broadcast::channel(16);
         let progress = ProgressSender::new(tx, "call_1", "echo");
         let cancel = CancellationToken::new();
         let args = serde_json::json!({"text": "hello"});
 
-        let result = tool
-            .execute_with_progress("call_1", args, cancel, progress)
-            .await;
+        let ctx = ExecutionContext {
+            cwd: PathBuf::from("/tmp"),
+            cancel,
+            progress,
+        };
+
+        let result = tool.execute(args, ctx).await;
 
         assert!(!result.is_error);
         assert_eq!(result.text_content(), "hello");

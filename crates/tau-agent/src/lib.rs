@@ -11,7 +11,7 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod prompts;
-pub mod subagent;
+pub mod agent_manager;
 pub mod tool;
 pub mod transport;
 
@@ -21,5 +21,5 @@ pub use conversation::{AgentState, Conversation};
 pub use error::Error;
 pub use events::AgentEvent;
 pub use handle::AgentHandle;
-pub use tool::{ProgressSender, Tool, ToolResult};
+pub use tool::{Concurrency, ExecutionContext, ProgressSender, Tool, ToolResult};
 pub use transport::Transport;

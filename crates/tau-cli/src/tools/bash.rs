@@ -4,12 +4,11 @@ use std::{collections::VecDeque, process::Stdio};
 
 use async_trait::async_trait;
 use serde_json::json;
-use tau_agent::tool::{Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
 };
-use tokio_util::sync::CancellationToken;
 
 /// Maximum output size in bytes before truncation
 const MAX_OUTPUT_SIZE: usize = 30_000; // 30KB
@@ -17,20 +16,11 @@ const MAX_OUTPUT_SIZE: usize = 30_000; // 30KB
 const MAX_OUTPUT_LINES: usize = 500;
 
 /// Tool for executing bash commands
-pub struct BashTool {
-    cwd: Option<std::path::PathBuf>,
-}
+pub struct BashTool;
 
 impl BashTool {
     pub fn new() -> Self {
-        Self { cwd: None }
-    }
-
-    /// Create a BashTool that runs commands in a specific directory.
-    pub fn with_cwd(cwd: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            cwd: Some(cwd.into()),
-        }
+        Self
     }
 }
 
@@ -156,9 +146,8 @@ impl Tool for BashTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         arguments: serde_json::Value,
-        cancel: CancellationToken,
+        ctx: ExecutionContext,
     ) -> ToolResult {
         let command = match arguments.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
@@ -181,10 +170,8 @@ impl Tool for BashTool {
         cmd.arg(shell_arg)
             .arg(command)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(ref cwd) = self.cwd {
-            cmd.current_dir(cwd);
-        }
+            .stderr(Stdio::piped())
+            .current_dir(&ctx.cwd);
         let mut child = match cmd.spawn()
         {
             Ok(c) => c,
@@ -207,7 +194,7 @@ impl Tool for BashTool {
 
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
+                _ = ctx.cancel.cancelled() => {
                     let _ = child.kill().await;
                     return ToolResult::error("Command cancelled");
                 }
