@@ -2,7 +2,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use parking_lot::Mutex;
@@ -17,8 +17,12 @@ pub struct AgentHandle {
     pub(crate) cancel: Arc<Mutex<CancellationToken>>,
     pub(crate) steering_queue: Arc<Mutex<Vec<Message>>>,
     pub(crate) follow_up_queue: Arc<Mutex<Vec<Message>>>,
+    pub(crate) follow_up_notify: Arc<tokio::sync::Notify>,
     pub(crate) idle_notify: Arc<tokio::sync::Notify>,
     pub(crate) is_running: Arc<AtomicBool>,
+    /// Number of background agents that have been spawned but haven't
+    /// posted their follow-up yet.
+    pub(crate) pending_follow_ups: Arc<AtomicU32>,
 }
 
 impl AgentHandle {
@@ -27,8 +31,10 @@ impl AgentHandle {
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             follow_up_queue: Arc::new(Mutex::new(Vec::new())),
+            follow_up_notify: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
             is_running: Arc::new(AtomicBool::new(false)),
+            pending_follow_ups: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -69,6 +75,34 @@ impl AgentHandle {
             q.remove(0);
         }
         q.push(message);
+        drop(q);
+        self.follow_up_notify.notify_one();
+    }
+
+    /// Record that a background agent was spawned and its follow-up is expected.
+    pub fn expect_follow_up(&self) {
+        self.pending_follow_ups.fetch_add(1, Ordering::Release);
+    }
+
+    /// Record that an expected follow-up was consumed.
+    /// Only decrements if the counter is positive (follow-ups posted
+    /// without a prior `expect_follow_up` are ignored).
+    pub fn consume_follow_up(&self) {
+        let _ = self
+            .pending_follow_ups
+            .fetch_update(Ordering::Release, Ordering::Acquire, |n| {
+                if n > 0 { Some(n - 1) } else { None }
+            });
+    }
+
+    /// Whether there are background agents that haven't posted their follow-up yet.
+    pub fn has_pending_follow_ups(&self) -> bool {
+        self.pending_follow_ups.load(Ordering::Acquire) > 0
+    }
+
+    /// Wait until a follow-up message is posted.
+    pub async fn wait_for_follow_up(&self) {
+        self.follow_up_notify.notified().await;
     }
 
     /// Wait until the agent loop becomes idle (finishes running).

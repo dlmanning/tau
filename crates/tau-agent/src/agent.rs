@@ -843,13 +843,43 @@ impl Agent {
             DrainFollowUps => {
                 let follow_ups =
                     self.drain_queue(&self.handle.follow_up_queue, self.config.follow_up_mode);
-                if follow_ups.is_empty() {
-                    Done(Ok(()))
-                } else {
-                    StartTurn {
+
+                if !follow_ups.is_empty() {
+                    for _ in &follow_ups {
+                        self.handle.consume_follow_up();
+                    }
+                    return StartTurn {
                         messages: follow_ups,
                         first_user_message: None,
+                    };
+                }
+
+                // Register the waiter BEFORE checking the condition to avoid
+                // a TOCTOU race (same pattern as wait_for_idle).
+                let notified = self.handle.follow_up_notify.notified();
+
+                // Re-check: a follow-up may have arrived between drain and registration.
+                let follow_ups =
+                    self.drain_queue(&self.handle.follow_up_queue, self.config.follow_up_mode);
+                if !follow_ups.is_empty() {
+                    for _ in &follow_ups {
+                        self.handle.consume_follow_up();
                     }
+                    return StartTurn {
+                        messages: follow_ups,
+                        first_user_message: None,
+                    };
+                }
+
+                if !self.handle.has_pending_follow_ups() {
+                    return Done(Ok(()));
+                }
+
+                // Wait for a background agent to post its follow-up
+                let cancel = self.handle.cancel.lock().clone();
+                tokio::select! {
+                    _ = notified => DrainFollowUps,
+                    _ = cancel.cancelled() => Done(Ok(())),
                 }
             }
 

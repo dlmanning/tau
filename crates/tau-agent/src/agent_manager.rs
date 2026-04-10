@@ -184,6 +184,8 @@ impl AgentManager {
         let description = request.description.clone();
         let bg_cancel = CancellationToken::new();
 
+        parent_handle.expect_follow_up();
+
         let manager = self.clone();
         let desc = description.clone();
         let aid = agent_id.clone();
