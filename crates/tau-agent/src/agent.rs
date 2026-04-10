@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     compaction::{self, CompactionConfig, CompactionReason},
     events::AgentEvent,
+    loop_state::{LoopState, ToolCall},
     tool::{BoxedTool, ToolResult, to_api_tool},
     transport::{AgentRunConfig, Transport, is_context_overflow},
 };
@@ -380,10 +381,10 @@ impl Agent {
     /// Skip remaining tool calls by emitting start/end events and producing error results.
     fn skip_remaining_tools(
         &self,
-        tool_calls: &[(String, String, serde_json::Value)],
+        tool_calls: &[ToolCall],
         tool_results: &mut Vec<Message>,
     ) {
-        for (skip_id, skip_name, _) in tool_calls {
+        for ToolCall { id: skip_id, name: skip_name, .. } in tool_calls {
             send_event(
                 &self.event_tx,
                 AgentEvent::ToolExecutionStart {
@@ -469,13 +470,13 @@ impl Agent {
     }
 
     /// Attempt overflow recovery via compaction. Returns `true` if recovery succeeded
-    /// and the caller should `continue` the loop.
+    /// and the caller should retry. On success, `messages_to_add` is reset to
+    /// contain only the first user message (so the retried turn starts clean).
     async fn try_overflow_recovery(
         &mut self,
         error: &str,
         messages_to_add: &mut Vec<Message>,
         first_user_message: &Option<Message>,
-        turn: &mut u32,
     ) -> bool {
         if !self.config.compaction.enabled || !is_context_overflow(error) {
             return false;
@@ -491,7 +492,6 @@ impl Agent {
             if let Some(msg) = first_user_message {
                 *messages_to_add = vec![msg.clone()];
             }
-            *turn = 0;
             return true;
         }
         false
@@ -501,7 +501,7 @@ impl Agent {
     /// and append the steering messages. Returns true if steered.
     fn apply_steering(
         &self,
-        remaining: &[(String, String, serde_json::Value)],
+        remaining: &[ToolCall],
         tool_results: &mut Vec<Message>,
     ) -> bool {
         let steering_msgs =
@@ -521,8 +521,8 @@ impl Agent {
     /// between groups. Read-before-write guard is applied uniformly.
     async fn execute_tool_calls(
         &mut self,
-        tool_calls: Vec<(String, String, serde_json::Value)>,
-    ) -> (Vec<Message>, bool) {
+        tool_calls: Vec<ToolCall>,
+    ) -> Vec<Message> {
         use crate::tool::Concurrency;
 
         // Build groups: consecutive Parallel tools form a group, Sequential is singleton.
@@ -530,11 +530,11 @@ impl Agent {
         let mut current_group: Vec<usize> = vec![];
         let mut current_is_parallel = false;
 
-        for (idx, (_, name, _)) in tool_calls.iter().enumerate() {
+        for (idx, tc) in tool_calls.iter().enumerate() {
             let is_parallel = self
                 .tools
                 .iter()
-                .find(|t| t.name() == name.as_str())
+                .find(|t| t.name() == tc.name.as_str())
                 .map(|t| t.concurrency() == Concurrency::Parallel)
                 .unwrap_or(false);
 
@@ -554,14 +554,12 @@ impl Agent {
         }
 
         let mut tool_results = vec![];
-        let mut steered = false;
 
         for group in &groups {
             // Check steering before each group (except the first)
             if !tool_results.is_empty() {
                 let from = *group.first().unwrap();
                 if self.apply_steering(&tool_calls[from..], &mut tool_results) {
-                    steered = true;
                     break;
                 }
             }
@@ -569,16 +567,16 @@ impl Agent {
             if group.len() == 1 {
                 // --- Sequential: single tool ---
                 let idx = group[0];
-                let (ref id, ref name, ref args) = tool_calls[idx];
-                let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
-                let validator = self.schema_cache.get(name.as_str()).cloned();
+                let tc = &tool_calls[idx];
+                let tool = self.tools.iter().find(|t| t.name() == tc.name.as_str()).cloned();
+                let validator = self.schema_cache.get(tc.name.as_str()).cloned();
 
                 let cancel = self.handle.cancel.lock().clone();
                 let result = run_single_tool(
                     tool,
-                    id.clone(),
-                    name.clone(),
-                    args.clone(),
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    tc.args.clone(),
                     validator,
                     self.event_tx.clone(),
                     crate::tool::ExecutionContext {
@@ -586,8 +584,8 @@ impl Agent {
                         cancel,
                         progress: crate::tool::ProgressSender::new(
                             self.event_tx.clone(),
-                            id.clone(),
-                            name.clone(),
+                            tc.id.clone(),
+                            tc.name.clone(),
                         ),
                         interaction: self.interaction_tx.clone(),
                         file_access: self.file_access.clone(),
@@ -595,10 +593,11 @@ impl Agent {
                 )
                 .await;
 
-                tool_results.push(Message::tool_result(id, name, result.content, result.is_error));
+                tool_results.push(Message::tool_result(
+                    &tc.id, &tc.name, result.content, result.is_error,
+                ));
 
                 if self.apply_steering(&tool_calls[idx + 1..], &mut tool_results) {
-                    steered = true;
                     break;
                 }
             } else {
@@ -607,13 +606,13 @@ impl Agent {
                 let cwd = self.effective_cwd();
 
                 for &idx in group {
-                    let (ref id, ref name, ref args) = tool_calls[idx];
-                    let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
-                    let validator = self.schema_cache.get(name.as_str()).cloned();
+                    let tc = &tool_calls[idx];
+                    let tool = self.tools.iter().find(|t| t.name() == tc.name.as_str()).cloned();
+                    let validator = self.schema_cache.get(tc.name.as_str()).cloned();
                     let event_tx = self.event_tx.clone();
-                    let id = id.clone();
-                    let name = name.clone();
-                    let args = args.clone();
+                    let id = tc.id.clone();
+                    let name = tc.name.clone();
+                    let args = tc.args.clone();
                     let ctx = crate::tool::ExecutionContext {
                         cwd: cwd.clone(),
                         cancel: self.handle.cancel.lock().clone(),
@@ -647,31 +646,28 @@ impl Agent {
                 }
 
                 for &idx in group {
-                    let (ref id, ref name, _) = tool_calls[idx];
+                    let tc = &tool_calls[idx];
                     let result = results_map.remove(&idx).unwrap_or_else(|| {
                         ToolResult::error("Task failed (panicked or cancelled)")
                     });
-                    tool_results
-                        .push(Message::tool_result(id, name, result.content, result.is_error));
+                    tool_results.push(Message::tool_result(
+                        &tc.id, &tc.name, result.content, result.is_error,
+                    ));
                 }
 
                 let after = *group.last().unwrap() + 1;
                 if self.apply_steering(&tool_calls[after..], &mut tool_results) {
-                    steered = true;
                     break;
                 }
             }
         }
 
-        (tool_results, steered)
+        tool_results
     }
 
     /// If input tokens are approaching the context window, compact proactively.
-    async fn check_compaction_threshold(
-        &mut self,
-        turn_usage: &Usage,
-        messages_to_add: &mut Vec<Message>,
-    ) {
+    /// Must be called after the assistant message has been appended to conversation.
+    async fn check_compaction_threshold(&mut self, turn_usage: &Usage) {
         if !self.config.compaction.enabled {
             return;
         }
@@ -682,9 +678,6 @@ impl Agent {
             .context_window
             .saturating_sub(self.config.compaction.reserve_tokens);
         if used > limit {
-            for m in messages_to_add.drain(..) {
-                self.conversation.messages.push(m);
-            }
             let _ = self.run_compaction(CompactionReason::Threshold).await;
         }
     }
@@ -696,11 +689,237 @@ impl Agent {
         }
     }
 
+    /// Advance the agent loop by one step. Each match arm handles one state
+    /// and returns the next state.
+    async fn step(
+        &mut self,
+        state: LoopState,
+        run_config: &AgentRunConfig,
+        completed_turns: &mut u32,
+    ) -> LoopState {
+        use crate::loop_state::LoopState::*;
+
+        match state {
+            StartTurn {
+                messages,
+                first_user_message,
+            } => {
+                // Check cancellation
+                if self.handle.cancel.lock().is_cancelled() {
+                    return Done(Ok(()));
+                }
+
+                // Check turn limit
+                if let Some(max) = self.config.max_turns {
+                    if *completed_turns >= max {
+                        self.run_final_summary(&messages, run_config).await;
+                        return Done(Ok(()));
+                    }
+                }
+
+                CallModel {
+                    messages,
+                    first_user_message,
+                }
+            }
+
+            CallModel {
+                mut messages,
+                first_user_message,
+            } => {
+                let context = self.build_context(&messages);
+                let cancel_token = self.handle.cancel.lock().clone();
+
+                let mut event_stream = match self
+                    .transport
+                    .run(context, run_config, cancel_token)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        let overflow =
+                            e.is_context_overflow() || is_context_overflow(&error_msg);
+                        if overflow
+                            && self
+                                .try_overflow_recovery(
+                                    &error_msg,
+                                    &mut messages,
+                                    &first_user_message,
+                                )
+                                .await
+                        {
+                            *completed_turns = 0;
+                            return StartTurn {
+                                messages,
+                                first_user_message,
+                            };
+                        }
+                        self.conversation.error = Some(error_msg.clone());
+                        send_event(
+                            &self.event_tx,
+                            AgentEvent::Error {
+                                message: error_msg.clone(),
+                            },
+                        );
+                        return Done(Err(crate::error::Error::Other(error_msg)));
+                    }
+                };
+
+                let outcome = self.process_stream(&mut event_stream).await;
+
+                // Handle streaming errors
+                if let Some(error_message) = outcome.error {
+                    if let Some(partial) = outcome.partial_message {
+                        if has_meaningful_content(&partial) {
+                            self.flush_pending(&mut messages);
+                            self.conversation.messages.push(partial);
+                        }
+                    }
+                    if self
+                        .try_overflow_recovery(
+                            &error_message,
+                            &mut messages,
+                            &first_user_message,
+                        )
+                        .await
+                    {
+                        *completed_turns = 0;
+                        return StartTurn {
+                            messages,
+                            first_user_message,
+                        };
+                    }
+                    self.conversation.error = Some(error_message.clone());
+                    return Done(Err(crate::error::Error::Other(error_message)));
+                }
+
+                self.accumulate_usage(&outcome.usage);
+
+                if let Some(msg) = outcome.assistant_message {
+                    // Append assistant message BEFORE compaction check so it's
+                    // included in the compacted context.
+                    self.flush_pending(&mut messages);
+                    self.conversation.messages.push(msg.clone());
+                    self.check_compaction_threshold(&outcome.usage).await;
+
+                    *completed_turns += 1;
+
+                    let tool_calls: Vec<ToolCall> = msg
+                        .tool_calls()
+                        .into_iter()
+                        .map(|(id, name, args)| ToolCall {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            args: args.clone(),
+                        })
+                        .collect();
+
+                    if tool_calls.is_empty() {
+                        DrainFollowUps
+                    } else {
+                        ExecuteTools {
+                            tool_calls,
+                            first_user_message,
+                        }
+                    }
+                } else {
+                    Done(Ok(()))
+                }
+            }
+
+            ExecuteTools {
+                tool_calls,
+                first_user_message,
+            } => {
+                let tool_results = self.execute_tool_calls(tool_calls).await;
+
+                StartTurn {
+                    messages: tool_results,
+                    first_user_message,
+                }
+            }
+
+            DrainFollowUps => {
+                let follow_ups =
+                    self.drain_queue(&self.handle.follow_up_queue, self.config.follow_up_mode);
+                if follow_ups.is_empty() {
+                    Done(Ok(()))
+                } else {
+                    StartTurn {
+                        messages: follow_ups,
+                        first_user_message: None,
+                    }
+                }
+            }
+
+            Done(result) => Done(result),
+        }
+    }
+
+    /// Run a final summary turn with tools disabled (used when max_turns is reached
+    /// and the last message has pending tool results).
+    async fn run_final_summary(
+        &mut self,
+        messages: &[Message],
+        run_config: &AgentRunConfig,
+    ) {
+        let last_has_tool_calls = self
+            .conversation
+            .messages
+            .last()
+            .is_some_and(|m| !m.tool_calls().is_empty());
+
+        if !last_has_tool_calls || messages.is_empty() {
+            tracing::info!(
+                "Agent reached max turns ({}), stopping",
+                self.config.max_turns.unwrap_or(0)
+            );
+            return;
+        }
+
+        let max = self.config.max_turns.unwrap_or(0);
+        tracing::info!(
+            "Agent reached max turns ({}), running final summary turn",
+            max
+        );
+
+        // Flush pending tool results into conversation so they're preserved.
+        for m in messages {
+            self.conversation.messages.push(m.clone());
+        }
+
+        let summary_prompt = vec![Message::user(format!(
+            "[System: You have reached the maximum of {} turns. \
+             Summarize your findings so far. Do not call any tools.]",
+            max
+        ))];
+
+        let context = self.build_context(&summary_prompt);
+        let mut final_config = run_config.clone();
+        final_config.tools.clear();
+        let cancel_token = self.handle.cancel.lock().clone();
+
+        if let Ok(mut stream) = self
+            .transport
+            .run(context, &final_config, cancel_token)
+            .await
+        {
+            let outcome = self.process_stream(&mut stream).await;
+            self.accumulate_usage(&outcome.usage);
+            if let Some(msg) = outcome.assistant_message {
+                self.conversation.messages.push(msg);
+            }
+        }
+    }
+
     /// Core agent loop, shared between prompt_with_content and continue_loop.
     async fn run_with_messages(
         &mut self,
         initial_messages: Vec<Message>,
     ) -> crate::error::Result<()> {
+        use crate::loop_state::LoopState;
+
         *self.handle.cancel.lock() = CancellationToken::new();
         self.handle.is_running.store(true, Ordering::Release);
 
@@ -709,175 +928,28 @@ impl Agent {
         self.conversation.error = None;
         send_event(&self.event_tx, AgentEvent::AgentStart);
 
-        let mut turn = 0u32;
-        let mut messages_to_add: Vec<Message> = initial_messages;
-        let first_user_message = messages_to_add.first().cloned();
+        let first_user_message = initial_messages.first().cloned();
+        let mut completed_turns = 0u32;
+        let mut state = LoopState::StartTurn {
+            messages: initial_messages,
+            first_user_message,
+        };
 
-        let result = loop {
-            turn += 1;
+        while !matches!(state, LoopState::Done(_)) {
+            state = self.step(state, &run_config, &mut completed_turns).await;
+        }
 
-            if self.handle.cancel.lock().is_cancelled() {
-                turn -= 1;
-                break Ok(());
-            }
-
-            // Enforce turn limit if set (used by subagents).
-            // When hitting the limit with pending tool results, run one final
-            // turn with tools disabled so the model produces a text summary
-            // rather than leaving the conversation mid-tool-call.
-            if let Some(max) = self.config.max_turns {
-                if turn > max {
-                    let last_has_tool_calls = self
-                        .conversation
-                        .messages
-                        .last()
-                        .is_some_and(|m| !m.tool_calls().is_empty());
-                    if last_has_tool_calls && !messages_to_add.is_empty() {
-                        tracing::info!(
-                            "Agent reached max turns ({}), running final summary turn",
-                            max
-                        );
-                        messages_to_add.push(Message::user(format!(
-                            "[System: You have reached the maximum of {} turns. \
-                             Summarize your findings so far. Do not call any tools.]",
-                            max
-                        )));
-                        let context_messages = self.build_context(&messages_to_add);
-                        let mut final_config = run_config.clone();
-                        final_config.tools.clear();
-                        let cancel_token = self.handle.cancel.lock().clone();
-                        if let Ok(mut stream) = self
-                            .transport
-                            .run(context_messages, &final_config, cancel_token)
-                            .await
-                        {
-                            let outcome = self.process_stream(&mut stream).await;
-                            self.accumulate_usage(&outcome.usage);
-                            self.flush_pending(&mut messages_to_add);
-                            if let Some(msg) = outcome.assistant_message {
-                                self.conversation.messages.push(msg);
-                            }
-                        }
-                    } else {
-                        tracing::info!("Agent reached max turns ({}), stopping", max);
-                    }
-                    turn -= 1; // correct the count — this turn didn't execute
-                    break Ok(());
-                }
-            }
-
-            let context_messages = self.build_context(&messages_to_add);
-            let cancel_token = self.handle.cancel.lock().clone();
-            let mut event_stream = match self
-                .transport
-                .run(context_messages, &run_config, cancel_token)
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    let overflow = e.is_context_overflow() || is_context_overflow(&error_msg);
-                    if overflow
-                        && self
-                            .try_overflow_recovery(
-                                &error_msg,
-                                &mut messages_to_add,
-                                &first_user_message,
-                                &mut turn,
-                            )
-                            .await
-                    {
-                        continue;
-                    }
-                    self.conversation.error = Some(error_msg.clone());
-                    send_event(
-                        &self.event_tx,
-                        AgentEvent::Error {
-                            message: error_msg.clone(),
-                        },
-                    );
-                    break Err(crate::error::Error::Other(error_msg));
-                }
-            };
-
-            let outcome = self.process_stream(&mut event_stream).await;
-
-            // Handle streaming errors with overflow recovery
-            if let Some(error_message) = outcome.error {
-                if let Some(partial) = outcome.partial_message {
-                    if has_meaningful_content(&partial) {
-                        self.flush_pending(&mut messages_to_add);
-                        self.conversation.messages.push(partial);
-                    }
-                }
-                if self
-                    .try_overflow_recovery(
-                        &error_message,
-                        &mut messages_to_add,
-                        &first_user_message,
-                        &mut turn,
-                    )
-                    .await
-                {
-                    continue;
-                }
-                self.conversation.error = Some(error_message.clone());
-                break Err(crate::error::Error::Other(error_message));
-            }
-
-            self.accumulate_usage(&outcome.usage);
-            self.check_compaction_threshold(&outcome.usage, &mut messages_to_add)
-                .await;
-
-            if let Some(msg) = outcome.assistant_message {
-                self.flush_pending(&mut messages_to_add);
-                self.conversation.messages.push(msg.clone());
-
-                let tool_calls = msg.tool_calls();
-                if tool_calls.is_empty() {
-                    let follow_ups =
-                        self.drain_queue(&self.handle.follow_up_queue, self.config.follow_up_mode);
-                    if !follow_ups.is_empty() {
-                        messages_to_add = follow_ups;
-                        continue;
-                    }
-                    break Ok(());
-                }
-
-                // Convert to owned types and execute
-                let tool_calls_vec: Vec<(String, String, serde_json::Value)> = tool_calls
-                    .into_iter()
-                    .map(|(id, name, args)| (id.to_string(), name.to_string(), args.clone()))
-                    .collect();
-
-                let (tool_results, steered) = self.execute_tool_calls(tool_calls_vec).await;
-                messages_to_add = tool_results;
-                if steered {
-                    continue;
-                }
-            } else {
-                break Ok(());
-            }
+        let result = match state {
+            LoopState::Done(r) => r,
+            _ => unreachable!(),
         };
 
         self.conversation.is_streaming = false;
 
-        if self.config.compaction.enabled {
-            let last_input = self.conversation.total_usage.input;
-            let limit = self
-                .config
-                .model
-                .context_window
-                .saturating_sub(self.config.compaction.reserve_tokens);
-            if last_input > limit {
-                let _ = self.run_compaction(CompactionReason::Threshold).await;
-            }
-        }
-
         send_event(
             &self.event_tx,
             AgentEvent::AgentEnd {
-                total_turns: turn,
+                total_turns: completed_turns,
                 total_usage: self.conversation.total_usage.clone(),
             },
         );

@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod interaction;
+pub mod loop_state;
 pub mod prompts;
 pub mod agent_manager;
 pub mod stream;
