@@ -131,6 +131,9 @@ pub struct ExecutionContext {
     pub cancel: CancellationToken,
     /// Progress sender — tools can emit updates during execution.
     pub progress: ProgressSender,
+    /// Channel for tools that need user input (e.g. AskUserQuestion).
+    /// `None` in non-interactive contexts or subagents.
+    pub interaction: Option<tokio::sync::mpsc::Sender<crate::interaction::InteractionRequest>>,
 }
 
 /// Trait for executable tools
@@ -219,6 +222,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             cancel,
             progress,
+            interaction: None,
         };
 
         let result = tool.execute(args, ctx).await;

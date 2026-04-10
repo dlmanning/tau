@@ -293,6 +293,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut agent = Agent::new(config, transport.clone());
 
+    // Set up interaction channel for tools that need user input (e.g. ask_user)
+    let (interaction_tx, interaction_rx) =
+        tokio::sync::mpsc::channel::<tau_agent::InteractionRequest>(8);
+    agent.set_interaction_sender(interaction_tx);
+
+    agent.add_tool(Arc::new(tools::AskTool::new()));
     agent.add_tool(Arc::new(tools::BashTool::new()));
     agent.add_tool(Arc::new(tools::ReadTool::new()));
     agent.add_tool(Arc::new(tools::WriteTool::new()));
@@ -369,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Non-interactive mode
     if let Some(command) = args.command {
-        return run_command(&mut agent, &command, &model).await;
+        return run_command(&mut agent, &command, &model, interaction_rx).await;
     }
 
     // TUI mode
@@ -377,7 +383,14 @@ async fn main() -> anyhow::Result<()> {
         let mut model = model;
         let mut reasoning = reasoning;
         let available_models = get_available_models();
-        return ui::run_tui(&mut agent, &mut model, &mut reasoning, &available_models).await;
+        return ui::run_tui(
+            &mut agent,
+            &mut model,
+            &mut reasoning,
+            &available_models,
+            interaction_rx,
+        )
+        .await;
     }
 
     // Interactive mode (simple stdin/stdout)
@@ -385,10 +398,15 @@ async fn main() -> anyhow::Result<()> {
     let mut session = session::SessionManager::new(&model.id).ok();
     let mut model = model;
     let mut reasoning = reasoning;
-    run_interactive(&mut agent, &mut model, &mut reasoning, session.as_mut()).await
+    run_interactive(&mut agent, &mut model, &mut reasoning, session.as_mut(), interaction_rx).await
 }
 
-async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow::Result<()> {
+async fn run_command(
+    agent: &mut Agent,
+    command: &str,
+    model: &Model,
+    interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
+) -> anyhow::Result<()> {
     println!("tau> {}", command);
     println!();
 
@@ -458,13 +476,55 @@ async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow:
         }
     });
 
+    let interaction_handle = tokio::spawn(handle_interaction_stdin(interaction_rx));
+
     agent.prompt(command).await?;
 
     // Wait a bit for final events
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     handle.abort();
+    interaction_handle.abort();
 
     Ok(())
+}
+
+/// Handle interaction requests by printing to stdout and reading from stdin.
+/// Used in non-TUI modes (command mode and simple interactive mode).
+async fn handle_interaction_stdin(
+    mut rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
+) {
+    use tau_agent::interaction::{InteractionKind, InteractionResponse};
+
+    while let Some(request) = rx.recv().await {
+        match request.kind {
+            InteractionKind::AskQuestion { question, options } => {
+                println!("\n{}", question);
+                for (i, opt) in options.iter().enumerate() {
+                    println!("  {}) {} — {}", i + 1, opt.label, opt.description);
+                }
+                print!("Enter choice (1-{}): ", options.len());
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+
+                let num_options = options.len();
+                let line = tokio::task::spawn_blocking(|| {
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input
+                })
+                .await
+                .unwrap_or_default();
+
+                let response = match line.trim().parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= num_options => {
+                        InteractionResponse::Answer(options[n - 1].label.clone())
+                    }
+                    _ => InteractionResponse::Cancelled,
+                };
+
+                let _ = request.response_tx.send(response);
+            }
+        }
+    }
 }
 
 async fn run_interactive(
@@ -472,10 +532,12 @@ async fn run_interactive(
     model: &mut Model,
     reasoning: &mut ReasoningLevel,
     mut session: Option<&mut session::SessionManager>,
+    interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
 ) -> anyhow::Result<()> {
     use std::io::{self, Write};
 
     let available_models = get_available_models();
+    let _interaction_handle = tokio::spawn(handle_interaction_stdin(interaction_rx));
 
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         let model_short = model.id.split('/').next_back().unwrap_or(&model.id);

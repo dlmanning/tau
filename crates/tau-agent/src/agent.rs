@@ -87,6 +87,8 @@ pub struct Agent {
     /// Files that have been read in this conversation.
     /// Write/Edit tools require a prior read for existing files.
     read_files: HashSet<PathBuf>,
+    /// Optional interaction channel for tools that need user input.
+    interaction_tx: Option<tokio::sync::mpsc::Sender<crate::interaction::InteractionRequest>>,
 }
 
 impl Agent {
@@ -104,6 +106,7 @@ impl Agent {
             schema_cache: HashMap::new(),
             cwd: None,
             read_files: HashSet::new(),
+            interaction_tx: None,
         }
     }
 
@@ -271,6 +274,14 @@ impl Agent {
     /// Set the follow-up queue dequeue mode.
     pub fn set_follow_up_mode(&mut self, mode: DequeueMode) {
         self.config.follow_up_mode = mode;
+    }
+
+    /// Set the interaction channel for tools that need user input.
+    pub fn set_interaction_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::Sender<crate::interaction::InteractionRequest>,
+    ) {
+        self.interaction_tx = Some(tx);
     }
 
     /// Set a transform_context hook called before sending messages to transport.
@@ -671,6 +682,7 @@ impl Agent {
                                 id.clone(),
                                 name.clone(),
                             ),
+                            interaction: self.interaction_tx.clone(),
                         };
                         tool.execute(args.clone(), ctx).await
                     }
@@ -745,6 +757,7 @@ impl Agent {
                     let validator = self.schema_cache.get(name.as_str()).cloned();
                     let cwd = cwd.clone();
                     let guard_err = guard_errors.remove(&idx);
+                    let interaction = self.interaction_tx.clone();
 
                     join_set.spawn(async move {
                         send_event(
@@ -772,6 +785,7 @@ impl Agent {
                                         id.clone(),
                                         name.clone(),
                                     ),
+                                    interaction,
                                 };
                                 tool.execute(args, ctx).await
                             }

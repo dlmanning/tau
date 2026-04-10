@@ -23,6 +23,14 @@ use tau_tui::{
 };
 use tokio::sync::mpsc;
 
+/// Pending interaction request waiting for user input in the TUI.
+struct PendingInteraction {
+    question: String,
+    options: Vec<tau_agent::QuestionOption>,
+    response_tx: tokio::sync::oneshot::Sender<tau_agent::InteractionResponse>,
+    selector: SelectorState,
+}
+
 /// Format a token count compactly (e.g. 1234 → "1.2k", 56 → "56")
 fn format_tokens(n: u32) -> String {
     if n >= 1000 {
@@ -90,6 +98,8 @@ pub struct TuiState {
     model_selector: SelectorState,
     /// Branch selector state
     branch_selector: SelectorState,
+    /// Pending interaction request (question waiting for user to pick an option)
+    pending_interaction: Option<PendingInteraction>,
 }
 
 impl TuiState {
@@ -135,6 +145,7 @@ impl TuiState {
             spinner_start: Instant::now(),
             model_selector,
             branch_selector: SelectorState::default(),
+            pending_interaction: None,
         }
     }
 
@@ -517,6 +528,10 @@ impl TuiState {
         self.input
             .render(chunks[2], frame.buffer_mut(), &self.theme);
 
+        if self.pending_interaction.is_some() {
+            self.render_question_selector(frame, size);
+        }
+
         if self.model_selector.visible {
             self.render_model_selector(frame, size);
         }
@@ -524,6 +539,25 @@ impl TuiState {
         if self.branch_selector.visible {
             self.render_branch_selector(frame, size);
         }
+    }
+
+    /// Render the question selector popup
+    fn render_question_selector(&self, frame: &mut Frame, area: Rect) {
+        let pi = self.pending_interaction.as_ref().unwrap();
+        let items: Vec<OwnedSelectorItem> = pi
+            .options
+            .iter()
+            .map(|opt| OwnedSelectorItem {
+                label: opt.label.clone(),
+                description: Some(opt.description.clone()),
+                is_current: false,
+            })
+            .collect();
+
+        let selector = OwnedSelector::new(&pi.question, items, &self.theme)
+            .with_selected(pi.selector.selected);
+
+        selector.render_centered(area, frame.buffer_mut());
     }
 
     /// Render the model selector popup
@@ -738,6 +772,7 @@ pub async fn run_tui(
     model: &mut Model,
     reasoning: &mut tau_ai::ReasoningLevel,
     available_models: &[Model],
+    mut interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
 ) -> anyhow::Result<()> {
     use std::io;
 
@@ -801,6 +836,8 @@ pub async fn run_tui(
                         if let Err(e) = result {
                             state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
                         }
+                        // Drop any pending interaction (tool future is gone)
+                        state.pending_interaction = None;
                         break; // Exit inner loop, prompt is done
                     }
 
@@ -812,6 +849,35 @@ pub async fn run_tui(
 
                     event = event_stream.next() => {
                         match event {
+                            Some(Ok(Event::Key(key))) if state.pending_interaction.is_some() => {
+                                let action = tau_tui::input::key_to_action(key);
+                                match action {
+                                    Action::Up => {
+                                        let pi = state.pending_interaction.as_mut().unwrap();
+                                        pi.selector.up(pi.options.len());
+                                    }
+                                    Action::Down => {
+                                        let pi = state.pending_interaction.as_mut().unwrap();
+                                        pi.selector.down(pi.options.len());
+                                    }
+                                    Action::Submit => {
+                                        let pi = state.pending_interaction.take().unwrap();
+                                        let label = pi.options[pi.selector.selected].label.clone();
+                                        let _ = pi.response_tx.send(
+                                            tau_agent::InteractionResponse::Answer(label),
+                                        );
+                                        state.status = "Thinking...".to_string();
+                                    }
+                                    Action::Escape | Action::Interrupt => {
+                                        let pi = state.pending_interaction.take().unwrap();
+                                        let _ = pi.response_tx.send(
+                                            tau_agent::InteractionResponse::Cancelled,
+                                        );
+                                        state.status = "Thinking...".to_string();
+                                    }
+                                    _ => {} // consume all other input while modal is open
+                                }
+                            }
                             Some(Ok(Event::Key(key))) => {
                                 let action = tau_tui::input::key_to_action(key);
                                 match action {
@@ -844,6 +910,23 @@ pub async fn run_tui(
                                 return Ok(());
                             }
                             _ => {}
+                        }
+                    }
+
+                    request = interaction_rx.recv() => {
+                        if let Some(request) = request {
+                            use tau_agent::interaction::InteractionKind;
+                            match request.kind {
+                                InteractionKind::AskQuestion { question, options } => {
+                                    state.status = "Waiting for your choice...".to_string();
+                                    state.pending_interaction = Some(PendingInteraction {
+                                        question,
+                                        options,
+                                        response_tx: request.response_tx,
+                                        selector: SelectorState::default(),
+                                    });
+                                }
+                            }
                         }
                     }
 

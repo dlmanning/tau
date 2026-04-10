@@ -1,6 +1,7 @@
 //! Built-in tools for the coding agent
 
 pub mod agent;
+mod ask;
 mod bash;
 mod edit;
 mod glob;
@@ -24,6 +25,7 @@ pub(crate) fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
 }
 
 pub use agent::AgentTool;
+pub use ask::AskTool;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
