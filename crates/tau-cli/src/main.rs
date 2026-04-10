@@ -333,9 +333,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(tool)
     }));
 
+    let mgr_for_send = manager.clone();
     agent.add_tool(Arc::new(
         tools::AgentTool::new(manager, 0).with_handle(agent_handle),
     ));
+    agent.add_tool(Arc::new(tools::SendMessageTool::new(mgr_for_send)));
 
     // Build dynamic system prompt based on registered tools
     let tool_names = agent.tool_names();

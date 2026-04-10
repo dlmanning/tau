@@ -9,6 +9,7 @@ mod grep;
 mod list;
 pub mod lsp;
 mod read;
+mod send_message;
 mod write;
 
 use std::path::{Path, PathBuf};
@@ -33,4 +34,5 @@ pub use grep::GrepTool;
 pub use list::ListTool;
 pub use lsp::LspTool;
 pub use read::ReadTool;
+pub use send_message::SendMessageTool;
 pub use write::WriteTool;

@@ -570,6 +570,48 @@ impl Agent {
         }
     }
 
+    /// Check the read-before-write guard for write/edit tools.
+    fn check_read_guard(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        if name != "write" && name != "edit" {
+            return None;
+        }
+        let path = Self::resolve_tool_path(args, &self.cwd)?;
+        if path.exists() && !self.read_files.contains(&path) {
+            Some(format!(
+                "You must read this file before {}ing it. Use the read tool first.",
+                name
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Track a successful read in the read_files set.
+    fn track_read(&mut self, name: &str, args: &serde_json::Value, result: &ToolResult) {
+        if name == "read" && !result.is_error {
+            if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
+                self.read_files.insert(path);
+            }
+        }
+    }
+
+    /// Drain steering queue. If non-empty, skip all remaining tool calls
+    /// and append the steering messages. Returns true if steered.
+    fn apply_steering(
+        &self,
+        remaining: &[(String, String, serde_json::Value)],
+        tool_results: &mut Vec<Message>,
+    ) -> bool {
+        let steering_msgs =
+            self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
+        if steering_msgs.is_empty() {
+            return false;
+        }
+        self.skip_remaining_tools(remaining, tool_results);
+        tool_results.extend(steering_msgs);
+        true
+    }
+
     /// Execute tool calls using concurrency-aware scheduling.
     ///
     /// Groups consecutive `Parallel` tools together and runs them concurrently
@@ -613,205 +655,92 @@ impl Agent {
         let mut steered = false;
 
         for group in &groups {
-            // Check steering queue before each group (except the first)
+            // Check steering before each group (except the first)
             if !tool_results.is_empty() {
-                let steering_msgs =
-                    self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
-                if !steering_msgs.is_empty() {
-                    let first_in_group = *group.first().unwrap();
-                    let remaining: Vec<_> = tool_calls[first_in_group..]
-                        .iter()
-                        .map(|(id, name, args)| (id.clone(), name.clone(), args.clone()))
-                        .collect();
-                    self.skip_remaining_tools(&remaining, &mut tool_results);
-                    tool_results.extend(steering_msgs);
+                let from = *group.first().unwrap();
+                if self.apply_steering(&tool_calls[from..], &mut tool_results) {
                     steered = true;
                     break;
                 }
             }
 
             if group.len() == 1 {
+                // --- Sequential: single tool ---
                 let idx = group[0];
                 let (ref id, ref name, ref args) = tool_calls[idx];
+                let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
+                let guard_err = self.check_read_guard(name, args);
+                let validator = self.schema_cache.get(name.as_str()).cloned();
 
-                let tool = self.tools.iter().find(|t| t.name() == name.as_str());
-
-                send_event(
-                    &self.event_tx,
-                    AgentEvent::ToolExecutionStart {
-                        tool_call_id: id.clone(),
-                        tool_name: name.clone(),
-                        arguments: args.clone(),
+                let cancel = self.handle.cancel.lock().clone();
+                let result = run_single_tool(
+                    tool,
+                    id.clone(),
+                    name.clone(),
+                    args.clone(),
+                    guard_err,
+                    validator,
+                    self.event_tx.clone(),
+                    crate::tool::ExecutionContext {
+                        cwd: self.effective_cwd(),
+                        cancel,
+                        progress: crate::tool::ProgressSender::new(
+                            self.event_tx.clone(),
+                            id.clone(),
+                            name.clone(),
+                        ),
+                        interaction: self.interaction_tx.clone(),
                     },
-                );
+                )
+                .await;
 
-                // Read-before-write guard
-                let guard_error = if name == "write" || name == "edit" {
-                    if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
-                        if path.exists() && !self.read_files.contains(&path) {
-                            Some(format!(
-                                "You must read this file before {}ing it. Use the read tool first.",
-                                name
-                            ))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let result = if let Some(err) = guard_error {
-                    ToolResult::error(err)
-                } else if let Some(tool) = tool {
-                    let validation_error = self
-                        .schema_cache
-                        .get(name.as_str())
-                        .and_then(|validator| validate_with_validator(args, validator));
-
-                    if let Some(err) = validation_error {
-                        ToolResult::error(err)
-                    } else {
-                        let ctx = crate::tool::ExecutionContext {
-                            cwd: self.effective_cwd(),
-                            cancel: self.handle.cancel.lock().clone(),
-                            progress: crate::tool::ProgressSender::new(
-                                self.event_tx.clone(),
-                                id.clone(),
-                                name.clone(),
-                            ),
-                            interaction: self.interaction_tx.clone(),
-                        };
-                        tool.execute(args.clone(), ctx).await
-                    }
-                } else {
-                    ToolResult::error(format!("Tool not found: {}", name))
-                };
-
-                if name == "read" && !result.is_error {
-                    if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
-                        self.read_files.insert(path);
-                    }
-                }
-
-                send_event(
-                    &self.event_tx,
-                    AgentEvent::ToolExecutionEnd {
-                        tool_call_id: id.clone(),
-                        tool_name: name.clone(),
-                        result: result.text_content(),
-                        is_error: result.is_error,
-                    },
-                );
-
+                self.track_read(name, args, &result);
                 tool_results.push(Message::tool_result(id, name, result.content, result.is_error));
 
-                // Check steering after each sequential tool
-                let steering_msgs =
-                    self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
-                if !steering_msgs.is_empty() {
-                    let remaining: Vec<_> = tool_calls[idx + 1..]
-                        .iter()
-                        .map(|(id, name, args)| (id.clone(), name.clone(), args.clone()))
-                        .collect();
-                    self.skip_remaining_tools(&remaining, &mut tool_results);
-                    tool_results.extend(steering_msgs);
+                if self.apply_steering(&tool_calls[idx + 1..], &mut tool_results) {
                     steered = true;
                     break;
                 }
             } else {
-                use tokio::task::JoinSet;
-                let mut join_set = JoinSet::new();
+                // --- Parallel: multiple tools via JoinSet ---
+                let mut join_set = tokio::task::JoinSet::new();
                 let cwd = self.effective_cwd();
-
-                // Pre-check read-before-write guard for each tool (must be sync)
-                let mut guard_errors: std::collections::HashMap<usize, String> =
-                    std::collections::HashMap::new();
-                for &idx in group {
-                    let (_, ref name, ref args) = tool_calls[idx];
-                    if name == "write" || name == "edit" {
-                        if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
-                            if path.exists() && !self.read_files.contains(&path) {
-                                guard_errors.insert(
-                                    idx,
-                                    format!(
-                                        "You must read this file before {}ing it. Use the read tool first.",
-                                        name
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                }
 
                 for &idx in group {
                     let (ref id, ref name, ref args) = tool_calls[idx];
                     let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
+                    let guard_err = self.check_read_guard(name, args);
+                    let validator = self.schema_cache.get(name.as_str()).cloned();
                     let event_tx = self.event_tx.clone();
-                    let cancel = self.handle.cancel.lock().clone();
                     let id = id.clone();
                     let name = name.clone();
                     let args = args.clone();
-                    let validator = self.schema_cache.get(name.as_str()).cloned();
-                    let cwd = cwd.clone();
-                    let guard_err = guard_errors.remove(&idx);
-                    let interaction = self.interaction_tx.clone();
+                    let ctx = crate::tool::ExecutionContext {
+                        cwd: cwd.clone(),
+                        cancel: self.handle.cancel.lock().clone(),
+                        progress: crate::tool::ProgressSender::new(
+                            event_tx.clone(),
+                            id.clone(),
+                            name.clone(),
+                        ),
+                        interaction: self.interaction_tx.clone(),
+                    };
 
                     join_set.spawn(async move {
-                        send_event(
-                            &event_tx,
-                            AgentEvent::ToolExecutionStart {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                arguments: args.clone(),
-                            },
-                        );
-
-                        let result = if let Some(err) = guard_err {
-                            ToolResult::error(err)
-                        } else if let Some(tool) = tool {
-                            let validation_error =
-                                validator.and_then(|v| validate_with_validator(&args, &v));
-                            if let Some(err) = validation_error {
-                                ToolResult::error(err)
-                            } else {
-                                let ctx = crate::tool::ExecutionContext {
-                                    cwd,
-                                    cancel,
-                                    progress: crate::tool::ProgressSender::new(
-                                        event_tx.clone(),
-                                        id.clone(),
-                                        name.clone(),
-                                    ),
-                                    interaction,
-                                };
-                                tool.execute(args, ctx).await
-                            }
-                        } else {
-                            ToolResult::error(format!("Tool not found: {}", name))
-                        };
-
-                        send_event(
-                            &event_tx,
-                            AgentEvent::ToolExecutionEnd {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                result: result.text_content(),
-                                is_error: result.is_error,
-                            },
-                        );
-
-                        (idx, id, name, result)
+                        let result = run_single_tool(
+                            tool, id, name, args, guard_err, validator, event_tx, ctx,
+                        )
+                        .await;
+                        (idx, result)
                     });
                 }
 
-                let mut results_map = std::collections::HashMap::new();
+                // Collect results in original order
+                let mut results_map: HashMap<usize, ToolResult> = HashMap::new();
                 while let Some(join_result) = join_set.join_next().await {
                     match join_result {
-                        Ok((idx, id, name, result)) => {
-                            results_map.insert(idx, (id, name, result));
+                        Ok((idx, result)) => {
+                            results_map.insert(idx, result);
                         }
                         Err(e) => {
                             tracing::error!("Parallel tool task panicked: {}", e);
@@ -820,38 +749,17 @@ impl Agent {
                 }
 
                 for &idx in group {
-                    let (ref orig_id, ref orig_name, ref orig_args) = tool_calls[idx];
-                    let (_, _, result) = results_map.remove(&idx).unwrap_or_else(|| {
-                        (
-                            orig_id.clone(),
-                            orig_name.clone(),
-                            ToolResult::error("Task failed (panicked or cancelled)"),
-                        )
+                    let (ref id, ref name, ref args) = tool_calls[idx];
+                    let result = results_map.remove(&idx).unwrap_or_else(|| {
+                        ToolResult::error("Task failed (panicked or cancelled)")
                     });
-                    if orig_name == "read" && !result.is_error {
-                        if let Some(path) = Self::resolve_tool_path(orig_args, &self.cwd) {
-                            self.read_files.insert(path);
-                        }
-                    }
-                    tool_results.push(Message::tool_result(
-                        orig_id,
-                        orig_name,
-                        result.content,
-                        result.is_error,
-                    ));
+                    self.track_read(name, args, &result);
+                    tool_results
+                        .push(Message::tool_result(id, name, result.content, result.is_error));
                 }
 
-                // Check steering after parallel group
-                let steering_msgs =
-                    self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
-                if !steering_msgs.is_empty() {
-                    let last_idx = *group.last().unwrap();
-                    let remaining: Vec<_> = tool_calls[last_idx + 1..]
-                        .iter()
-                        .map(|(id, name, args)| (id.clone(), name.clone(), args.clone()))
-                        .collect();
-                    self.skip_remaining_tools(&remaining, &mut tool_results);
-                    tool_results.extend(steering_msgs);
+                let after = *group.last().unwrap() + 1;
+                if self.apply_steering(&tool_calls[after..], &mut tool_results) {
                     steered = true;
                     break;
                 }
@@ -1090,6 +998,56 @@ pub(crate) fn send_event(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) 
     if tx.send(event).is_err() {
         tracing::debug!("Event dropped: no active receivers or buffer full");
     }
+}
+
+/// Execute a single tool: emit events, check guard/validation, run, emit end event.
+/// Standalone function so it can be called both inline (sequential) and from a
+/// spawned task (parallel) without borrowing Agent.
+#[allow(clippy::too_many_arguments)]
+async fn run_single_tool(
+    tool: Option<BoxedTool>,
+    id: String,
+    name: String,
+    args: serde_json::Value,
+    guard_error: Option<String>,
+    validator: Option<Arc<jsonschema::Validator>>,
+    event_tx: broadcast::Sender<AgentEvent>,
+    ctx: crate::tool::ExecutionContext,
+) -> ToolResult {
+    send_event(
+        &event_tx,
+        AgentEvent::ToolExecutionStart {
+            tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            arguments: args.clone(),
+        },
+    );
+
+    let result = if let Some(err) = guard_error {
+        ToolResult::error(err)
+    } else if let Some(tool) = tool {
+        let validation_error =
+            validator.and_then(|v| validate_with_validator(&args, &v));
+        if let Some(err) = validation_error {
+            ToolResult::error(err)
+        } else {
+            tool.execute(args, ctx).await
+        }
+    } else {
+        ToolResult::error(format!("Tool not found: {}", name))
+    };
+
+    send_event(
+        &event_tx,
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id: id,
+            tool_name: name,
+            result: result.text_content(),
+            is_error: result.is_error,
+        },
+    );
+
+    result
 }
 
 /// Check if a message has meaningful content worth preserving.

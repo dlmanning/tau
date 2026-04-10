@@ -1,6 +1,6 @@
 //! Subagent spawning — create independent agent instances for parallel work.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -93,6 +93,13 @@ pub struct SpawnRequest {
     pub depth: u32,
 }
 
+/// Whether an agent is currently executing or stored (idle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Running,
+    Idle,
+}
+
 /// Manages subagent lifecycle: spawn, resume, evict.
 pub struct AgentManager {
     agents: tokio::sync::Mutex<VecDeque<(String, ManagedAgent)>>,
@@ -104,6 +111,9 @@ pub struct AgentManager {
     /// wrapped in `AgentEvent::Subagent`.
     parent_event_tx: broadcast::Sender<AgentEvent>,
     agent_tool_factory: parking_lot::Mutex<Option<AgentToolFactory>>,
+    /// Handles for agents that are currently executing (keyed by agent_id).
+    /// Value is (handle, description). Inserted before prompt(), removed after.
+    running_handles: tokio::sync::Mutex<HashMap<String, (AgentHandle, String)>>,
 }
 
 struct ManagedAgent {
@@ -129,6 +139,7 @@ impl AgentManager {
             parent_config,
             parent_event_tx,
             agent_tool_factory: parking_lot::Mutex::new(None),
+            running_handles: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,7 +162,11 @@ impl AgentManager {
     ) -> crate::error::Result<SubagentResult> {
         let agent_id = uuid::Uuid::new_v4().to_string();
         let description = request.description.clone();
-        let (result, agent) = self.run_subagent(&request, cancel, &agent_id).await?;
+        let result = self.run_subagent(&request, cancel, &agent_id).await;
+        // Always clean up running handle (run_agent_inner inserts before prompt,
+        // removes after, but if the future is dropped mid-execution it leaks).
+        self.running_handles.lock().await.remove(&agent_id);
+        let (result, agent) = result?;
         self.store(result.agent_id.clone(), agent, description).await;
         Ok(result)
     }
@@ -182,6 +197,10 @@ impl AgentManager {
                     Err(crate::error::Error::Other("Cancelled by parent".into()))
                 }
             };
+
+            // Clean up running handle (may have been inserted by run_agent_inner
+            // but not removed if the future was dropped by the select above).
+            manager.running_handles.lock().await.remove(&aid);
 
             match result {
                 Ok((subresult, agent)) => {
@@ -309,6 +328,48 @@ impl AgentManager {
             .iter()
             .map(|(id, e)| (id.clone(), e.description.clone()))
             .collect()
+    }
+
+    /// Find an agent by name or ID. Checks running agents first, then stored.
+    /// Name matching is case-insensitive substring on the description.
+    pub async fn find_agent(&self, name_or_id: &str) -> Option<(String, String, AgentStatus)> {
+        // Check running agents (exact ID, then fuzzy description)
+        {
+            let running = self.running_handles.lock().await;
+            if let Some((_, desc)) = running.get(name_or_id) {
+                return Some((name_or_id.to_string(), desc.clone(), AgentStatus::Running));
+            }
+            let needle = name_or_id.to_lowercase();
+            for (id, (_, desc)) in running.iter() {
+                if desc.to_lowercase().contains(&needle) {
+                    return Some((id.clone(), desc.clone(), AgentStatus::Running));
+                }
+            }
+        } // running lock dropped before acquiring agents lock
+
+        // Check stored agents (exact ID, then fuzzy description)
+        let agents = self.agents.lock().await;
+        if let Some((id, e)) = agents.iter().find(|(id, _)| id == name_or_id) {
+            return Some((id.clone(), e.description.clone(), AgentStatus::Idle));
+        }
+        let needle = name_or_id.to_lowercase();
+        for (id, e) in agents.iter() {
+            if e.description.to_lowercase().contains(&needle) {
+                return Some((id.clone(), e.description.clone(), AgentStatus::Idle));
+            }
+        }
+        None
+    }
+
+    /// Send a message to a currently running agent via its steering queue.
+    /// Returns `true` if the agent was found and the message was delivered.
+    pub async fn send_to_running(&self, id: &str, message: Message) -> bool {
+        if let Some((handle, _)) = self.running_handles.lock().await.get(id) {
+            handle.steer(message);
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -448,16 +509,26 @@ impl AgentManager {
 
         // Wire the parent's cancel token to the subagent so that
         // cancelling the parent also cancels this subagent.
+        let cancel_handle = agent_handle.clone();
         let parent_cancel = cancel.clone();
         let cancel_bridge = tokio::spawn(async move {
             parent_cancel.cancelled().await;
-            agent_handle.abort();
+            cancel_handle.abort();
         });
+
+        // Track this agent as running so SendMessage can reach it.
+        // Use a struct guard to ensure cleanup even if the future is dropped.
+        self.running_handles.lock().await.insert(
+            agent_id.to_string(),
+            (agent_handle, req.description.clone()),
+        );
 
         let prompt_result = agent.prompt(&req.prompt).await;
         cancel_bridge.abort();
-
         event_task.abort();
+
+        // Always remove from running handles, regardless of success/failure.
+        self.running_handles.lock().await.remove(agent_id);
 
         prompt_result?;
 
