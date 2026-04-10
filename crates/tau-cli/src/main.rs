@@ -317,12 +317,13 @@ async fn main() -> anyhow::Result<()> {
         20,
     ));
 
-    // Create factory that makes AgentTools referencing this manager
+    // Create factory that makes AgentTools referencing this manager.
+    // The handle parameter ensures background sub-subagents report to the
+    // correct parent rather than always routing to the root agent.
     let mgr_for_factory = manager.clone();
-    let handle_for_factory = agent_handle.clone();
-    manager.set_agent_tool_factory(Arc::new(move |depth| {
+    manager.set_agent_tool_factory(Arc::new(move |depth, handle| {
         let tool = tools::AgentTool::new(mgr_for_factory.clone(), depth)
-            .with_handle(handle_for_factory.clone());
+            .with_handle(handle);
         Arc::new(tool)
     }));
 

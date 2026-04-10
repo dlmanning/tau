@@ -64,11 +64,10 @@ impl std::fmt::Display for AgentType {
     }
 }
 
-/// Callback for receiving events from a running subagent.
-type EventCallback = Arc<dyn Fn(&crate::events::AgentEvent) + Send + Sync>;
-
 /// Factory function to create a depth-limited Agent tool.
-type AgentToolFactory = Arc<dyn Fn(u32) -> BoxedTool + Send + Sync>;
+/// Receives the depth and the spawning agent's handle so background
+/// sub-subagents report to the correct parent.
+type AgentToolFactory = Arc<dyn Fn(u32, AgentHandle) -> BoxedTool + Send + Sync>;
 
 /// Result from a completed subagent.
 #[derive(Debug)]
@@ -94,12 +93,7 @@ pub struct SpawnRequest {
     pub depth: u32,
 }
 
-/// Manages subagent lifecycle: spawn, resume, cancel, evict.
-///
-/// Replaces the old AgentRegistry with additional capabilities:
-/// - Persistent cancel token per agent (resume is cancellable)
-/// - Delta usage tracking (not cumulative)
-/// - Event forwarding for background agents
+/// Manages subagent lifecycle: spawn, resume, evict.
 pub struct AgentManager {
     agents: tokio::sync::Mutex<VecDeque<(String, ManagedAgent)>>,
     max_agents: usize,
@@ -115,8 +109,8 @@ pub struct AgentManager {
 struct ManagedAgent {
     agent: Agent,
     description: String,
-    cancel: CancellationToken,
     usage_at_pause: Usage,
+    messages_at_pause: usize,
 }
 
 impl AgentManager {
@@ -142,7 +136,7 @@ impl AgentManager {
     /// Must be called after construction (breaks circular Arc dependency).
     pub fn set_agent_tool_factory(
         &self,
-        factory: Arc<dyn Fn(u32) -> BoxedTool + Send + Sync>,
+        factory: Arc<dyn Fn(u32, AgentHandle) -> BoxedTool + Send + Sync>,
     ) {
         *self.agent_tool_factory.lock() = Some(factory);
     }
@@ -217,6 +211,7 @@ impl AgentManager {
                     ));
                 }
             }
+
         });
 
         agent_id
@@ -247,13 +242,11 @@ impl AgentManager {
         // Use the stored snapshot (not current total_usage) for correct delta
         let usage_before = entry.usage_at_pause.clone();
 
-        let event_cb = self.event_forwarder(id, &entry.description);
-        let mut events = entry.agent.subscribe();
-        let event_task = tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                event_cb(&event);
-            }
-        });
+        let event_task = self.spawn_event_forwarder(
+            entry.agent.subscribe(),
+            id,
+            &entry.description,
+        );
 
         let agent_handle = entry.agent.handle();
         let bridge = tokio::spawn({
@@ -272,9 +265,8 @@ impl AgentManager {
         let delta_input = current_usage.input.saturating_sub(usage_before.input);
         let delta_output = current_usage.output.saturating_sub(usage_before.output);
 
-        let tool_use_count = entry
-            .agent
-            .messages()
+        let msg_start = entry.messages_at_pause.min(entry.agent.messages().len());
+        let tool_use_count = entry.agent.messages()[msg_start..]
             .iter()
             .map(|m| match m {
                 Message::Assistant { content, .. } => content
@@ -289,6 +281,7 @@ impl AgentManager {
 
         record_transcript(id, entry.agent.messages()).await;
         entry.usage_at_pause = current_usage;
+        entry.messages_at_pause = entry.agent.messages().len();
         self.agents
             .lock()
             .await
@@ -308,16 +301,8 @@ impl AgentManager {
         })
     }
 
-    /// Cancel a specific agent.
-    pub async fn cancel(&self, agent_id: &str) {
-        let agents = self.agents.lock().await;
-        if let Some((_, entry)) = agents.iter().find(|(id, _)| id == agent_id) {
-            entry.cancel.cancel();
-        }
-    }
-
-    /// List all stored agents (id, description).
-    pub async fn list(&self) -> Vec<(String, String)> {
+    #[cfg(test)]
+    async fn list(&self) -> Vec<(String, String)> {
         self.agents
             .lock()
             .await
@@ -326,28 +311,30 @@ impl AgentManager {
             .collect()
     }
 
-    /// Number of stored agents.
-    pub async fn len(&self) -> usize {
+    #[cfg(test)]
+    async fn len(&self) -> usize {
         self.agents.lock().await.len()
     }
 
-    /// Whether the manager has no stored agents.
-    pub async fn is_empty(&self) -> bool {
-        self.agents.lock().await.is_empty()
-    }
-
-    /// Create an event callback that wraps child events in `AgentEvent::Subagent`
-    /// and emits them on the parent's event channel.
-    fn event_forwarder(&self, agent_id: &str, description: &str) -> EventCallback {
+    /// Spawn a task that forwards events from a subagent's broadcast channel
+    /// to the parent's event channel, wrapped in `AgentEvent::Subagent`.
+    fn spawn_event_forwarder(
+        &self,
+        mut events: broadcast::Receiver<AgentEvent>,
+        agent_id: &str,
+        description: &str,
+    ) -> tokio::task::JoinHandle<()> {
         let tx = self.parent_event_tx.clone();
         let agent_id = agent_id.to_string();
         let desc = description.to_string();
-        Arc::new(move |event: &crate::events::AgentEvent| {
-            let _ = tx.send(crate::events::AgentEvent::Subagent {
-                agent_id: agent_id.clone(),
-                description: desc.clone(),
-                event: Box::new(event.clone()),
-            });
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                let _ = tx.send(AgentEvent::Subagent {
+                    agent_id: agent_id.clone(),
+                    description: desc.clone(),
+                    event: Box::new(event),
+                });
+            }
         })
     }
 
@@ -416,14 +403,6 @@ impl AgentManager {
                     .unwrap_or_else(|_| ".".into())
             });
 
-        let factory = self.agent_tool_factory.lock().clone();
-        let tools = build_tool_set(
-            &req.agent_type,
-            &self.tools,
-            req.depth,
-            &factory,
-        );
-
         let mut agent_cfg = self.parent_config.clone();
         agent_cfg.system_prompt = None;
         agent_cfg.max_turns = Some(req.agent_type.max_turns());
@@ -433,6 +412,17 @@ impl AgentManager {
 
         let mut agent = Agent::new(agent_cfg, self.transport.clone());
         agent.set_cwd(&cwd);
+
+        let agent_handle = agent.handle();
+
+        let factory = self.agent_tool_factory.lock().clone();
+        let tools = build_tool_set(
+            &req.agent_type,
+            &self.tools,
+            req.depth,
+            &factory,
+            &agent_handle,
+        );
         for tool in tools {
             agent.add_tool(tool);
         }
@@ -450,18 +440,14 @@ impl AgentManager {
         );
         agent.set_system_prompt(system_prompt);
 
-        let on_event = self.event_forwarder(agent_id, &req.description);
-        let mut events = agent.subscribe();
-        let cb = on_event.clone();
-        let event_task = tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                cb(&event);
-            }
-        });
+        let event_task = self.spawn_event_forwarder(
+            agent.subscribe(),
+            agent_id,
+            &req.description,
+        );
 
         // Wire the parent's cancel token to the subagent so that
         // cancelling the parent also cancels this subagent.
-        let agent_handle = agent.handle();
         let parent_cancel = cancel.clone();
         let cancel_bridge = tokio::spawn(async move {
             parent_cancel.cancelled().await;
@@ -509,13 +495,14 @@ impl AgentManager {
             agents.pop_front();
         }
         let usage = agent.state().total_usage.clone();
+        let message_count = agent.messages().len();
         agents.push_back((
             id,
             ManagedAgent {
                 agent,
                 description,
-                cancel: CancellationToken::new(),
                 usage_at_pause: usage,
+                messages_at_pause: message_count,
             },
         ));
     }
@@ -557,6 +544,7 @@ fn build_tool_set(
     all_tools: &[BoxedTool],
     depth: u32,
     agent_tool_factory: &Option<AgentToolFactory>,
+    handle: &AgentHandle,
 ) -> Vec<BoxedTool> {
     let mut tools: Vec<BoxedTool> = match agent_type {
         AgentType::Explore | AgentType::Plan => {
@@ -576,7 +564,7 @@ fn build_tool_set(
 
     if matches!(agent_type, AgentType::GeneralPurpose) && depth + 1 < MAX_AGENT_DEPTH {
         if let Some(factory) = agent_tool_factory {
-            tools.push(factory(depth + 1));
+            tools.push(factory(depth + 1, handle.clone()));
         }
     }
 
@@ -729,7 +717,7 @@ mod tests {
     use tau_ai::{AssistantMetadata, Content, Message};
 
     /// Local alias for the (now-private) factory type, used in tests.
-    type TestAgentToolFactory = Arc<dyn Fn(u32) -> BoxedTool + Send + Sync>;
+    type TestAgentToolFactory = Arc<dyn Fn(u32, AgentHandle) -> BoxedTool + Send + Sync>;
 
     struct MockTool {
         tool_name: &'static str,
@@ -803,10 +791,15 @@ mod tests {
         assert_eq!(AgentType::Plan.max_turns(), 15);
     }
 
+    fn test_handle() -> AgentHandle {
+        AgentHandle::new()
+    }
+
     #[test]
     fn test_explore_gets_read_only_tools() {
         let all = mock_tools();
-        let filtered = build_tool_set(&AgentType::Explore, &all, 0, &None);
+        let handle = test_handle();
+        let filtered = build_tool_set(&AgentType::Explore, &all, 0, &None, &handle);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -822,7 +815,8 @@ mod tests {
     #[test]
     fn test_plan_gets_read_only_tools() {
         let all = mock_tools();
-        let filtered = build_tool_set(&AgentType::Plan, &all, 0, &None);
+        let handle = test_handle();
+        let filtered = build_tool_set(&AgentType::Plan, &all, 0, &None, &handle);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert_eq!(names.len(), 5);
         assert!(!names.contains(&"bash"));
@@ -832,7 +826,8 @@ mod tests {
     #[test]
     fn test_general_purpose_gets_all_except_agent() {
         let all = mock_tools();
-        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &None);
+        let handle = test_handle();
+        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &None, &handle);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read"));
@@ -843,8 +838,9 @@ mod tests {
     #[test]
     fn test_general_purpose_gets_agent_tool_from_factory() {
         let all = mock_tools();
-        let factory: TestAgentToolFactory = Arc::new(|_depth| Arc::new(MockTool { tool_name: "agent" }));
-        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory));
+        let handle = test_handle();
+        let factory: TestAgentToolFactory = Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
+        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory), &handle);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"agent")); // added by factory
     }
@@ -852,13 +848,15 @@ mod tests {
     #[test]
     fn test_depth_limit_excludes_agent_tool() {
         let all = mock_tools();
-        let factory: TestAgentToolFactory = Arc::new(|_depth| Arc::new(MockTool { tool_name: "agent" }));
+        let handle = test_handle();
+        let factory: TestAgentToolFactory = Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
         // At MAX_AGENT_DEPTH - 1, the next level would be MAX_AGENT_DEPTH -> excluded
         let filtered = build_tool_set(
             &AgentType::GeneralPurpose,
             &all,
             MAX_AGENT_DEPTH - 1,
             &Some(factory),
+            &handle,
         );
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"agent")); // depth exceeded
@@ -923,88 +921,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_event_callback_receives_all_events() {
+    async fn test_event_forwarder_wraps_events() {
         use crate::events::AgentEvent;
 
-        let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+        let manager = make_test_manager(20);
 
-        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let received_clone = received.clone();
-        let cb: EventCallback = Arc::new(move |event: &AgentEvent| {
-            let msg = match event {
-                AgentEvent::ToolExecutionStart { tool_name, .. } => {
-                    format!("[{}...]", tool_name)
-                }
-                AgentEvent::ToolExecutionEnd {
-                    tool_name, is_error, ..
-                } => {
-                    if *is_error {
-                        format!("[{} error]", tool_name)
-                    } else {
-                        format!("[{} done]", tool_name)
-                    }
-                }
-                AgentEvent::TurnEnd { turn_number, .. } => {
-                    format!("[turn {}]", turn_number)
-                }
-                _ => return,
-            };
-            received_clone.lock().unwrap().push(msg);
-        });
+        // Create a child broadcast channel (simulates a subagent's event_tx)
+        let (child_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(16);
 
-        // Subscribe and spawn forwarder (same logic as run_agent_inner)
-        let mut events = tx.subscribe();
-        let cb_clone = cb.clone();
-        let task = tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                cb_clone(&event);
-            }
-        });
+        // Subscribe to the parent channel that the manager forwards to
+        let mut parent_rx = manager.parent_event_tx.subscribe();
 
-        // Emit events -- tool start, tool end (success), tool error, TurnEnd
-        tx.send(AgentEvent::ToolExecutionStart {
-            tool_call_id: "c1".into(),
-            tool_name: "bash".into(),
-            arguments: serde_json::json!({}),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolExecutionEnd {
-            tool_call_id: "c1".into(),
-            tool_name: "bash".into(),
-            result: "ok".into(),
-            is_error: false,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolExecutionStart {
-            tool_call_id: "c2".into(),
-            tool_name: "read".into(),
-            arguments: serde_json::json!({}),
-        })
-        .unwrap();
-        tx.send(AgentEvent::ToolExecutionEnd {
-            tool_call_id: "c2".into(),
-            tool_name: "read".into(),
-            result: "failed".into(),
-            is_error: true,
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnEnd {
-            turn_number: 1,
-            message: tau_ai::Message::assistant_empty(),
-            usage: tau_ai::Usage::default(),
-        })
-        .unwrap();
+        // Spawn the forwarder
+        let task = manager.spawn_event_forwarder(
+            child_tx.subscribe(),
+            "agent-123",
+            "test task",
+        );
 
-        drop(tx);
+        // Emit events on the child channel
+        child_tx
+            .send(AgentEvent::ToolExecutionStart {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        child_tx
+            .send(AgentEvent::ToolExecutionEnd {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                result: "ok".into(),
+                is_error: false,
+            })
+            .unwrap();
+        child_tx
+            .send(AgentEvent::TurnEnd {
+                turn_number: 1,
+                message: tau_ai::Message::assistant_empty(),
+                usage: tau_ai::Usage::default(),
+            })
+            .unwrap();
+
+        drop(child_tx);
         let _ = task.await;
 
-        let msgs = received.lock().unwrap();
-        assert_eq!(msgs.len(), 5);
-        assert_eq!(msgs[0], "[bash...]");
-        assert_eq!(msgs[1], "[bash done]");
-        assert_eq!(msgs[2], "[read...]");
-        assert_eq!(msgs[3], "[read error]");
-        assert_eq!(msgs[4], "[turn 1]");
+        // Verify events arrived wrapped in Subagent
+        let mut received = vec![];
+        while let Ok(event) = parent_rx.try_recv() {
+            if let AgentEvent::Subagent {
+                agent_id,
+                description,
+                event,
+            } = event
+            {
+                assert_eq!(agent_id, "agent-123");
+                assert_eq!(description, "test task");
+                let label = match *event {
+                    AgentEvent::ToolExecutionStart { ref tool_name, .. } => {
+                        format!("[{}...]", tool_name)
+                    }
+                    AgentEvent::ToolExecutionEnd {
+                        ref tool_name,
+                        is_error,
+                        ..
+                    } => {
+                        if is_error {
+                            format!("[{} error]", tool_name)
+                        } else {
+                            format!("[{} done]", tool_name)
+                        }
+                    }
+                    AgentEvent::TurnEnd { turn_number, .. } => {
+                        format!("[turn {}]", turn_number)
+                    }
+                    _ => continue,
+                };
+                received.push(label);
+            }
+        }
+
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0], "[bash...]");
+        assert_eq!(received[1], "[bash done]");
+        assert_eq!(received[2], "[turn 1]");
     }
 
     struct DummyTransport;

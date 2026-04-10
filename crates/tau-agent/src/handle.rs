@@ -87,9 +87,6 @@ impl AgentHandle {
     /// Wait until the agent loop becomes idle, with a timeout.
     /// Returns `true` if idle was reached, `false` on timeout.
     pub async fn wait_for_idle_timeout(&self, timeout: std::time::Duration) -> bool {
-        if !self.is_running.load(Ordering::Acquire) {
-            return true;
-        }
         tokio::time::timeout(timeout, self.wait_for_idle())
             .await
             .is_ok()
