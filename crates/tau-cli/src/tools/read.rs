@@ -87,6 +87,10 @@ impl Tool for ReadTool {
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
 
+        // Track this file as read for the read-before-write policy
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        ctx.file_access.lock().mark_read(canonical);
+
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 

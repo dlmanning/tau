@@ -1,16 +1,100 @@
 //! Tool trait and execution
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tau_ai::Content;
+use tau_ai::{Content, Message};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::send_event;
 use crate::events::AgentEvent;
+
+/// Tracks which files have been read so write/edit tools can enforce
+/// a read-before-write policy. Shared via `Arc<Mutex<...>>` on `ExecutionContext`.
+#[derive(Default)]
+pub struct FileAccessTracker {
+    read_files: HashSet<PathBuf>,
+}
+
+impl FileAccessTracker {
+    /// Record that a file has been successfully read.
+    pub fn mark_read(&mut self, path: impl Into<PathBuf>) {
+        self.read_files.insert(path.into());
+    }
+
+    /// Check that a file has been read before writing. Returns `Ok(())` if the
+    /// file doesn't exist yet (new file) or has been read. Returns an error
+    /// message if the file exists but hasn't been read.
+    pub fn require_read(&self, path: &Path) -> Result<(), String> {
+        if path.exists() && !self.read_files.contains(path) {
+            Err("You must read this file before editing it. Use the read tool first.".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Clear all tracked reads.
+    pub fn clear(&mut self) {
+        self.read_files.clear();
+    }
+
+    /// Rebuild from conversation history (for session restore).
+    pub fn rebuild_from_messages(&mut self, messages: &[Message], cwd: &Option<PathBuf>) {
+        self.read_files.clear();
+        for msg in messages {
+            if let Message::Assistant { content, .. } = msg {
+                for c in content {
+                    if let Content::ToolCall {
+                        name, arguments, id,
+                    } = c
+                    {
+                        if name == "read" {
+                            let has_success = messages.iter().any(|m| {
+                                matches!(m, Message::ToolResult { tool_call_id, is_error, .. }
+                                    if tool_call_id == id && !is_error)
+                            });
+                            if has_success {
+                                if let Some(path) = resolve_tool_path(arguments, cwd) {
+                                    self.read_files.insert(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a file path from tool arguments, handling `~/`, relative paths,
+/// and canonicalization.
+pub fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
+    let path_str = args.get("path").and_then(|v| v.as_str())?;
+    let path = if let Some(rest) = path_str.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path_str))
+    } else if path_str == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        let p = PathBuf::from(path_str);
+        if p.is_absolute() {
+            p
+        } else {
+            let base = cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            base.join(p)
+        }
+    };
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
 
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +218,8 @@ pub struct ExecutionContext {
     /// Channel for tools that need user input (e.g. AskUserQuestion).
     /// `None` in non-interactive contexts or subagents.
     pub interaction: Option<tokio::sync::mpsc::Sender<crate::interaction::InteractionRequest>>,
+    /// File access tracker for read-before-write policy.
+    pub file_access: Arc<Mutex<FileAccessTracker>>,
 }
 
 /// Trait for executable tools
@@ -223,6 +309,7 @@ mod tests {
             cancel,
             progress,
             interaction: None,
+            file_access: Arc::new(Mutex::new(FileAccessTracker::default())),
         };
 
         let result = tool.execute(args, ctx).await;
@@ -283,5 +370,39 @@ mod tests {
         let api_tool = to_api_tool(&tool);
         assert_eq!(api_tool.name, "echo");
         assert_eq!(api_tool.description, "Echoes input");
+    }
+
+    #[test]
+    fn test_file_access_new_file_allowed() {
+        let tracker = FileAccessTracker::default();
+        // Non-existent path should pass (new file creation is allowed)
+        let result = tracker.require_read(Path::new("/nonexistent/path/to/file.txt"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_file_access_read_then_write() {
+        let mut tracker = FileAccessTracker::default();
+        let path = PathBuf::from("/tmp/test-file-access-tracker");
+        // Create a temp file so it "exists"
+        std::fs::write(&path, "test").ok();
+        // Before reading: require_read should fail
+        let result = tracker.require_read(&path);
+        assert!(result.is_err());
+        // After reading: require_read should pass
+        tracker.mark_read(path.clone());
+        let result = tracker.require_read(&path);
+        assert!(result.is_ok());
+        // Cleanup
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_file_access_clear() {
+        let mut tracker = FileAccessTracker::default();
+        tracker.mark_read("/some/path");
+        tracker.clear();
+        // After clear, the path is forgotten
+        assert!(tracker.read_files.is_empty());
     }
 }

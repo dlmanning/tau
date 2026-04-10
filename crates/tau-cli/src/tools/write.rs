@@ -80,6 +80,12 @@ impl Tool for WriteTool {
             return ToolResult::error("Operation cancelled");
         }
 
+        // Enforce read-before-write: must read existing files before overwriting
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Err(e) = ctx.file_access.lock().require_read(&canonical) {
+            return ToolResult::error(e);
+        }
+
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent).await {

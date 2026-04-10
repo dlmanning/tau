@@ -1,7 +1,7 @@
 //! Agent state management and execution
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
@@ -84,9 +84,8 @@ pub struct Agent {
 
     /// Working directory override (set for subagents with custom CWDs).
     cwd: Option<PathBuf>,
-    /// Files that have been read in this conversation.
-    /// Write/Edit tools require a prior read for existing files.
-    read_files: HashSet<PathBuf>,
+    /// File access tracker for read-before-write policy.
+    file_access: Arc<parking_lot::Mutex<crate::tool::FileAccessTracker>>,
     /// Optional interaction channel for tools that need user input.
     interaction_tx: Option<tokio::sync::mpsc::Sender<crate::interaction::InteractionRequest>>,
 }
@@ -105,7 +104,7 @@ impl Agent {
             transform_context: None,
             schema_cache: HashMap::new(),
             cwd: None,
-            read_files: HashSet::new(),
+            file_access: Arc::new(parking_lot::Mutex::new(crate::tool::FileAccessTracker::default())),
             interaction_tx: None,
         }
     }
@@ -206,13 +205,15 @@ impl Agent {
         self.conversation.total_usage = Usage::default();
         self.conversation.error = None;
         self.conversation.previous_summary = None;
-        self.read_files.clear();
+        self.file_access.lock().clear();
     }
 
     /// Set messages (for loading from session)
     pub fn set_messages(&mut self, messages: Vec<Message>) {
+        self.file_access
+            .lock()
+            .rebuild_from_messages(&messages, &self.cwd);
         self.conversation.messages = messages;
-        self.rebuild_read_files();
     }
 
     /// Set the previous summary (for session resume after compaction)
@@ -516,85 +517,6 @@ impl Agent {
         false
     }
 
-    /// Resolve a path from tool arguments: expand `~/`, join relative paths with
-    /// the given CWD (or process CWD), and canonicalize if the file exists
-    /// (to normalize symlinks and `..` components).
-    fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
-        let path_str = args.get("path").and_then(|v| v.as_str())?;
-        let path = if let Some(rest) = path_str.strip_prefix("~/") {
-            dirs::home_dir()
-                .map(|h| h.join(rest))
-                .unwrap_or_else(|| PathBuf::from(path_str))
-        } else if path_str == "~" {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            let p = PathBuf::from(path_str);
-            if p.is_absolute() {
-                p
-            } else {
-                let base = cwd
-                    .clone()
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_default();
-                base.join(p)
-            }
-        };
-        // Canonicalize to normalize symlinks and .. components.
-        // Falls back to the un-canonicalized path for new files.
-        Some(std::fs::canonicalize(&path).unwrap_or(path))
-    }
-
-    /// Rebuild `read_files` from conversation messages (used after session restore).
-    fn rebuild_read_files(&mut self) {
-        self.read_files.clear();
-        let cwd = self.cwd.clone();
-        // Scan assistant messages for read tool calls that have successful results
-        for msg in &self.conversation.messages {
-            if let Message::Assistant { content, .. } = msg {
-                for c in content {
-                    if let Content::ToolCall { name, arguments, id } = c {
-                        if name == "read" {
-                            let has_success = self.conversation.messages.iter().any(|m| {
-                                matches!(m, Message::ToolResult { tool_call_id, is_error, .. }
-                                    if tool_call_id == id && !is_error)
-                            });
-                            if has_success {
-                                if let Some(path) = Self::resolve_tool_path(arguments, &cwd) {
-                                    self.read_files.insert(path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check the read-before-write guard for write/edit tools.
-    fn check_read_guard(&self, name: &str, args: &serde_json::Value) -> Option<String> {
-        if name != "write" && name != "edit" {
-            return None;
-        }
-        let path = Self::resolve_tool_path(args, &self.cwd)?;
-        if path.exists() && !self.read_files.contains(&path) {
-            Some(format!(
-                "You must read this file before {}ing it. Use the read tool first.",
-                name
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Track a successful read in the read_files set.
-    fn track_read(&mut self, name: &str, args: &serde_json::Value, result: &ToolResult) {
-        if name == "read" && !result.is_error {
-            if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
-                self.read_files.insert(path);
-            }
-        }
-    }
-
     /// Drain steering queue. If non-empty, skip all remaining tool calls
     /// and append the steering messages. Returns true if steered.
     fn apply_steering(
@@ -669,7 +591,6 @@ impl Agent {
                 let idx = group[0];
                 let (ref id, ref name, ref args) = tool_calls[idx];
                 let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
-                let guard_err = self.check_read_guard(name, args);
                 let validator = self.schema_cache.get(name.as_str()).cloned();
 
                 let cancel = self.handle.cancel.lock().clone();
@@ -678,7 +599,6 @@ impl Agent {
                     id.clone(),
                     name.clone(),
                     args.clone(),
-                    guard_err,
                     validator,
                     self.event_tx.clone(),
                     crate::tool::ExecutionContext {
@@ -690,11 +610,11 @@ impl Agent {
                             name.clone(),
                         ),
                         interaction: self.interaction_tx.clone(),
+                        file_access: self.file_access.clone(),
                     },
                 )
                 .await;
 
-                self.track_read(name, args, &result);
                 tool_results.push(Message::tool_result(id, name, result.content, result.is_error));
 
                 if self.apply_steering(&tool_calls[idx + 1..], &mut tool_results) {
@@ -709,7 +629,6 @@ impl Agent {
                 for &idx in group {
                     let (ref id, ref name, ref args) = tool_calls[idx];
                     let tool = self.tools.iter().find(|t| t.name() == name.as_str()).cloned();
-                    let guard_err = self.check_read_guard(name, args);
                     let validator = self.schema_cache.get(name.as_str()).cloned();
                     let event_tx = self.event_tx.clone();
                     let id = id.clone();
@@ -724,13 +643,12 @@ impl Agent {
                             name.clone(),
                         ),
                         interaction: self.interaction_tx.clone(),
+                        file_access: self.file_access.clone(),
                     };
 
                     join_set.spawn(async move {
-                        let result = run_single_tool(
-                            tool, id, name, args, guard_err, validator, event_tx, ctx,
-                        )
-                        .await;
+                        let result =
+                            run_single_tool(tool, id, name, args, validator, event_tx, ctx).await;
                         (idx, result)
                     });
                 }
@@ -749,11 +667,10 @@ impl Agent {
                 }
 
                 for &idx in group {
-                    let (ref id, ref name, ref args) = tool_calls[idx];
+                    let (ref id, ref name, _) = tool_calls[idx];
                     let result = results_map.remove(&idx).unwrap_or_else(|| {
                         ToolResult::error("Task failed (panicked or cancelled)")
                     });
-                    self.track_read(name, args, &result);
                     tool_results
                         .push(Message::tool_result(id, name, result.content, result.is_error));
                 }
@@ -1003,13 +920,11 @@ pub(crate) fn send_event(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) 
 /// Execute a single tool: emit events, check guard/validation, run, emit end event.
 /// Standalone function so it can be called both inline (sequential) and from a
 /// spawned task (parallel) without borrowing Agent.
-#[allow(clippy::too_many_arguments)]
 async fn run_single_tool(
     tool: Option<BoxedTool>,
     id: String,
     name: String,
     args: serde_json::Value,
-    guard_error: Option<String>,
     validator: Option<Arc<jsonschema::Validator>>,
     event_tx: broadcast::Sender<AgentEvent>,
     ctx: crate::tool::ExecutionContext,
@@ -1023,11 +938,8 @@ async fn run_single_tool(
         },
     );
 
-    let result = if let Some(err) = guard_error {
-        ToolResult::error(err)
-    } else if let Some(tool) = tool {
-        let validation_error =
-            validator.and_then(|v| validate_with_validator(&args, &v));
+    let result = if let Some(tool) = tool {
+        let validation_error = validator.and_then(|v| validate_with_validator(&args, &v));
         if let Some(err) = validation_error {
             ToolResult::error(err)
         } else {

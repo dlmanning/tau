@@ -92,6 +92,12 @@ impl Tool for EditTool {
             return ToolResult::error("Operation cancelled");
         }
 
+        // Enforce read-before-write: must read existing files before editing
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Err(e) = ctx.file_access.lock().require_read(&canonical) {
+            return ToolResult::error(e);
+        }
+
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),

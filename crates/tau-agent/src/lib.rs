@@ -23,5 +23,7 @@ pub use error::Error;
 pub use events::AgentEvent;
 pub use handle::AgentHandle;
 pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
-pub use tool::{Concurrency, ExecutionContext, ProgressSender, Tool, ToolResult};
+pub use tool::{
+    Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
+};
 pub use transport::Transport;
