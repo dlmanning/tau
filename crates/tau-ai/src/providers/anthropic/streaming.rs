@@ -11,10 +11,6 @@ use crate::{
     types::{Api, Model},
 };
 
-// ============================================================================
-// SSE event deserialization types
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub(super) struct MessageStartEvent {
     pub message: MessageInfo,
@@ -116,10 +112,6 @@ pub(super) struct ApiError {
     pub error_type: String,
     pub message: String,
 }
-
-// ============================================================================
-// Stream creation
-// ============================================================================
 
 /// Create the event stream from SSE events
 pub(super) fn create_stream(

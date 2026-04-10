@@ -14,10 +14,8 @@ impl ModelCommand {
         available_models: &[Model],
     ) -> CommandResult {
         if args.is_empty() {
-            // Open model selector (TUI) or list models (CLI)
             CommandResult::OpenModelSelector
         } else {
-            // Try to find and switch to a model
             match find_model(args, available_models) {
                 Some(model) => CommandResult::ChangeModel(model),
                 None => CommandResult::Message(format!(
@@ -41,7 +39,6 @@ fn list_models(current: &Model, models: &[Model]) -> String {
 
     let mut output = String::from("Available models:\n");
 
-    // Group by provider
     let mut by_provider: std::collections::HashMap<String, Vec<&Model>> =
         std::collections::HashMap::new();
 
@@ -67,12 +64,10 @@ fn list_models(current: &Model, models: &[Model]) -> String {
 fn find_model(query: &str, models: &[Model]) -> Option<Model> {
     let query_lower = query.to_lowercase();
 
-    // Exact match first
     if let Some(model) = models.iter().find(|m| m.id.to_lowercase() == query_lower) {
         return Some(model.clone());
     }
 
-    // Partial match
     if let Some(model) = models
         .iter()
         .find(|m| m.id.to_lowercase().contains(&query_lower))
@@ -80,7 +75,6 @@ fn find_model(query: &str, models: &[Model]) -> Option<Model> {
         return Some(model.clone());
     }
 
-    // Match by name
     models
         .iter()
         .find(|m| m.name.to_lowercase().contains(&query_lower))

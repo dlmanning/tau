@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 
 use super::storage::OAuthCredentials;
 
-// OAuth constants for Anthropic
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
@@ -14,12 +13,10 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference";
 
 /// Generate PKCE verifier and challenge
 fn generate_pkce() -> (String, String) {
-    // Generate 32 random bytes for verifier
     let mut verifier_bytes = [0u8; 32];
     getrandom::fill(&mut verifier_bytes).expect("Failed to generate random bytes");
     let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
 
-    // Generate SHA-256 challenge from verifier
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     let challenge_bytes = hasher.finalize();
@@ -44,7 +41,6 @@ where
 {
     let (verifier, challenge) = generate_pkce();
 
-    // Build authorization URL
     let auth_params = [
         ("code", "true"),
         ("client_id", CLIENT_ID),
@@ -64,19 +60,15 @@ where
 
     let auth_url = format!("{}?{}", AUTHORIZE_URL, params_str);
 
-    // Notify caller of auth URL
     on_auth_url(auth_url);
 
-    // Wait for authorization code from user
     let auth_code = on_prompt_code().await;
     let auth_code = auth_code.trim();
 
-    // Parse code#state format
     let (code, state) = auth_code
         .split_once('#')
         .ok_or_else(|| "Invalid authorization code format. Expected: code#state".to_string())?;
 
-    // Exchange code for tokens
     let client = reqwest::Client::new();
     let token_request = serde_json::json!({
         "grant_type": "authorization_code",

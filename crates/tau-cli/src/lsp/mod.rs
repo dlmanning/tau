@@ -34,7 +34,6 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Convert a file path to a file:// URI with proper percent-encoding.
 fn file_uri(path: &Path) -> anyhow::Result<Uri> {
-    // Percent-encode each path component, preserving /
     let encoded: String = path
         .components()
         .map(|c| {
@@ -54,7 +53,6 @@ fn file_uri(path: &Path) -> anyhow::Result<Uri> {
 fn uri_to_path(uri: &Uri) -> String {
     let s = uri.as_str();
     let path = s.strip_prefix("file://").unwrap_or(s);
-    // Decode percent-encoding
     urlencoding::decode(path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| path.to_string())
@@ -107,12 +105,10 @@ impl LspManager {
 
         let mut servers = self.servers.lock().await;
 
-        // Check if cached server is still alive
         if let Some(client) = servers.get(ext) {
             if client.is_alive().await {
                 return Ok(client.clone());
             }
-            // Dead server — remove stale entries and opened_files tracking
             tracing::warn!("LSP server {} died, restarting", config.command);
             for (e, _) in &config.extensions {
                 servers.remove(e);
@@ -124,7 +120,6 @@ impl LspManager {
         let client =
             LspClient::spawn(&config.command, &config.args, &self.workspace_root).await?;
 
-        // Initialize
         #[allow(deprecated)] // root_uri still needed by many servers
         let init_params = InitializeParams {
             process_id: Some(std::process::id()),
@@ -184,7 +179,6 @@ impl LspManager {
             return Ok(());
         }
 
-        // Check file size before reading
         let metadata = tokio::fs::metadata(path).await?;
         if metadata.len() > MAX_FILE_SIZE {
             return Err(anyhow::anyhow!(
@@ -390,10 +384,6 @@ impl LspManager {
     }
 }
 
-// ============================================================================
-// Result formatters
-// ============================================================================
-
 fn format_definition_result(result: Option<GotoDefinitionResponse>) -> String {
     match result {
         None => "No definition found".into(),
@@ -447,7 +437,6 @@ fn format_references_result(result: Option<Vec<Location>>) -> String {
         _ => return "No references found".into(),
     };
 
-    // Group by file
     let mut by_file: HashMap<String, Vec<String>> = HashMap::new();
     for loc in &locs {
         let path = uri_to_path(&loc.uri);

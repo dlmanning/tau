@@ -9,10 +9,8 @@ pub struct ThinkingCommand;
 impl ThinkingCommand {
     pub fn execute(args: &str, current: ReasoningLevel) -> CommandResult {
         if args.is_empty() {
-            // Show current level and options
             CommandResult::Message(show_levels(current))
         } else {
-            // Try to set level
             match parse_level(args) {
                 Some(level) => CommandResult::ChangeReasoning(level),
                 None => CommandResult::Message(format!(

@@ -41,7 +41,7 @@ tracing-subscriber = { workspace = true }
 tokio-util = "0.7"
 lsp-types = "0.97"
 reqwest = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
-getrandom = "0.3"
+getrandom = "0.4"
 urlencoding = "2.1"

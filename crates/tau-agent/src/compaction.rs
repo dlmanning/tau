@@ -66,8 +66,6 @@ struct CutPointResult {
     is_split_turn: bool,
 }
 
-// --- Token Estimation ---
-
 /// Estimate token count for a single message (chars/4 heuristic)
 pub fn estimate_tokens(message: &Message) -> u32 {
     let char_count: usize = match message {
@@ -104,8 +102,6 @@ fn content_char_count(content: &[Content]) -> usize {
         })
         .sum()
 }
-
-// --- Message Serialization ---
 
 /// Serialize messages to plain text for the summarization prompt.
 /// Uses a human-readable format to prevent the LLM from trying to "continue" the conversation.
@@ -240,8 +236,6 @@ fn format_tool_args(args: &serde_json::Value) -> String {
     }
 }
 
-// --- File Operation Tracking ---
-
 /// Tool names that perform read-only file operations.
 const READ_TOOLS: &[&str] = &["read", "glob", "grep", "list"];
 /// Tool names that perform file modifications.
@@ -286,8 +280,6 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 
     (read_files, modified_files)
 }
-
-// --- Cut Point Algorithm ---
 
 /// Find where to cut messages for compaction.
 /// Walks backwards from the end, keeping at least `keep_recent_tokens` tokens.
@@ -391,8 +383,6 @@ fn find_turn_start(messages: &[Message], from: usize) -> usize {
     idx
 }
 
-// --- Summarization Prompts ---
-
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
 You are a specialized summarization model. Your task is to create a comprehensive \
 yet concise summary of a coding conversation. This summary will replace the original \
@@ -449,8 +439,6 @@ what the assistant was doing and what tool calls were made.
 {conversation}
 </partial-turn>";
 
-// --- Main Compaction Function ---
-
 /// Run compaction on the given messages.
 ///
 /// This generates a summary of older messages by calling the LLM, and returns
@@ -464,16 +452,12 @@ pub async fn compact(
 ) -> Result<CompactionResult, String> {
     let tokens_before = estimate_total_tokens(messages);
 
-    // Find the cut point
     let cut = find_cut_point(messages, config.keep_recent_tokens)
         .ok_or_else(|| "Not enough messages to compact".to_string())?;
 
     let messages_to_summarize = &messages[..cut.first_kept_index];
 
-    // Extract file operations
     let (read_files, modified_files) = extract_file_operations(messages_to_summarize);
-
-    // Serialize messages to text
     let conversation_text = serialize_messages_for_summary(messages_to_summarize);
 
     let read_files_str = if read_files.is_empty() {
@@ -487,7 +471,6 @@ pub async fn compact(
         modified_files.join(", ")
     };
 
-    // Build the summarization prompt
     let prompt = if let Some(prev_summary) = previous_summary {
         UPDATE_SUMMARIZATION_PROMPT
             .replace("{previous_summary}", prev_summary)
@@ -501,7 +484,6 @@ pub async fn compact(
             .replace("{modified_files}", &modified_files_str)
     };
 
-    // Generate turn prefix summary if we split a turn
     let mut full_summary = String::new();
 
     if cut.is_split_turn {
@@ -519,7 +501,6 @@ pub async fn compact(
         }
     }
 
-    // Generate the main summary
     let main_summary = call_summarization_llm(&prompt, agent_config, transport).await?;
     full_summary.push_str(&main_summary);
 

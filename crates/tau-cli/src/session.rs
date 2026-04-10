@@ -70,7 +70,6 @@ impl SessionManager {
         let file = File::create(&path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write metadata
         let metadata = SessionEntry::Metadata {
             id: id.clone(),
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -133,7 +132,6 @@ impl SessionManager {
             }
         }
 
-        // If there was a compaction, rebuild context
         let (messages, previous_summary) = if let Some((summary, kept_index)) = last_compaction {
             let summary_msg = Message::user(format!(
                 "<context-summary>\n{}\n</context-summary>",
@@ -148,7 +146,6 @@ impl SessionManager {
             (all_messages, None)
         };
 
-        // Open for appending
         let file = File::options().append(true).open(&path)?;
         let writer = BufWriter::new(file);
 
@@ -242,7 +239,6 @@ impl SessionManager {
             }
         }
 
-        // Sort by created_at descending (newest first)
         sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         Ok(sessions)
@@ -260,7 +256,6 @@ impl SessionManager {
             working_dir,
         }) = serde_json::from_str(&first_line)
         {
-            // Count messages by deserializing each line
             let file = File::open(path).ok()?;
             let reader = BufReader::new(file);
             let message_count = reader
@@ -302,7 +297,6 @@ impl SessionManager {
         let file = File::create(&path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write metadata
         let metadata = SessionEntry::Metadata {
             id: id.clone(),
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -313,7 +307,6 @@ impl SessionManager {
         };
         writeln!(writer, "{}", serde_json::to_string(&metadata)?)?;
 
-        // Write messages up to branch point
         if let Some(idx) = branch_index {
             for msg in messages.iter().take(idx + 1) {
                 let entry = SessionEntry::Message {

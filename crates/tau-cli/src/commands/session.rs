@@ -16,7 +16,6 @@ impl SessionCommand {
         output.push_str(&"-".repeat(40));
         output.push('\n');
 
-        // Model info
         output.push_str(&format!(
             "Model:      {} ({})\n",
             model.id,
@@ -25,7 +24,6 @@ impl SessionCommand {
         output.push_str(&format!("Reasoning:  {:?}\n", reasoning));
         output.push('\n');
 
-        // Message count
         let user_msgs = state
             .messages
             .iter()
@@ -49,7 +47,6 @@ impl SessionCommand {
         ));
         output.push('\n');
 
-        // Token usage
         output.push_str("Token Usage:\n");
         output.push_str(&format!(
             "  Input:       {:>8}\n",
@@ -73,11 +70,9 @@ impl SessionCommand {
         }
         output.push('\n');
 
-        // Cost estimate
         let cost = usage.calculate_cost(model);
         output.push_str(&format!("Estimated cost: ${:.4}\n", cost.total));
 
-        // Context usage (rough estimate)
         let total_tokens = usage.input + usage.output;
         let context_pct = (total_tokens as f64 / model.context_window as f64) * 100.0;
         output.push_str(&format!(

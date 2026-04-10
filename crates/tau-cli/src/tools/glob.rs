@@ -75,13 +75,11 @@ impl Tool for GlobTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(100) as usize;
 
-        // Build the full pattern
         let full_pattern = match &cwd {
             Some(dir) => dir.join(pattern).to_string_lossy().to_string(),
             None => pattern.to_string(),
         };
 
-        // Execute glob
         let entries = match glob(&full_pattern) {
             Ok(paths) => paths,
             Err(e) => return ToolResult::error(format!("Invalid glob pattern: {}", e)),
@@ -101,7 +99,6 @@ impl Tool for GlobTool {
                     }
                 }
                 Err(e) => {
-                    // Skip unreadable entries but continue
                     tracing::debug!("Glob entry error: {}", e);
                 }
             }

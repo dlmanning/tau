@@ -109,7 +109,6 @@ impl<'a> MessageList<'a> {
     fn render_message(&self, msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
-        // Role header with visual distinction
         let (role_text, role_style, prefix) = match msg.role.as_str() {
             "user" => ("You", self.theme.accent_bold(), "▶ "),
             "assistant" => (
@@ -147,13 +146,10 @@ impl<'a> MessageList<'a> {
 
         lines.push(Line::from(Span::styled(header, role_style)));
 
-        // Content - use markdown for assistant messages, plain text for others
         let content_width = width.saturating_sub(2);
 
         if msg.role == "assistant" && !msg.is_error {
             if msg.content.is_empty() && msg.is_streaming {
-                // Show animated thinking indicator for empty streaming message
-                // Use time-based frame selection for animation
                 let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let frame_idx = (std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -166,10 +162,8 @@ impl<'a> MessageList<'a> {
                     Style::default().fg(Color::Yellow),
                 )));
             } else {
-                // Render markdown for assistant messages
                 let md_lines = render_markdown(&msg.content, self.theme, content_width);
                 for line in md_lines {
-                    // Indent the line
                     let mut indented_spans = vec![Span::raw("  ")];
                     indented_spans.extend(
                         line.spans
@@ -180,7 +174,6 @@ impl<'a> MessageList<'a> {
                 }
             }
         } else if msg.role.starts_with("agent:") && msg.is_streaming {
-            // Active agent — show content with animated spinner
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let frame_idx = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -198,7 +191,6 @@ impl<'a> MessageList<'a> {
                 Style::default().fg(Color::Cyan),
             )));
         } else {
-            // Plain text with wrapping for other messages
             let content_style = if msg.is_error {
                 self.theme.error_style()
             } else if msg.role.starts_with("tool:") {
@@ -216,7 +208,6 @@ impl<'a> MessageList<'a> {
             }
         }
 
-        // Empty line between messages
         lines.push(Line::from(""));
 
         lines
@@ -234,7 +225,6 @@ impl Widget for MessageList<'_> {
             return;
         }
 
-        // Render all messages into lines
         let width = inner.width as usize;
         let mut all_lines: Vec<Line> = Vec::new();
 
@@ -242,7 +232,6 @@ impl Widget for MessageList<'_> {
             all_lines.extend(self.render_message(msg, width));
         }
 
-        // Apply scroll and take visible lines
         let visible_lines: Vec<Line> = all_lines
             .into_iter()
             .skip(self.scroll)
@@ -260,26 +249,20 @@ pub fn calculate_message_height(messages: &[ChatMessage], width: usize, theme: &
     let content_width = width.saturating_sub(2);
 
     for msg in messages {
-        // Role header
         total += 1;
 
-        // Content lines - must match actual rendering logic
         if msg.role == "assistant" && !msg.is_error {
             if msg.content.is_empty() && msg.is_streaming {
-                // Thinking indicator
                 total += 1;
             } else {
-                // Render markdown to count actual lines
-                let md_lines = render_markdown(&msg.content, &theme, content_width);
+                let md_lines = render_markdown(&msg.content, theme, content_width);
                 total += md_lines.len();
             }
         } else {
-            // Plain text with wrapping
             let wrapped = textwrap::wrap(&msg.content, content_width);
             total += wrapped.len();
         }
 
-        // Separator
         total += 1;
     }
     total

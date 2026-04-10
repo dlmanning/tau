@@ -13,8 +13,6 @@ use crate::Theme;
 /// Maximum width for selector popups
 const MAX_POPUP_WIDTH: u16 = 80;
 
-// --- Shared rendering helpers ---
-
 /// Compute the popup size given a title, item labels/descriptions, and max width.
 fn compute_popup_size(
     title_len: usize,
@@ -87,8 +85,6 @@ fn build_list_item<'a>(
     let content = format!("{}{}", prefix, label);
     ListItem::new(Line::from(Span::styled(content, style)))
 }
-
-// --- Borrowed selector ---
 
 /// A popup selector for choosing from a list of options
 pub struct Selector<'a> {
@@ -180,8 +176,6 @@ impl<'a> Selector<'a> {
     }
 }
 
-// --- Owned selector ---
-
 /// An item in the selector (owned version for dynamic content)
 pub struct OwnedSelectorItem {
     /// Display label
@@ -248,8 +242,6 @@ impl<'a> OwnedSelector<'a> {
         );
     }
 }
-
-// --- Selector state ---
 
 /// State for the selector popup
 #[derive(Default)]

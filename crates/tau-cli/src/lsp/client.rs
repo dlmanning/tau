@@ -71,7 +71,6 @@ impl LspClient {
         let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
-        // Log stderr in background
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -86,7 +85,6 @@ impl LspClient {
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Spawn background reader task
         let pending_clone = pending.clone();
         tokio::spawn(async move {
             if let Err(e) = read_loop(stdout, pending_clone).await {
@@ -121,13 +119,11 @@ impl LspClient {
         };
         self.send_message(&serde_json::to_string(&request)?).await?;
 
-        // Wait with timeout
         let rpc_result = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
             .await
             .map_err(|_| anyhow::anyhow!("LSP request timed out after 60s: {}", method))?
             .map_err(|_| anyhow::anyhow!("LSP server connection lost"))?;
 
-        // Handle JSON-RPC level errors properly
         match rpc_result {
             RpcResult::Ok(value) => serde_json::from_value(value).map_err(Into::into),
             RpcResult::Err { code, message } => {
@@ -178,7 +174,6 @@ async fn read_loop(
     let mut header_buf = String::new();
 
     loop {
-        // Read headers until empty line
         let mut content_length: Option<usize> = None;
         loop {
             header_buf.clear();
@@ -200,12 +195,10 @@ async fn read_loop(
             None => continue,
         };
 
-        // Read body
         let mut body = vec![0u8; len];
         tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await?;
         let body_str = String::from_utf8_lossy(&body);
 
-        // Try to parse as response
         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&body_str) {
             if let Some(id) = response.id {
                 let mut pending = pending.lock().await;

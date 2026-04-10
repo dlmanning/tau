@@ -94,10 +94,6 @@ pub struct SpawnRequest {
     pub depth: u32,
 }
 
-// ============================================================================
-// AgentManager — manages subagent lifecycle
-// ============================================================================
-
 /// Manages subagent lifecycle: spawn, resume, cancel, evict.
 ///
 /// Replaces the old AgentRegistry with additional capabilities:
@@ -237,7 +233,6 @@ impl AgentManager {
     ) -> crate::error::Result<SubagentResult> {
         let start = std::time::Instant::now();
 
-        // Take agent out
         let mut entry = {
             let mut agents = self.agents.lock().await;
             let pos = agents.iter().position(|(k, _)| k == id).ok_or_else(|| {
@@ -252,7 +247,6 @@ impl AgentManager {
         // Use the stored snapshot (not current total_usage) for correct delta
         let usage_before = entry.usage_at_pause.clone();
 
-        // Forward events as AgentEvent::Subagent
         let event_cb = self.event_forwarder(id, &entry.description);
         let mut events = entry.agent.subscribe();
         let event_task = tokio::spawn(async move {
@@ -261,7 +255,6 @@ impl AgentManager {
             }
         });
 
-        // Cancel bridge: parent cancel -> agent abort
         let agent_handle = entry.agent.handle();
         let bridge = tokio::spawn({
             let parent_cancel = parent_cancel.clone();
@@ -275,7 +268,6 @@ impl AgentManager {
         bridge.abort();
         event_task.abort();
 
-        // Compute delta usage
         let current_usage = entry.agent.state().total_usage.clone();
         let delta_input = current_usage.input.saturating_sub(usage_before.input);
         let delta_output = current_usage.output.saturating_sub(usage_before.output);
@@ -295,17 +287,13 @@ impl AgentManager {
 
         let text = extract_final_text(entry.agent.messages());
 
-        // Record transcript
         record_transcript(id, entry.agent.messages()).await;
-
-        // Update usage snapshot and re-insert
         entry.usage_at_pause = current_usage;
         self.agents
             .lock()
             .await
             .push_back((id.to_string(), entry));
 
-        // Propagate error after re-inserting
         prompt_result?;
 
         Ok(SubagentResult {
@@ -348,8 +336,6 @@ impl AgentManager {
         self.agents.lock().await.is_empty()
     }
 
-    // ---- Internal helpers ----
-
     /// Create an event callback that wraps child events in `AgentEvent::Subagent`
     /// and emits them on the parent's event channel.
     fn event_forwarder(&self, agent_id: &str, description: &str) -> EventCallback {
@@ -376,7 +362,6 @@ impl AgentManager {
     ) -> crate::error::Result<(SubagentResult, Agent)> {
         let start = std::time::Instant::now();
 
-        // Worktree setup
         let worktree = if req.isolation.as_deref() == Some("worktree") {
             match create_worktree(agent_id).await {
                 Ok(wt) => Some(wt),
@@ -391,10 +376,7 @@ impl AgentManager {
             None
         };
 
-        // Run the agent, capturing the result (success or failure)
         let agent_result = self.run_agent_inner(req, agent_id, &worktree, cancel).await;
-
-        // Always cleanup worktree, even on failure
         let (wt_path, wt_branch) = if let Some(wt) = &worktree {
             match cleanup_worktree(wt).await {
                 Ok(true) => (None, None),
@@ -409,9 +391,7 @@ impl AgentManager {
 
         let (mut result, agent) = agent_result?;
 
-        // Record transcript
         record_transcript(agent_id, agent.messages()).await;
-
         result.worktree_path = wt_path;
         result.worktree_branch = wt_branch;
         result.duration_ms = start.elapsed().as_millis() as u64;
@@ -426,7 +406,6 @@ impl AgentManager {
         worktree: &Option<WorktreeInfo>,
         cancel: CancellationToken,
     ) -> crate::error::Result<(SubagentResult, Agent)> {
-        // Determine CWD
         let cwd = req
             .cwd
             .clone()
@@ -437,7 +416,6 @@ impl AgentManager {
                     .unwrap_or_else(|_| ".".into())
             });
 
-        // Build tool set
         let factory = self.agent_tool_factory.lock().clone();
         let tools = build_tool_set(
             &req.agent_type,
@@ -446,7 +424,6 @@ impl AgentManager {
             &factory,
         );
 
-        // Create agent
         let mut agent_cfg = self.parent_config.clone();
         agent_cfg.system_prompt = None;
         agent_cfg.max_turns = Some(req.agent_type.max_turns());
@@ -460,7 +437,6 @@ impl AgentManager {
             agent.add_tool(tool);
         }
 
-        // Build system prompt
         let tool_names = agent.tool_names();
         let prompt_opts = crate::prompts::PromptOptions {
             tool_names: &tool_names,
@@ -474,7 +450,6 @@ impl AgentManager {
         );
         agent.set_system_prompt(system_prompt);
 
-        // Forward events to callback
         let on_event = self.event_forwarder(agent_id, &req.description);
         let mut events = agent.subscribe();
         let cb = on_event.clone();
@@ -493,16 +468,13 @@ impl AgentManager {
             agent_handle.abort();
         });
 
-        // Run the agent (max_turns enforced by the agent loop)
         let prompt_result = agent.prompt(&req.prompt).await;
         cancel_bridge.abort();
 
-        // Abort progress forwarder before returning
         event_task.abort();
 
         prompt_result?;
 
-        // Collect result
         let text = extract_final_text(agent.messages());
         let state = agent.state();
 
@@ -549,10 +521,6 @@ impl AgentManager {
     }
 }
 
-// ============================================================================
-// Transcript recording
-// ============================================================================
-
 /// Record a subagent's conversation to disk for debugging.
 /// Writes JSONL to `~/.local/share/tau/agent-transcripts/{agent_id}.jsonl`.
 /// Overwrites any previous transcript for this agent (e.g. after resumption,
@@ -584,17 +552,12 @@ pub async fn record_transcript(agent_id: &str, messages: &[Message]) {
     }
 }
 
-// ============================================================================
-// Tool filtering
-// ============================================================================
-
 fn build_tool_set(
     agent_type: &AgentType,
     all_tools: &[BoxedTool],
     depth: u32,
     agent_tool_factory: &Option<AgentToolFactory>,
 ) -> Vec<BoxedTool> {
-    // Determine which tools are allowed for this agent type
     let mut tools: Vec<BoxedTool> = match agent_type {
         AgentType::Explore | AgentType::Plan => {
             let read_only = ["read", "glob", "grep", "list", "lsp"];
@@ -611,7 +574,6 @@ fn build_tool_set(
             .collect(),
     };
 
-    // Add recursive agent tool for general-purpose agents
     if matches!(agent_type, AgentType::GeneralPurpose) && depth + 1 < MAX_AGENT_DEPTH {
         if let Some(factory) = agent_tool_factory {
             tools.push(factory(depth + 1));
@@ -620,10 +582,6 @@ fn build_tool_set(
 
     tools
 }
-
-// ============================================================================
-// System prompt suffixes
-// ============================================================================
 
 const AGENT_GENERAL_PROMPT: &str = include_str!("prompts/agent_general.md");
 const AGENT_EXPLORE_PROMPT: &str = include_str!("prompts/agent_explore.md");
@@ -636,10 +594,6 @@ fn agent_type_suffix(agent_type: &AgentType) -> &'static str {
         AgentType::Plan => AGENT_PLAN_PROMPT,
     }
 }
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 fn extract_final_text(messages: &[Message]) -> String {
     messages
@@ -666,10 +620,6 @@ fn extract_final_text(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
-// ============================================================================
-// Worktree management
-// ============================================================================
-
 struct WorktreeInfo {
     path: PathBuf,
     branch: String,
@@ -688,7 +638,6 @@ async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
     }
 
     let git_root = PathBuf::from(String::from_utf8_lossy(&git_root_output.stdout).trim());
-    // Use full UUID to avoid branch name collisions
     let branch = format!("worktree-agent-{}", agent_id);
     let path = git_root.join(format!(".tau-worktrees/agent-{}", agent_id));
 
@@ -735,14 +684,12 @@ async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
 async fn cleanup_worktree(info: &WorktreeInfo) -> Result<bool, String> {
     let path_str = info.path.display().to_string();
 
-    // Check for tracked changes
     let diff = tokio::process::Command::new("git")
         .args(["-C", &path_str, "diff", "--quiet", &info.head_commit])
         .status()
         .await
         .map_err(|e| format!("git diff failed: {}", e))?;
 
-    // Check for untracked files
     let untracked = tokio::process::Command::new("git")
         .args([
             "-C",
@@ -760,7 +707,6 @@ async fn cleanup_worktree(info: &WorktreeInfo) -> Result<bool, String> {
         .is_empty();
 
     if diff.success() && !has_untracked {
-        // No changes — clean up
         let _ = tokio::process::Command::new("git")
             .args(["worktree", "remove", &path_str])
             .output()
@@ -785,7 +731,6 @@ mod tests {
     /// Local alias for the (now-private) factory type, used in tests.
     type TestAgentToolFactory = Arc<dyn Fn(u32) -> BoxedTool + Send + Sync>;
 
-    // Minimal mock tool for testing tool filtering
     struct MockTool {
         tool_name: &'static str,
     }
@@ -824,8 +769,6 @@ mod tests {
         ]
     }
 
-    // ── AgentType ──
-
     #[test]
     fn test_parse_valid_types() {
         assert!(matches!(
@@ -859,8 +802,6 @@ mod tests {
         assert_eq!(AgentType::Explore.max_turns(), 10);
         assert_eq!(AgentType::Plan.max_turns(), 15);
     }
-
-    // ── Tool filtering ──
 
     #[test]
     fn test_explore_gets_read_only_tools() {
@@ -923,8 +864,6 @@ mod tests {
         assert!(!names.contains(&"agent")); // depth exceeded
     }
 
-    // ── extract_final_text ──
-
     #[test]
     fn test_extract_final_text_from_assistant() {
         let messages = vec![
@@ -966,8 +905,6 @@ mod tests {
         assert_eq!(extract_final_text(&messages), "");
     }
 
-    // ── agent_type_suffix ──
-
     #[test]
     fn test_suffixes_are_nonempty() {
         assert!(!agent_type_suffix(&AgentType::GeneralPurpose).is_empty());
@@ -984,8 +921,6 @@ mod tests {
         assert_ne!(gp, pl);
         assert_ne!(ex, pl);
     }
-
-    // ── Progress callback ──
 
     #[tokio::test]
     async fn test_event_callback_receives_all_events() {
@@ -1072,9 +1007,6 @@ mod tests {
         assert_eq!(msgs[4], "[turn 1]");
     }
 
-    // ── AgentManager ──
-
-    // Minimal transport that never gets called (agent is stored, not run)
     struct DummyTransport;
 
     #[async_trait]
@@ -1168,7 +1100,6 @@ mod tests {
             Agent::new(config, transport)
         };
 
-        // Fill to capacity
         for i in 0..max {
             manager
                 .store(format!("agent-{}", i), make_agent(), format!("desc-{}", i))
@@ -1176,7 +1107,6 @@ mod tests {
         }
         assert_eq!(manager.len().await, max);
 
-        // One more should evict
         manager
             .store("agent-overflow".into(), make_agent(), "overflow".into())
             .await;

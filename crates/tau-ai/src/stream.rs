@@ -292,10 +292,6 @@ impl MessageBuilder {
     }
 }
 
-// ============================================================================
-// Stream accumulator — producer-side event generation
-// ============================================================================
-
 /// Tracks streaming content blocks and emits [`MessageEvent`]s.
 ///
 /// Providers parse their SSE format and feed deltas into the accumulator,
@@ -368,8 +364,6 @@ impl StreamAccumulator {
         (acc, start)
     }
 
-    // ---- text ----
-
     /// Append a text delta. Auto-creates and starts the block if needed.
     pub fn text_delta(&mut self, index: usize, delta: &str) -> Vec<MessageEvent> {
         self.ensure_block(index);
@@ -432,8 +426,6 @@ impl StreamAccumulator {
             vec![]
         }
     }
-
-    // ---- thinking ----
 
     /// Start a thinking block.
     pub fn thinking_start(&mut self, index: usize) -> Vec<MessageEvent> {
@@ -505,8 +497,6 @@ impl StreamAccumulator {
         }
     }
 
-    // ---- tool calls ----
-
     /// Start a tool call block.
     pub fn tool_call_start(
         &mut self,
@@ -571,8 +561,6 @@ impl StreamAccumulator {
         }
     }
 
-    // ---- special blocks ----
-
     /// Record a redacted thinking block (no events emitted).
     pub fn add_redacted_thinking(&mut self, index: usize, data: String) {
         self.ensure_block(index);
@@ -591,8 +579,6 @@ impl StreamAccumulator {
         self.blocks[index] = AccBlock::ServerToolUse { id, name, input };
     }
 
-    // ---- state ----
-
     /// Mutable reference to usage for incremental updates.
     pub fn usage_mut(&mut self) -> &mut Usage {
         &mut self.usage
@@ -609,8 +595,6 @@ impl StreamAccumulator {
         self.error = Some(msg.into());
         self.stop_reason = Some(StopReason::Error);
     }
-
-    // ---- generic block end (for Anthropic content_block_stop) ----
 
     /// End the block at `index`, dispatching to the appropriate end method.
     /// `override_signature` is applied only to thinking blocks.
@@ -636,8 +620,6 @@ impl StreamAccumulator {
             vec![]
         }
     }
-
-    // ---- terminal ----
 
     /// Create an error event for immediate yield-and-return (without calling finish).
     pub fn error_event(msg: impl Into<String>) -> MessageEvent {
@@ -759,8 +741,6 @@ impl StreamAccumulator {
 
         events
     }
-
-    // ---- private ----
 
     fn ensure_block(&mut self, index: usize) {
         while self.blocks.len() <= index {

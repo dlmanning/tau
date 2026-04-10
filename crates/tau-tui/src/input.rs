@@ -71,7 +71,6 @@ pub fn key_to_action(event: KeyEvent) -> Action {
         code, modifiers, ..
     } = event;
 
-    // Handle Ctrl combinations first
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
             KeyCode::Char('c') => Action::Interrupt,
@@ -88,12 +87,10 @@ pub fn key_to_action(event: KeyEvent) -> Action {
         };
     }
 
-    // Handle Alt combinations
     if modifiers.contains(KeyModifiers::ALT) {
         return Action::Unknown;
     }
 
-    // Regular keys
     match code {
         KeyCode::Char(c) => Action::Char(c),
         KeyCode::Enter => Action::Submit,

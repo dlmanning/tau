@@ -77,7 +77,6 @@ impl Config {
 
     /// Get the config file path
     pub fn config_path() -> PathBuf {
-        // Check for TAU_CONFIG_PATH env var first
         if let Ok(path) = std::env::var("TAU_CONFIG_PATH") {
             return PathBuf::from(path);
         }
@@ -150,7 +149,6 @@ impl Config {
 
     /// Get API key for a provider, checking config then env (sync version)
     pub fn get_api_key(&self, provider: &str) -> Option<String> {
-        // Check config first
         let from_config = match provider {
             "anthropic" => self.api_keys.anthropic.clone(),
             "openai" => self.api_keys.openai.clone(),
@@ -162,7 +160,6 @@ impl Config {
             return from_config;
         }
 
-        // Fall back to env var
         let env_var = match provider {
             "anthropic" => "ANTHROPIC_API_KEY",
             "openai" => "OPENAI_API_KEY",
@@ -179,22 +176,18 @@ impl Config {
 
     /// Get API key for a provider, checking OAuth first, then config, then env
     pub async fn get_api_key_with_oauth(&self, provider: &str) -> Option<String> {
-        // For Anthropic, check OAuth first
         if provider == "anthropic" {
-            // Check OAuth storage (auto-refresh if needed)
             if let Some(token) =
                 crate::oauth::get_oauth_token(crate::oauth::OAuthProvider::Anthropic).await
             {
                 return Some(token);
             }
 
-            // Check ANTHROPIC_OAUTH_TOKEN env var (manual OAuth token)
             if let Ok(token) = std::env::var("ANTHROPIC_OAUTH_TOKEN") {
                 return Some(token);
             }
         }
 
-        // Fall back to regular API key lookup
         self.get_api_key(provider)
     }
 }

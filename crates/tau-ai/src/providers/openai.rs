@@ -51,7 +51,6 @@ impl OpenAIProvider {
 
         let list: OpenAIModelList = response.json().await?;
 
-        // Filter to chat models only
         let chat_models: Vec<_> = list
             .data
             .into_iter()
@@ -73,7 +72,6 @@ impl OpenAIProvider {
         );
         headers.insert("content-type", "application/json".parse().unwrap());
 
-        // Add model-specific headers
         for (key, value) in &model.headers {
             if let (Ok(name), Ok(val)) = (
                 key.parse::<reqwest::header::HeaderName>(),
@@ -94,7 +92,6 @@ impl OpenAIProvider {
     fn build_request(&self, model: &Model, context: &Context) -> Result<OpenAIRequest> {
         let mut messages = Vec::new();
 
-        // Add system prompt as first message
         if let Some(ref system_prompt) = context.system_prompt {
             messages.push(OpenAIMessage {
                 role: "system".to_string(),
@@ -104,16 +101,13 @@ impl OpenAIProvider {
             });
         }
 
-        // Repair tool_use/tool_result pairing before conversion
         let mut context_messages = context.messages.clone();
         ensure_tool_result_pairing(&mut context_messages);
 
-        // Convert messages
         for msg in &context_messages {
             messages.extend(convert_message(msg));
         }
 
-        // Convert tools
         let tools = if context.tools.is_empty() {
             None
         } else {
@@ -359,8 +353,6 @@ fn create_stream(
     }
 }
 
-// Request/Response types
-
 #[derive(Debug, Serialize)]
 struct OpenAIRequest {
     model: String,
@@ -424,8 +416,6 @@ struct OpenAIFunctionCall {
     name: String,
     arguments: String,
 }
-
-// Streaming response types
 
 #[derive(Debug, Deserialize)]
 struct StreamChunk {

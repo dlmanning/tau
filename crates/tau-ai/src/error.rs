@@ -124,8 +124,6 @@ impl Error {
 mod tests {
     use super::*;
 
-    // --- is_retryable on Api variant ---
-
     #[test]
     fn test_retryable_typed_variants() {
         assert!(
@@ -179,8 +177,6 @@ mod tests {
         assert!(!Error::Aborted.is_retryable());
         assert!(!Error::ContextOverflow("too big".into()).is_retryable());
     }
-
-    // --- is_context_overflow on Api variant ---
 
     #[test]
     fn test_overflow_typed_variant() {

@@ -218,7 +218,6 @@ impl AnthropicProvider {
 
         apply_stainless_headers(&mut headers);
 
-        // Add model-specific headers
         for (key, value) in &model.headers {
             if let (Ok(name), Ok(val)) = (
                 key.parse::<reqwest::header::HeaderName>(),
@@ -338,7 +337,6 @@ impl AnthropicProvider {
             inference_geo: options.inference_geo.clone(),
         };
 
-        // Enable thinking if requested
         if options.thinking_enabled && model.reasoning {
             let display = options.thinking_display.clone();
             request.thinking = Some(if options.thinking_adaptive {

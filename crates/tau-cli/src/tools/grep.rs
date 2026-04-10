@@ -117,7 +117,6 @@ impl Tool for GrepTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
-        // Collect files to search
         let files = collect_files(&path, glob_pattern);
 
         let mut matches = Vec::new();
@@ -165,7 +164,6 @@ fn collect_files(path: &Path, glob_pattern: Option<&str>) -> Vec<PathBuf> {
         return files;
     }
 
-    // Build glob pattern
     let pattern = match glob_pattern {
         Some(g) => path.join(g).to_string_lossy().to_string(),
         None => path.join("**/*").to_string_lossy().to_string(),
@@ -174,7 +172,6 @@ fn collect_files(path: &Path, glob_pattern: Option<&str>) -> Vec<PathBuf> {
     if let Ok(entries) = glob::glob(&pattern) {
         for entry in entries.flatten() {
             if entry.is_file() {
-                // Skip binary files and hidden directories
                 let path_str = entry.to_string_lossy();
                 if !path_str.contains("/.git/")
                     && !path_str.contains("/node_modules/")
@@ -214,7 +211,6 @@ fn search_file(
             let display_path = path.display();
 
             if context_lines > 0 {
-                // Add context before
                 let start = line_num.saturating_sub(context_lines);
                 for (i, line_content) in lines.iter().enumerate().take(line_num).skip(start) {
                     matches.push(format!(
@@ -225,7 +221,6 @@ fn search_file(
                     ));
                 }
 
-                // Add the matching line
                 matches.push(format!(
                     "{}:{}> {}",
                     display_path,
@@ -233,7 +228,6 @@ fn search_file(
                     truncate_line(line)
                 ));
 
-                // Add context after
                 let end = (line_num + context_lines + 1).min(lines.len());
                 for (i, line_content) in lines.iter().enumerate().take(end).skip(line_num + 1) {
                     matches.push(format!(

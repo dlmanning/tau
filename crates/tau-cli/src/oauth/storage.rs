@@ -24,7 +24,6 @@ pub struct OAuthCredentials {
 
 impl OAuthCredentials {
     pub fn new(refresh: String, access: String, expires_in_secs: i64) -> Self {
-        // Apply 5-minute buffer to expiry
         let expires =
             chrono::Utc::now().timestamp_millis() + (expires_in_secs * 1000) - (5 * 60 * 1000);
         Self {
@@ -66,7 +65,6 @@ fn save_storage(storage: &HashMap<String, OAuthCredentials>) -> io::Result<()> {
     let dir = oauth_dir();
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
-        // Set directory permissions to 0o700 on Unix
         #[cfg(unix)]
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     }
@@ -75,7 +73,6 @@ fn save_storage(storage: &HashMap<String, OAuthCredentials>) -> io::Result<()> {
     let content = serde_json::to_string_pretty(storage)?;
     fs::write(&path, content)?;
 
-    // Set file permissions to 0o600 on Unix (owner read/write only)
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 

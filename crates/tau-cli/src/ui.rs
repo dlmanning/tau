@@ -150,12 +150,10 @@ impl TuiState {
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::AgentStart => {
-                // Already handled when Submit is received - this is just a confirmation
                 self.is_processing = true;
             }
             AgentEvent::MessageUpdate { message } => {
                 let text = message.text();
-                // Update the streaming message
                 if let Some(last) = self.messages.last_mut() {
                     if last.is_streaming {
                         last.content = text;
@@ -167,7 +165,6 @@ impl TuiState {
                 self.scroll_to_bottom();
             }
             AgentEvent::MessageEnd { message } => {
-                // Replace streaming message with final
                 if let Some(last) = self.messages.last_mut() {
                     if last.is_streaming {
                         last.content = message.text();
@@ -376,7 +373,6 @@ impl TuiState {
 
     /// Handle keyboard action
     pub async fn handle_action(&mut self, action: Action, width: u16) -> bool {
-        // Handle branch selector if visible
         if self.branch_selector.visible {
             match action {
                 Action::Up => {
@@ -388,25 +384,21 @@ impl TuiState {
                     return true;
                 }
                 Action::Submit => {
-                    // Create branch from selected message
                     let selected = self.branch_selector.selected;
                     self.branch_selector.hide();
                     let _ = self.ui_tx.send(UiMessage::Branch(Some(selected))).await;
                     return true;
                 }
                 Action::Escape => {
-                    // Close without branching
                     self.branch_selector.hide();
                     return true;
                 }
                 _ => {
-                    // Ignore other actions while selector is open
                     return true;
                 }
             }
         }
 
-        // Handle model selector if visible
         if self.model_selector.visible {
             match action {
                 Action::Up => {
@@ -418,19 +410,16 @@ impl TuiState {
                     return true;
                 }
                 Action::Submit => {
-                    // Select the model and close
                     let selected = self.model_selector.selected;
                     self.model_selector.hide();
                     let _ = self.ui_tx.send(UiMessage::ChangeModel(selected)).await;
                     return true;
                 }
                 Action::Escape | Action::ModelSelect => {
-                    // Close without selecting
                     self.model_selector.hide();
                     return true;
                 }
                 _ => {
-                    // Ignore other actions while selector is open
                     return true;
                 }
             }
@@ -443,10 +432,8 @@ impl TuiState {
                     self.input.clear();
 
                     if content.starts_with('/') {
-                        // Handle slash command
                         let _ = self.ui_tx.send(UiMessage::Command(content)).await;
                     } else {
-                        // Regular message
                         self.messages.push(ChatMessage::user(&content));
                         self.scroll_to_bottom();
                         let _ = self.ui_tx.send(UiMessage::Submit(content)).await;
@@ -460,7 +447,6 @@ impl TuiState {
             }
             Action::Interrupt => {
                 if self.is_processing {
-                    // Cancel current operation
                     let _ = self.ui_tx.send(UiMessage::Abort).await;
                     self.status = "Cancelling...".to_string();
                     true
@@ -471,7 +457,6 @@ impl TuiState {
             }
             Action::Escape => {
                 if self.is_processing {
-                    // Cancel current operation
                     let _ = self.ui_tx.send(UiMessage::Abort).await;
                     self.status = "Cancelling...".to_string();
                     true
@@ -501,7 +486,6 @@ impl TuiState {
                 true
             }
             Action::ModelSelect => {
-                // Open model selector (only when not processing)
                 if !self.is_processing {
                     self.model_selector.show();
                 }
@@ -528,22 +512,15 @@ impl TuiState {
             ])
             .split(size);
 
-        // Render status bar
         self.render_status(frame, chunks[0]);
-
-        // Render messages
         self.render_messages(frame, chunks[1]);
-
-        // Render input
         self.input
             .render(chunks[2], frame.buffer_mut(), &self.theme);
 
-        // Render model selector popup if visible
         if self.model_selector.visible {
             self.render_model_selector(frame, size);
         }
 
-        // Render branch selector popup if visible
         if self.branch_selector.visible {
             self.render_branch_selector(frame, size);
         }
@@ -578,7 +555,6 @@ impl TuiState {
             .enumerate()
             .map(|(i, msg)| {
                 let preview = crate::utils::truncate_chars(&msg.content, 50);
-                // Replace newlines with spaces for single-line display
                 let preview = preview.replace('\n', " ");
                 OwnedSelectorItem {
                     label: format!("{}: [{}] {}", i, msg.role, preview),
@@ -603,7 +579,6 @@ impl TuiState {
         frame.render_widget(block, area);
 
         if inner.height == 0 || self.messages.is_empty() {
-            // Show welcome screen with ASCII art and help
             let model_name = self
                 .model
                 .id
@@ -681,10 +656,8 @@ impl TuiState {
         );
 
         if self.scroll == usize::MAX {
-            // Auto-scroll to bottom
             self.scroll = content_height.saturating_sub(inner.height as usize);
         } else {
-            // Clamp scroll
             self.scroll = self
                 .scroll
                 .min(content_height.saturating_sub(inner.height as usize));
@@ -693,7 +666,6 @@ impl TuiState {
         let message_list = MessageList::new(&self.messages, &self.theme).scroll(self.scroll);
         frame.render_widget(message_list, inner);
 
-        // Render scrollbar if content overflows
         if content_height > inner.height as usize {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
@@ -711,12 +683,10 @@ impl TuiState {
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         if self.is_processing {
-            // Use animated spinner during processing
             let spinner =
                 Spinner::new(&self.status, &self.theme).with_start_time(self.spinner_start);
             frame.render_widget(spinner, area);
         } else {
-            // Show status with keybindings help on the right
             let model_name = self
                 .model
                 .id
@@ -745,7 +715,6 @@ impl TuiState {
             let right_width = right_content.chars().count();
             let available = area.width as usize;
 
-            // Build the line with spacing
             let line = if left_width + right_width + 2 <= available {
                 let spacing = available - left_width - right_width;
                 Line::from(vec![
@@ -780,17 +749,14 @@ pub async fn run_tui(
 
     use crate::commands::{CommandResult, execute_command};
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create channels
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(32);
 
-    // Create state
     let mut state = TuiState::new(
         model.clone(),
         *reasoning,
@@ -799,10 +765,7 @@ pub async fn run_tui(
         ui_tx,
     );
 
-    // Subscribe to agent events
     let mut agent_rx = agent.subscribe();
-
-    // Event stream
     let mut event_stream = EventStream::new();
 
     // Tick interval for animations (80ms for smooth spinner)
@@ -816,7 +779,6 @@ pub async fn run_tui(
         // If there's a pending prompt, start processing it
         // We create the future here where `content` is still in scope
         if let Some(content) = pending_prompt.take() {
-            // Show thinking indicator
             state.is_processing = true;
             state.spinner_start = Instant::now();
             state.status = "Thinking...".to_string();
@@ -826,19 +788,15 @@ pub async fn run_tui(
             // Get cancel handle before creating the future (so we can cancel without borrowing agent)
             let cancel_handle = agent.cancel_handle();
 
-            // Create the prompt future
             let mut prompt_future = std::pin::pin!(agent.prompt(&content));
 
-            // Poll it alongside other events until completion
             loop {
-                // Render each iteration to show spinner animation
                 terminal.draw(|frame| state.render(frame))?;
                 let area_width = terminal.size()?.width;
 
                 tokio::select! {
                     biased;
 
-                    // Poll the prompt future
                     result = &mut prompt_future => {
                         if let Err(e) = result {
                             state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
@@ -846,34 +804,28 @@ pub async fn run_tui(
                         break; // Exit inner loop, prompt is done
                     }
 
-                    // Handle agent events (highest priority for responsiveness)
                     event = agent_rx.recv() => {
                         if let Ok(agent_event) = event {
                             state.handle_agent_event(agent_event);
                         }
                     }
 
-                    // Handle terminal events - input works during processing!
                     event = event_stream.next() => {
                         match event {
                             Some(Ok(Event::Key(key))) => {
                                 let action = tau_tui::input::key_to_action(key);
-                                // During processing, only handle interrupt/quit differently
                                 match action {
                                     Action::Interrupt | Action::Escape => {
-                                        // Cancel using the handle (doesn't need to borrow agent)
                                         cancel_handle.lock().cancel();
                                         state.status = "Cancelling...".to_string();
                                     }
                                     Action::Quit => {
-                                        // Cleanup and exit
                                         disable_raw_mode()?;
                                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                                         terminal.show_cursor()?;
                                         return Ok(());
                                     }
                                     _ => {
-                                        // Still allow typing during processing
                                         state.input.handle_action(&action, area_width);
                                     }
                                 }
@@ -886,7 +838,6 @@ pub async fn run_tui(
                             }
                             Some(Ok(Event::Resize(_, _))) => {}
                             Some(Err(_)) | None => {
-                                // Exit on error or stream end
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                                 terminal.show_cursor()?;
@@ -896,23 +847,19 @@ pub async fn run_tui(
                         }
                     }
 
-                    // Tick for animations
                     _ = tick_interval.tick() => {}
                 }
             }
 
-            // Drain any remaining agent events after prompt completes
             while let Ok(agent_event) = agent_rx.try_recv() {
                 state.handle_agent_event(agent_event);
             }
 
-            // Render final state before continuing
             terminal.draw(|frame| state.render(frame))?;
 
             continue; // Continue outer loop after prompt completes
         }
 
-        // Render
         terminal.draw(|frame| state.render(frame))?;
 
         let area_width = terminal.size()?.width;
@@ -920,14 +867,12 @@ pub async fn run_tui(
         tokio::select! {
             biased;
 
-            // Handle agent events first (highest priority for responsiveness)
             event = agent_rx.recv() => {
                 if let Ok(agent_event) = event {
                     state.handle_agent_event(agent_event);
                 }
             }
 
-            // Handle terminal events (keyboard input)
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) => {
@@ -953,14 +898,11 @@ pub async fn run_tui(
                 }
             }
 
-            // Tick for animations (spinner updates)
             _ = tick_interval.tick() => {}
 
-            // Handle UI messages (submit, quit, clear, abort, command)
             msg = ui_rx.recv() => {
                 match msg {
                     Some(UiMessage::Submit(content)) => {
-                        // Queue the prompt - will be processed at start of next loop iteration
                         pending_prompt = Some(content);
                     }
                     Some(UiMessage::Command(cmd)) => {
@@ -999,11 +941,9 @@ pub async fn run_tui(
                                     state.show_system_message(&format!("Unknown command: /{}\nType /help for available commands.", cmd));
                                 }
                                 CommandResult::OpenModelSelector => {
-                                    // Open the model selector popup
                                     state.model_selector.show();
                                 }
                                 CommandResult::OpenBranchSelector => {
-                                    // Open the branch selector popup
                                     state.open_branch_selector();
                                 }
                                 CommandResult::Compact => {
@@ -1021,7 +961,6 @@ pub async fn run_tui(
                                     }
                                 }
                                 CommandResult::BranchFrom(branch_index) => {
-                                    // Create branch directly (CLI mode or with index)
                                     match crate::session::SessionManager::branch_from(
                                         agent.messages(),
                                         branch_index,
@@ -1034,11 +973,9 @@ pub async fn run_tui(
                                                 new_session.id(),
                                                 msg_count
                                             ));
-                                            // Truncate agent messages to branch point
                                             if let Some(idx) = branch_index {
                                                 let messages: Vec<_> = agent.messages().iter().take(idx + 1).cloned().collect();
                                                 agent.set_messages(messages);
-                                                // Truncate UI messages too
                                                 state.messages.truncate(idx + 1);
                                             } else {
                                                 agent.clear_messages();
@@ -1082,7 +1019,6 @@ pub async fn run_tui(
                         agent.abort();
                     }
                     Some(UiMessage::Branch(branch_index)) => {
-                        // Create branch from selected message
                         match crate::session::SessionManager::branch_from(
                             agent.messages(),
                             branch_index,
@@ -1095,11 +1031,9 @@ pub async fn run_tui(
                                     new_session.id(),
                                     msg_count
                                 ));
-                                // Truncate agent messages to branch point
                                 if let Some(idx) = branch_index {
                                     let messages: Vec<_> = agent.messages().iter().take(idx + 1).cloned().collect();
                                     agent.set_messages(messages);
-                                    // Truncate UI messages too
                                     state.messages.truncate(idx + 1);
                                 } else {
                                     agent.clear_messages();
@@ -1122,7 +1056,6 @@ pub async fn run_tui(
         }
     };
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

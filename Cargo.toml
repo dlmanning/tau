@@ -17,41 +17,41 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.48", features = ["full"] }
-tokio-stream = { version = "0.1.17", features = ["full"] }
-tokio-util = "0.7.17"
-futures = "0.3.31"
+tokio = { version = "1.51", features = ["full"] }
+tokio-stream = { version = "0.1.18", features = ["full"] }
+tokio-util = "0.7.18"
+futures = "0.3.32"
 async-stream = "0.3.6"
 async-trait = "0.1"
 
 # HTTP client
-reqwest = { version = "0.12.24", features = ["json", "stream"] }
+reqwest = { version = "0.12.28", features = ["json", "stream"] }
 reqwest-eventsource = "0.6.0"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0.149"
 
 # Error handling
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 anyhow = "1.0"
 
 # CLI
-clap = { version = "4.5.53", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 
 # TUI
-ratatui = "0.30.0-beta.0"
+ratatui = "0.30.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 
 # Utilities
-uuid = { version = "1.18.1", features = ["v4", "serde"] }
-chrono = { version = "0.4.42", features = ["serde"] }
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 base64 = "0.22.1"
 dirs = "6.0.0"
-similar = "2.7.0"
+similar = "3.0.0"
 regex = "1.12"
-jsonschema = "0.28"
-toml = "0.9"
+jsonschema = "0.45"
+toml = "1.1"
 glob = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

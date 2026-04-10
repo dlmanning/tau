@@ -12,7 +12,6 @@ pub struct PromptOptions<'a> {
     pub acolyte_mode: bool,
 }
 
-// Static sections — embedded at compile time
 const INTRO: &str = include_str!("intro.md");
 const SYSTEM: &str = include_str!("system.md");
 const TASKS: &str = include_str!("tasks.md");
@@ -46,7 +45,6 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 
     let mut sections = vec![INTRO, SYSTEM, &tasks, ACTIONS, &tools];
 
-    // Add agent instructions if the agent tool is available
     if opts.tool_names.contains(&"agent") {
         sections.push(AGENTS);
     }
@@ -56,17 +54,12 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 
     let mut prompt = sections.join("\n\n");
 
-    // Append project context files (CLAUDE.md, AGENTS.md)
     if let Some(context) = crate::context::load_context() {
         prompt = format!("{}\n\n---\n\n# Project Context\n\n{}", prompt, context);
     }
 
     prompt
 }
-
-// ============================================================================
-// Dynamic sections — assembled at runtime
-// ============================================================================
 
 fn using_tools_section(tool_names: &[&str]) -> String {
     let has_bash = tool_names.contains(&"bash");

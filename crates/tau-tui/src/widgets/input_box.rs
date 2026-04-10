@@ -93,7 +93,6 @@ impl InputBox {
                 if self.cursor > 0 {
                     self.cursor -= 1;
                     let byte_offset = self.cursor_byte_offset();
-                    // Find the next char boundary after this position
                     let next_boundary = self.content[byte_offset..]
                         .char_indices()
                         .nth(1)
@@ -109,7 +108,6 @@ impl InputBox {
             Action::Delete => {
                 if self.cursor < char_count {
                     let byte_offset = self.cursor_byte_offset();
-                    // Find the next char boundary after this position
                     let next_boundary = self.content[byte_offset..]
                         .char_indices()
                         .nth(1)
@@ -154,20 +152,16 @@ impl InputBox {
                 true
             }
             Action::DeleteWord => {
-                // Delete word before cursor
                 let mut new_cursor = self.cursor;
                 let chars: Vec<char> = self.content.chars().collect();
 
-                // Skip trailing spaces
                 while new_cursor > 0 && chars.get(new_cursor - 1) == Some(&' ') {
                     new_cursor -= 1;
                 }
-                // Skip word characters
                 while new_cursor > 0 && chars.get(new_cursor - 1) != Some(&' ') {
                     new_cursor -= 1;
                 }
 
-                // Calculate byte offsets for the range to delete
                 let start_byte = self
                     .content
                     .char_indices()
@@ -183,7 +177,6 @@ impl InputBox {
             }
             Action::Paste(text) => {
                 for c in text.chars() {
-                    // Convert newlines to spaces for single-line input
                     if c == '\n' || c == '\r' {
                         // Avoid double spaces from \r\n
                         if !self.content.ends_with(' ') && self.cursor > 0 {
@@ -230,17 +223,14 @@ impl InputBox {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        // Render content or placeholder
         let display_text = if self.content.is_empty() {
             self.placeholder.clone()
         } else {
-            // Apply scroll
             let visible_width = inner.width as usize;
             let chars: Vec<char> = self.content.chars().collect();
             let mut start_idx = 0;
             let mut current_width = 0;
 
-            // Find start position based on scroll
             for (i, c) in chars.iter().enumerate() {
                 if current_width >= self.scroll {
                     start_idx = i;
@@ -249,7 +239,6 @@ impl InputBox {
                 current_width += c.to_string().width();
             }
 
-            // Collect visible characters
             let mut visible = String::new();
             current_width = 0;
             for c in chars.iter().skip(start_idx) {
@@ -272,7 +261,6 @@ impl InputBox {
         let paragraph = Paragraph::new(display_text).style(style);
         paragraph.render(inner, buf);
 
-        // Render cursor if focused
         if self.focused && inner.width > 0 {
             let cursor_x = self.cursor_display_width().saturating_sub(self.scroll);
             if cursor_x < inner.width as usize {

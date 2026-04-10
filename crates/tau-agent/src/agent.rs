@@ -76,15 +76,12 @@ pub struct Agent {
     event_tx: broadcast::Sender<AgentEvent>,
     handle: AgentHandle,
 
-    // --- transformContext hook ---
     /// Optional hook to transform context messages before sending to transport
     transform_context: Option<Arc<TransformContextFn>>,
 
-    // --- Schema validator cache ---
     /// Cached compiled JSON schema validators keyed by tool name
     schema_cache: HashMap<String, Arc<jsonschema::Validator>>,
 
-    // --- File tracking for read-before-write guard ---
     /// Working directory override (set for subagents with custom CWDs).
     cwd: Option<PathBuf>,
     /// Files that have been read in this conversation.
@@ -310,7 +307,6 @@ impl Agent {
         .await
         .map_err(crate::error::Error::Compaction)?;
 
-        // Replace messages: [summary as User message] + [kept messages]
         let summary_msg = Message::user(format!(
             "<context-summary>\n{}\n</context-summary>",
             result.summary
@@ -334,7 +330,6 @@ impl Agent {
 
     /// Send a message with multiple content blocks
     pub async fn prompt_with_content(&mut self, content: Vec<Content>) -> crate::error::Result<()> {
-        // Create user message
         let user_message = Message::User {
             content,
             timestamp: chrono::Utc::now().timestamp_millis(),
@@ -345,7 +340,6 @@ impl Agent {
 
     /// Re-enter the agent loop, draining steering then follow-up queues.
     pub async fn continue_loop(&mut self) -> crate::error::Result<()> {
-        // Drain steering queue first, then follow-up
         let mut messages = self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
         if messages.is_empty() {
             messages = self.drain_queue(&self.handle.follow_up_queue, self.config.follow_up_mode);
@@ -404,8 +398,6 @@ impl Agent {
             ));
         }
     }
-
-    // ---- Private helpers extracted from run_with_messages ----
 
     /// Build the run config from current agent state.
     fn build_run_config(&self) -> AgentRunConfig {
@@ -496,7 +488,6 @@ impl Agent {
         if !self.config.compaction.enabled || !is_context_overflow(error) {
             return false;
         }
-        // Flush pending messages into conversation before compacting
         for m in messages_to_add.drain(..) {
             self.conversation.messages.push(m);
         }
@@ -596,10 +587,8 @@ impl Agent {
                 current_is_parallel = is_parallel;
                 current_group.push(idx);
             } else if is_parallel && current_is_parallel {
-                // Extend current parallel group
                 current_group.push(idx);
             } else {
-                // Flush current group, start new one
                 groups.push(current_group);
                 current_group = vec![idx];
                 current_is_parallel = is_parallel;
@@ -631,7 +620,6 @@ impl Agent {
             }
 
             if group.len() == 1 {
-                // Sequential execution — single tool
                 let idx = group[0];
                 let (ref id, ref name, ref args) = tool_calls[idx];
 
@@ -690,7 +678,6 @@ impl Agent {
                     ToolResult::error(format!("Tool not found: {}", name))
                 };
 
-                // Track successful reads
                 if name == "read" && !result.is_error {
                     if let Some(path) = Self::resolve_tool_path(args, &self.cwd) {
                         self.read_files.insert(path);
@@ -723,7 +710,6 @@ impl Agent {
                     break;
                 }
             } else {
-                // Parallel execution — run group concurrently via JoinSet
                 use tokio::task::JoinSet;
                 let mut join_set = JoinSet::new();
                 let cwd = self.effective_cwd();
@@ -807,7 +793,6 @@ impl Agent {
                     });
                 }
 
-                // Collect in original order
                 let mut results_map = std::collections::HashMap::new();
                 while let Some(join_result) = join_set.join_next().await {
                     match join_result {
@@ -829,7 +814,6 @@ impl Agent {
                             ToolResult::error("Task failed (panicked or cancelled)"),
                         )
                     });
-                    // Track successful reads from parallel execution
                     if orig_name == "read" && !result.is_error {
                         if let Some(path) = Self::resolve_tool_path(orig_args, &self.cwd) {
                             self.read_files.insert(path);
@@ -898,7 +882,6 @@ impl Agent {
         &mut self,
         initial_messages: Vec<Message>,
     ) -> crate::error::Result<()> {
-        // Reset cancellation token
         *self.handle.cancel.lock() = CancellationToken::new();
         self.handle.is_running.store(true, Ordering::Release);
 
@@ -914,7 +897,6 @@ impl Agent {
         let result = loop {
             turn += 1;
 
-            // Check cancellation before starting a new turn
             if self.handle.cancel.lock().is_cancelled() {
                 turn -= 1;
                 break Ok(());
@@ -965,10 +947,7 @@ impl Agent {
                 }
             }
 
-            // Build context for this turn
             let context_messages = self.build_context(&messages_to_add);
-
-            // Run the transport
             let cancel_token = self.handle.cancel.lock().clone();
             let mut event_stream = match self
                 .transport
@@ -1002,7 +981,6 @@ impl Agent {
                 }
             };
 
-            // Process the event stream
             let (assistant_message, turn_usage, stream_error) =
                 self.process_stream(&mut event_stream).await;
 
@@ -1033,7 +1011,6 @@ impl Agent {
             self.check_compaction_threshold(&turn_usage, &mut messages_to_add)
                 .await;
 
-            // Process assistant message
             if let Some(msg) = assistant_message {
                 self.flush_pending(&mut messages_to_add);
                 self.conversation.messages.push(msg.clone());
@@ -1067,7 +1044,6 @@ impl Agent {
 
         self.conversation.is_streaming = false;
 
-        // Proactive compaction check
         if self.config.compaction.enabled {
             let last_input = self.conversation.total_usage.input;
             let limit = self
@@ -1133,7 +1109,7 @@ fn validate_with_validator(
     let errors: Vec<String> = validator
         .iter_errors(args)
         .map(|e| {
-            let path = e.instance_path.to_string();
+            let path = e.instance_path().to_string();
             if path.is_empty() {
                 e.to_string()
             } else {
@@ -1175,8 +1151,6 @@ mod tests {
         events::AgentEvent,
         transport::{AgentEventStream, AgentRunConfig, Transport},
     };
-
-    // ===== Item 2: validate_tool_args tests =====
 
     fn simple_schema() -> serde_json::Value {
         serde_json::json!({
@@ -1246,8 +1220,6 @@ mod tests {
         assert!(validate_tool_args(&args, &schema).is_none());
     }
 
-    // ===== Item 3: has_meaningful_content tests =====
-
     #[test]
     fn test_meaningful_content_text() {
         let msg = Message::Assistant {
@@ -1310,8 +1282,6 @@ mod tests {
         };
         assert!(has_meaningful_content(&msg));
     }
-
-    // ===== Item 5: Steering & Follow-up queue tests =====
 
     /// A mock transport that returns a canned assistant response.
     struct MockTransport {
@@ -1476,8 +1446,6 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("fu1")));
     }
 
-    // ===== Steering with actual tool calls =====
-
     /// A simple no-op tool for testing
     struct NoopTool {
         tool_name: String,
@@ -1623,8 +1591,6 @@ mod tests {
         assert_eq!(count_b.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(count_c.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
-
-    // ===== Item 6: transformContext tests =====
 
     #[tokio::test]
     async fn test_transform_context_is_called() {

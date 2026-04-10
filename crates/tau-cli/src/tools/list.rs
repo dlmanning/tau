@@ -146,7 +146,6 @@ fn collect_flat(
 
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip hidden files unless requested
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -184,7 +183,6 @@ fn collect_recursive(
 
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip hidden files and common large directories
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -203,7 +201,6 @@ fn collect_recursive(
         );
         entries.push(entry_str);
 
-        // Recurse into directories
         if full_path.is_dir() {
             collect_recursive(base, &full_path, show_hidden, cancel, entries, limit);
         }

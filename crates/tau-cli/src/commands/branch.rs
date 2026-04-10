@@ -19,10 +19,8 @@ impl BranchCommand {
                     "No messages to branch from. Start a conversation first.".to_string(),
                 );
             }
-            // Open branch selector in TUI mode
             CommandResult::OpenBranchSelector
         } else {
-            // Parse the index
             match args.parse::<usize>() {
                 Ok(index) => {
                     if index >= message_count {

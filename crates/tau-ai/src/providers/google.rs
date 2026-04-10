@@ -51,7 +51,6 @@ impl GoogleProvider {
 
         let list: GoogleModelList = response.json().await?;
 
-        // Filter to generative models that support generateContent
         let chat_models: Vec<_> = list
             .models
             .into_iter()
@@ -76,7 +75,6 @@ impl GoogleProvider {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
 
-        // Add model-specific headers
         for (key, value) in &model.headers {
             if let (Ok(name), Ok(val)) = (
                 key.parse::<reqwest::header::HeaderName>(),
@@ -97,18 +95,15 @@ impl GoogleProvider {
     fn build_request(&self, model: &Model, context: &Context) -> Result<GeminiRequest> {
         let mut contents = Vec::new();
 
-        // Repair tool_use/tool_result pairing before conversion
         let mut context_messages = context.messages.clone();
         ensure_tool_result_pairing(&mut context_messages);
 
-        // Convert messages
         for msg in &context_messages {
             if let Some(content) = convert_message(msg) {
                 contents.push(content);
             }
         }
 
-        // System instruction (if present)
         let system_instruction = context.system_prompt.as_ref().map(|prompt| GeminiContent {
             role: None,
             parts: vec![GeminiPart::Text {
@@ -116,7 +111,6 @@ impl GoogleProvider {
             }],
         });
 
-        // Convert tools
         let tools = if context.tools.is_empty() {
             None
         } else {
@@ -340,8 +334,6 @@ fn create_stream(
     }
 }
 
-// Request types
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiRequest {
@@ -427,8 +419,6 @@ struct GeminiGenerationConfig {
     top_k: Option<i32>,
 }
 
-// Response types
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiStreamResponse {
@@ -484,8 +474,6 @@ struct GeminiErrorResponse {
 struct GeminiError {
     message: String,
 }
-
-// Model listing types
 
 /// Model info returned from Google API
 #[derive(Debug, Clone, Deserialize)]

@@ -55,7 +55,6 @@ pub fn ensure_tool_result_pairing(messages: &mut Vec<Message>) {
     let mut i = 0;
     while i < messages.len() {
         if let Message::Assistant { content, .. } = &messages[i] {
-            // Collect tool_use IDs from this assistant message
             let turn_tool_ids: Vec<(String, String)> = content
                 .iter()
                 .filter_map(|c| {

@@ -78,7 +78,6 @@ impl Tool for EditTool {
             None => return ToolResult::error("Missing 'new_text' argument"),
         };
 
-        // Expand ~ to home directory
         let path = if let Some(rest) = path_str.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 home.join(rest)
@@ -89,12 +88,10 @@ impl Tool for EditTool {
             super::resolve_path(path_str, &ctx.cwd)
         };
 
-        // Check for cancellation
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
-        // Read the file
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
@@ -105,7 +102,6 @@ impl Tool for EditTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Check if old text exists
         if !content.contains(old_text) {
             return ToolResult::error(format!(
                 "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
@@ -115,7 +111,6 @@ impl Tool for EditTool {
 
         let occurrences = content.matches(old_text).count();
 
-        // Perform replacement
         let new_content = if replace_all {
             content.replace(old_text, new_text)
         } else if occurrences > 1 {
@@ -127,7 +122,6 @@ impl Tool for EditTool {
             content.replacen(old_text, new_text, 1)
         };
 
-        // Check that something changed
         if content == new_content {
             return ToolResult::error(format!(
                 "No changes made to {}. The replacement produced identical content.",
@@ -135,15 +129,12 @@ impl Tool for EditTool {
             ));
         }
 
-        // Generate diff for output
         let diff = generate_diff(&content, &new_content);
 
-        // Check for cancellation before writing
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
-        // Write the file
         match fs::write(&path, &new_content).await {
             Ok(()) => {
                 let result = if replace_all && occurrences > 1 {

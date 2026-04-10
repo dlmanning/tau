@@ -46,7 +46,6 @@ pub async fn get_oauth_token(provider: OAuthProvider) -> Option<String> {
 
     // Check if token is expired (buffer already applied when storing)
     if chrono::Utc::now().timestamp_millis() >= credentials.expires {
-        // Token expired - try to refresh
         match refresh_token(provider, &credentials.refresh).await {
             Ok(new_creds) => {
                 save_oauth_credentials(provider.id(), &new_creds).ok()?;
@@ -54,7 +53,6 @@ pub async fn get_oauth_token(provider: OAuthProvider) -> Option<String> {
             }
             Err(e) => {
                 tracing::warn!("Failed to refresh OAuth token for {:?}: {}", provider, e);
-                // Remove invalid credentials
                 let _ = remove_oauth_credentials(provider.id());
                 None
             }

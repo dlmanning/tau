@@ -78,7 +78,6 @@ pub(super) fn convert_messages(
     cache_scope: &Option<CacheScope>,
     cache_ttl: &Option<String>,
 ) -> Vec<AnthropicMessage> {
-    // Repair tool_use/tool_result pairing before conversion
     let mut messages = messages.to_vec();
     ensure_tool_result_pairing(&mut messages);
 
@@ -186,7 +185,6 @@ pub(super) fn convert_messages(
                 });
             }
             Message::SystemInjection { content, source } => {
-                // Convert to user message with source context prefix
                 let prefix = match source {
                     crate::types::InjectionSource::SubagentCompleted { description, .. } => {
                         format!("[Subagent \"{}\" completed]\n", description)
@@ -209,7 +207,6 @@ pub(super) fn convert_messages(
         }
     }
 
-    // Consolidate consecutive messages with the same role.
     let mut consolidated: Vec<AnthropicMessage> = Vec::with_capacity(result.len());
     for msg in result {
         if let Some(last) = consolidated.last_mut() {
@@ -223,7 +220,6 @@ pub(super) fn convert_messages(
         consolidated.push(msg);
     }
 
-    // Add cache breakpoints to recent messages.
     if cache_breakpoint_budget > 0 {
         let total = consolidated.len();
         let cache_zone_start = total.saturating_sub(cache_breakpoint_budget);

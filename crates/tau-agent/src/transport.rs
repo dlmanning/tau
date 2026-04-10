@@ -313,7 +313,6 @@ impl Transport for ProviderTransport {
             tools: config.tools.clone(),
         };
 
-        // Get the appropriate provider and stream
         let model = config.model.clone();
         let run_config = config.clone();
         let api_key = self.api_key.clone();
@@ -322,7 +321,6 @@ impl Transport for ProviderTransport {
         let event_stream: AgentEventStream = Box::pin(stream! {
             yield AgentEvent::TurnStart { turn_number: 1 };
 
-            // Retry loop
             let mut attempt = 0u32;
             let message_stream;
 
@@ -468,8 +466,6 @@ impl Transport for ProviderTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- Item 1: Overflow pattern tests --
 
     #[test]
     fn test_overflow_anthropic_prompt_too_long() {

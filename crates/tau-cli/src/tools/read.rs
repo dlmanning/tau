@@ -66,7 +66,6 @@ impl Tool for ReadTool {
             None => return ToolResult::error("Missing 'path' argument"),
         };
 
-        // Expand ~ to home directory
         let path = if let Some(stripped) = path_str.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 home.join(stripped)
@@ -79,12 +78,10 @@ impl Tool for ReadTool {
             super::resolve_path(path_str, &ctx.cwd)
         };
 
-        // Check for cancellation
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
-        // Read the file
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
@@ -93,7 +90,6 @@ impl Tool for ReadTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // Parse offset and limit
         let offset = arguments
             .get("offset")
             .and_then(|v| v.as_u64())
@@ -106,7 +102,6 @@ impl Tool for ReadTool {
             .map(|l| l as usize)
             .unwrap_or(MAX_LINES);
 
-        // Check bounds
         if offset >= total_lines {
             return ToolResult::error(format!(
                 "Offset {} is beyond end of file ({} lines total)",
@@ -138,7 +133,6 @@ impl Tool for ReadTool {
 
         let mut output = formatted.join("\n");
 
-        // Add notices
         let mut notices = Vec::new();
         if had_truncated {
             notices.push(format!(

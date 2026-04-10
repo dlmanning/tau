@@ -88,7 +88,6 @@ impl OutputCollector {
             self.head_full = true;
         }
 
-        // Add to tail, evicting old entries if needed
         self.tail_bytes += line_len;
         self.tail.push_back(line);
         while self.tail.len() > self.max_tail_lines
@@ -102,7 +101,6 @@ impl OutputCollector {
 
     fn into_string(self) -> String {
         if !self.head_full {
-            // No truncation needed
             return self.head.join("\n");
         }
 
@@ -159,7 +157,6 @@ impl Tool for BashTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(120);
 
-        // Determine shell
         let (shell, shell_arg) = if cfg!(target_os = "windows") {
             ("cmd", "/C")
         } else {

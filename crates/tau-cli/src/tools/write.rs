@@ -64,7 +64,6 @@ impl Tool for WriteTool {
             None => return ToolResult::error("Missing 'content' argument"),
         };
 
-        // Expand ~ to home directory
         let path = if let Some(stripped) = path_str.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 home.join(stripped)
@@ -77,12 +76,10 @@ impl Tool for WriteTool {
             super::resolve_path(path_str, &ctx.cwd)
         };
 
-        // Check for cancellation
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
-        // Create parent directories
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent).await {
@@ -91,7 +88,6 @@ impl Tool for WriteTool {
             }
         }
 
-        // Write the file
         match fs::write(&path, content).await {
             Ok(()) => ToolResult::text(format!(
                 "Successfully wrote {} bytes to {}",

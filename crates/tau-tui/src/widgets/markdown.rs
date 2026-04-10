@@ -24,7 +24,6 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
-                    // Flush current line
                     if !current_line.is_empty() {
                         lines.push(Line::from(std::mem::take(&mut current_line)));
                     }
@@ -39,7 +38,6 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                     };
                 }
                 Tag::Paragraph => {
-                    // Start new paragraph
                     if !current_line.is_empty() {
                         lines.push(Line::from(std::mem::take(&mut current_line)));
                     }
@@ -47,7 +45,6 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                 Tag::CodeBlock(_) => {
                     in_code_block = true;
                     code_block_content.clear();
-                    // Flush current line and add blank line before code
                     if !current_line.is_empty() {
                         lines.push(Line::from(std::mem::take(&mut current_line)));
                     }
@@ -56,7 +53,6 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                     list_depth += 1;
                 }
                 Tag::Item => {
-                    // Start list item with bullet
                     if !current_line.is_empty() {
                         lines.push(Line::from(std::mem::take(&mut current_line)));
                     }
@@ -95,7 +91,6 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
-                    // Render code block with background styling
                     let code_style = Style::default().fg(theme.code).add_modifier(Modifier::DIM);
 
                     for code_line in code_block_content.lines() {
@@ -131,13 +126,11 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                 if in_code_block {
                     code_block_content.push_str(&text);
                 } else {
-                    // Wrap text if needed
                     let text_str = text.to_string();
                     current_line.push(Span::styled(text_str, current_style));
                 }
             }
             Event::Code(code) => {
-                // Inline code
                 let code_style = Style::default().fg(theme.code).add_modifier(Modifier::BOLD);
                 current_line.push(Span::styled(format!("`{}`", code), code_style));
             }
@@ -153,12 +146,10 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
         }
     }
 
-    // Flush remaining content
     if !current_line.is_empty() {
         lines.push(Line::from(current_line));
     }
 
-    // Remove trailing empty lines
     while lines.last().is_some_and(|l| {
         l.spans.is_empty() || (l.spans.len() == 1 && l.spans[0].content.is_empty())
     }) {

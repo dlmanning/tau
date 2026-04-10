@@ -17,16 +17,13 @@ const CONTEXT_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 pub fn load_context() -> Option<String> {
     let mut context_parts = Vec::new();
 
-    // 1. Load global context from ~/.config/tau/
     if let Some(global) = load_global_context() {
         context_parts.push(global);
     }
 
-    // 2. Load context from parent directories (root -> current)
     let parent_contexts = load_parent_contexts();
     context_parts.extend(parent_contexts);
 
-    // 3. Load context from current directory
     if let Some(current) = load_current_context() {
         context_parts.push(current);
     }
@@ -59,13 +56,8 @@ fn load_parent_contexts() -> Vec<String> {
         Err(_) => return contexts,
     };
 
-    // Find the repository root (look for .git directory)
     let repo_root = find_repo_root(&cwd);
-
-    // Collect parent directories from repo root (or filesystem root) down to parent of cwd
     let start_dir = repo_root.unwrap_or_else(|| PathBuf::from("/"));
-
-    // Build list of directories from start_dir to cwd's parent
     let mut dirs_to_check = Vec::new();
     let mut current = cwd.parent();
 
@@ -78,10 +70,7 @@ fn load_parent_contexts() -> Vec<String> {
         current = dir.parent();
     }
 
-    // Reverse so we go from root -> parent of cwd
     dirs_to_check.reverse();
-
-    // Load context from each directory
     for dir in dirs_to_check {
         if let Some(content) = load_context_from_dir(&dir) {
             contexts.push(content);
@@ -126,7 +115,6 @@ fn load_context_from_dir(dir: &Path) -> Option<String> {
 pub fn list_context_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
 
-    // Global
     if let Some(config_dir) = dirs::config_dir() {
         let tau_dir = config_dir.join("tau");
         for name in CONTEXT_FILE_NAMES {
@@ -138,7 +126,6 @@ pub fn list_context_files() -> Vec<PathBuf> {
         }
     }
 
-    // Parent directories
     if let Ok(cwd) = std::env::current_dir() {
         let repo_root = find_repo_root(&cwd);
         let start_dir = repo_root.unwrap_or_else(|| PathBuf::from("/"));
@@ -165,7 +152,6 @@ pub fn list_context_files() -> Vec<PathBuf> {
             }
         }
 
-        // Current directory
         for name in CONTEXT_FILE_NAMES {
             let path = cwd.join(name);
             if path.exists() {

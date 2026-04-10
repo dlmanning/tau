@@ -96,7 +96,6 @@ impl Tool for AgentTool {
             None => return ToolResult::error("Missing 'prompt'"),
         };
 
-        // Resume existing agent
         if let Some(agent_id) = arguments.get("to").and_then(|v| v.as_str()) {
             return match self.manager.send(agent_id, &prompt, ctx.cancel).await {
                 Ok(result) => ToolResult::text(format_result(&result)),

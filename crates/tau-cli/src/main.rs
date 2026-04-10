@@ -102,7 +102,6 @@ fn parse_provider(s: &str) -> Provider {
 }
 
 fn get_model(provider: &str, model_id: &str) -> Model {
-    // Try registry lookup first
     if let Some(model) = tau_ai::models::get_model_by_id(model_id) {
         return model;
     }
@@ -167,14 +166,12 @@ fn get_available_models() -> Vec<Model> {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Setup tracing
     if args.verbose {
         tracing_subscriber::fmt()
             .with_env_filter("tau=debug")
             .init();
     }
 
-    // Initialize config and exit
     if args.init_config {
         match config::Config::init() {
             Ok(path) => {
@@ -189,30 +186,24 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // List sessions and exit
     if args.sessions {
         return list_sessions();
     }
 
-    // Handle OAuth login
     if let Some(provider_id) = args.login {
         return handle_oauth_login(&provider_id).await;
     }
 
-    // Handle OAuth logout
     if let Some(provider_id) = args.logout {
         return handle_oauth_logout(&provider_id);
     }
 
-    // Show auth status
     if args.auth_status {
         return show_auth_status();
     }
 
-    // Load config file
     let cfg = config::Config::load();
 
-    // Change working directory if specified
     if let Some(ref dir) = args.working_dir {
         std::env::set_current_dir(dir)?;
     }
@@ -270,7 +261,6 @@ async fn main() -> anyhow::Result<()> {
         api_key,
     ));
 
-    // Build compaction config from settings
     let compaction = if let Some(ref compaction_settings) = cfg.compaction {
         tau_agent::CompactionConfig {
             enabled: compaction_settings.enabled.unwrap_or(true),
@@ -303,7 +293,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut agent = Agent::new(config, transport.clone());
 
-    // Add tools
     agent.add_tool(Arc::new(tools::BashTool::new()));
     agent.add_tool(Arc::new(tools::ReadTool::new()));
     agent.add_tool(Arc::new(tools::WriteTool::new()));
@@ -312,7 +301,6 @@ async fn main() -> anyhow::Result<()> {
     agent.add_tool(Arc::new(tools::GrepTool::new()));
     agent.add_tool(Arc::new(tools::ListTool::new()));
 
-    // Add LSP tool if any language servers are available
     let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
     if lsp_manager.is_available() {
         agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager)));
@@ -355,7 +343,6 @@ async fn main() -> anyhow::Result<()> {
     };
     agent.set_system_prompt(tau_agent::prompts::build_system_prompt(&prompt_opts));
 
-    // Resume session if specified
     if let Some(ref session_id) = args.resume {
         match session::SessionManager::load(session_id) {
             Ok((_session, messages, previous_summary)) => {
@@ -407,12 +394,10 @@ async fn run_command(agent: &mut Agent, command: &str, model: &Model) -> anyhow:
     let mut receiver = agent.subscribe();
     let model_for_cost = model.clone();
 
-    // Spawn event handler
     let handle = tokio::spawn(async move {
         while let Ok(event) = receiver.recv().await {
             match event {
                 AgentEvent::MessageUpdate { message } => {
-                    // Print streaming text
                     let text = message.text();
                     if !text.is_empty() {
                         print!("\r{}", text);
@@ -491,7 +476,6 @@ async fn run_interactive(
 
     let available_models = get_available_models();
 
-    // Show minimal startup info (only if TTY)
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         let model_short = model.id.split('/').next_back().unwrap_or(&model.id);
         if let Some(ref s) = session {
@@ -508,7 +492,6 @@ async fn run_interactive(
 
         let mut input = String::new();
         if io::stdin().read_line(&mut input)? == 0 {
-            // EOF
             break;
         }
 
@@ -517,7 +500,6 @@ async fn run_interactive(
             continue;
         }
 
-        // Handle slash commands
         if input.starts_with('/') {
             if let Some(result) =
                 commands::execute_command(input, agent, model, *reasoning, &available_models)
@@ -552,14 +534,12 @@ async fn run_interactive(
                         println!("Type /help for available commands.");
                     }
                     commands::CommandResult::OpenModelSelector => {
-                        // In CLI mode, just list the models
                         println!(
                             "{}",
                             commands::ModelCommand::list_models_text(model, &available_models)
                         );
                     }
                     commands::CommandResult::OpenBranchSelector => {
-                        // In CLI mode, show message list and ask for index
                         let messages = agent.messages();
                         if messages.is_empty() {
                             println!("No messages to branch from.");
@@ -610,7 +590,6 @@ async fn run_interactive(
                                     new_session.id(),
                                     msg_count
                                 );
-                                // Truncate agent messages to branch point
                                 if let Some(idx) = branch_index {
                                     let messages: Vec<_> =
                                         agent.messages().iter().take(idx + 1).cloned().collect();
@@ -636,8 +615,6 @@ async fn run_interactive(
         let mut receiver = agent.subscribe();
         let model_for_cost = model.clone();
 
-        // Spawn event handler
-        // Check if stdout is a TTY for cursor handling
         let is_tty = std::io::IsTerminal::is_terminal(&io::stdout());
         let handle = tokio::spawn(async move {
             let mut last_text_len = 0;
@@ -734,17 +711,14 @@ async fn run_interactive(
             eprintln!("Error: {}", e);
         }
 
-        // Save all new messages (user + assistant + tool calls) to session
         if let Some(ref mut s) = session {
             let all_msgs = agent.messages();
             for msg in all_msgs.iter().skip(msgs_before) {
                 let _ = s.append_message(msg);
             }
-            // Save usage
             let _ = s.append_usage(&agent.state().total_usage);
         }
 
-        // Wait for events to finish
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         handle.abort();
 
@@ -809,7 +783,6 @@ async fn handle_oauth_login(provider_id: &str) -> anyhow::Result<()> {
             println!("  {}", url);
             println!();
 
-            // Try to open browser
             #[cfg(target_os = "macos")]
             let _ = std::process::Command::new("open").arg(&url).spawn();
             #[cfg(target_os = "linux")]

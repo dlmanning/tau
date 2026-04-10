@@ -42,7 +42,6 @@ pub struct App {
 impl App {
     /// Create a new application
     pub fn new() -> io::Result<Self> {
-        // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(
@@ -81,12 +80,10 @@ impl App {
     /// Run the application with the given state
     pub fn run<S: AppState>(&mut self, state: &mut S) -> io::Result<()> {
         loop {
-            // Render
             self.terminal.draw(|frame| {
                 state.render(frame);
             })?;
 
-            // Handle events
             if event::poll(self.tick_rate)? {
                 let evt = event::read()?;
                 if let Event::Key(_) | Event::Paste(_) = &evt {
@@ -98,7 +95,6 @@ impl App {
                 }
             }
 
-            // Tick for animations
             state.tick();
         }
     }
@@ -120,12 +116,10 @@ impl App {
         let mut event_stream = EventStream::new();
 
         loop {
-            // Render
             self.terminal.draw(|frame| {
                 state.render(frame);
             })?;
 
-            // Handle events with timeout for ticks
             let event = tokio::time::timeout(self.tick_rate, event_stream.next()).await;
 
             match event {
@@ -140,11 +134,9 @@ impl App {
                     return Err(e);
                 }
                 Ok(None) => {
-                    // Stream ended
                     return Ok(());
                 }
                 Err(_) => {
-                    // Timeout - tick
                     state.tick();
                 }
             }
@@ -154,7 +146,6 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Restore terminal
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
