@@ -443,40 +443,20 @@ impl Agent {
         context
     }
 
-    /// Process the event stream, forwarding events to subscribers.
-    /// Returns (assistant_message, turn_usage, error_if_any).
+    /// Process the event stream, forwarding events to subscribers
+    /// and reducing them into a [`StreamOutcome`](crate::stream::StreamOutcome).
     async fn process_stream(
-        &mut self,
+        &self,
         event_stream: &mut crate::transport::AgentEventStream,
-    ) -> (Option<Message>, Usage, Option<String>) {
+    ) -> crate::stream::StreamOutcome {
         use futures::StreamExt;
 
-        let mut assistant_message: Option<Message> = None;
-        let mut turn_usage = Usage::default();
-        let mut error: Option<String> = None;
-
+        let mut reducer = crate::stream::StreamReducer::default();
         while let Some(event) = event_stream.next().await {
             send_event(&self.event_tx, event.clone());
-
-            match event {
-                AgentEvent::MessageUpdate { message } => {
-                    self.conversation.stream_message = Some(message);
-                }
-                AgentEvent::MessageEnd { message } => {
-                    self.conversation.stream_message = None;
-                    assistant_message = Some(message);
-                }
-                AgentEvent::TurnEnd { usage, .. } => {
-                    turn_usage = usage;
-                }
-                AgentEvent::Error { message } => {
-                    error = Some(message);
-                }
-                _ => {}
-            }
+            reducer.observe(&event);
         }
-
-        (assistant_message, turn_usage, error)
+        reducer.finalize()
     }
 
     /// Add turn usage to cumulative totals.
@@ -771,10 +751,10 @@ impl Agent {
                             .run(context_messages, &final_config, cancel_token)
                             .await
                         {
-                            let (msg, usage, _) = self.process_stream(&mut stream).await;
-                            self.accumulate_usage(&usage);
+                            let outcome = self.process_stream(&mut stream).await;
+                            self.accumulate_usage(&outcome.usage);
                             self.flush_pending(&mut messages_to_add);
-                            if let Some(msg) = msg {
+                            if let Some(msg) = outcome.assistant_message {
                                 self.conversation.messages.push(msg);
                             }
                         }
@@ -820,12 +800,11 @@ impl Agent {
                 }
             };
 
-            let (assistant_message, turn_usage, stream_error) =
-                self.process_stream(&mut event_stream).await;
+            let outcome = self.process_stream(&mut event_stream).await;
 
             // Handle streaming errors with overflow recovery
-            if let Some(error_message) = stream_error {
-                if let Some(partial) = self.conversation.stream_message.take() {
+            if let Some(error_message) = outcome.error {
+                if let Some(partial) = outcome.partial_message {
                     if has_meaningful_content(&partial) {
                         self.flush_pending(&mut messages_to_add);
                         self.conversation.messages.push(partial);
@@ -846,11 +825,11 @@ impl Agent {
                 break Err(crate::error::Error::Other(error_message));
             }
 
-            self.accumulate_usage(&turn_usage);
-            self.check_compaction_threshold(&turn_usage, &mut messages_to_add)
+            self.accumulate_usage(&outcome.usage);
+            self.check_compaction_threshold(&outcome.usage, &mut messages_to_add)
                 .await;
 
-            if let Some(msg) = assistant_message {
+            if let Some(msg) = outcome.assistant_message {
                 self.flush_pending(&mut messages_to_add);
                 self.conversation.messages.push(msg.clone());
 

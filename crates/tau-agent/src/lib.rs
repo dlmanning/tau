@@ -13,6 +13,7 @@ pub mod handle;
 pub mod interaction;
 pub mod prompts;
 pub mod agent_manager;
+pub mod stream;
 pub mod tool;
 pub mod transport;
 
