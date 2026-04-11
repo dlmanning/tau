@@ -205,10 +205,13 @@ pub enum Content {
         name: String,
         input: serde_json::Value,
     },
-    /// Server tool result
+    /// Server tool result (web search results, etc.)
     ServerToolResult {
         tool_use_id: String,
         content: serde_json::Value,
+        /// Original API block type for round-tripping (e.g. "web_search_tool_result")
+        #[serde(default)]
+        api_type: String,
     },
 }
 
@@ -459,6 +462,23 @@ impl Message {
     }
 }
 
+/// Server-controlled tool definitions (handled by the API, not the client)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ServerTool {
+    /// Anthropic web search tool
+    #[serde(rename = "web_search_20250305")]
+    WebSearch {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_domains: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        blocked_domains: Option<Vec<String>>,
+    },
+}
+
 /// Tool definition for function calling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
@@ -494,6 +514,9 @@ pub struct Context {
     pub messages: Vec<Message>,
     /// Available tools
     pub tools: Vec<Tool>,
+    /// Server-controlled tools (e.g. web search)
+    #[allow(dead_code)]
+    pub server_tools: Vec<ServerTool>,
 }
 
 impl Context {
@@ -503,6 +526,7 @@ impl Context {
             system_prompt: Some(system_prompt.into()),
             messages: vec![],
             tools: vec![],
+            server_tools: vec![],
         }
     }
 

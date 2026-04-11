@@ -524,6 +524,7 @@ async fn call_summarization_llm(
     let run_config = AgentRunConfig {
         system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
         tools: vec![],
+        server_tools: vec![],
         model: agent_config.model.clone(),
         reasoning: None, // No reasoning for summarization
         thinking_adaptive: false,

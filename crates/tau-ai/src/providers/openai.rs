@@ -555,6 +555,7 @@ mod tests {
             system_prompt: None,
             messages: vec![],
             tools: vec![],
+            server_tools: vec![],
         };
         let request = provider.build_request(&model, &context).unwrap();
         assert!(request.stream);

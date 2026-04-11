@@ -50,6 +50,20 @@ pub enum MessageEvent {
         stop_reason: StopReason,
         usage: Usage,
     },
+    /// Server-side tool started (e.g. web search)
+    ServerToolStart {
+        content_index: usize,
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Server-side tool result received (e.g. web search results)
+    ServerToolEnd {
+        content_index: usize,
+        tool_use_id: String,
+        api_type: String,
+        content: serde_json::Value,
+    },
     /// Error occurred
     Error { message: String },
 }
@@ -338,6 +352,11 @@ enum AccBlock {
         name: String,
         input: serde_json::Value,
     },
+    ServerToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+        api_type: String,
+    },
 }
 
 impl StreamAccumulator {
@@ -567,16 +586,46 @@ impl StreamAccumulator {
         self.blocks[index] = AccBlock::RedactedThinking { data };
     }
 
-    /// Record a server tool use block (no events emitted).
+    /// Record a server tool use block and emit a start event.
     pub fn add_server_tool_use(
         &mut self,
         index: usize,
         id: String,
         name: String,
         input: serde_json::Value,
-    ) {
+    ) -> Vec<MessageEvent> {
         self.ensure_block(index);
+        let event = MessageEvent::ServerToolStart {
+            content_index: index,
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        };
         self.blocks[index] = AccBlock::ServerToolUse { id, name, input };
+        vec![event]
+    }
+
+    /// Record a server tool result block and emit an end event.
+    pub fn add_server_tool_result(
+        &mut self,
+        index: usize,
+        tool_use_id: String,
+        content: serde_json::Value,
+        api_type: String,
+    ) -> Vec<MessageEvent> {
+        self.ensure_block(index);
+        let event = MessageEvent::ServerToolEnd {
+            content_index: index,
+            tool_use_id: tool_use_id.clone(),
+            api_type: api_type.clone(),
+            content: content.clone(),
+        };
+        self.blocks[index] = AccBlock::ServerToolResult {
+            tool_use_id,
+            content,
+            api_type,
+        };
+        vec![event]
     }
 
     /// Mutable reference to usage for incremental updates.
@@ -715,6 +764,17 @@ impl StreamAccumulator {
                 }
                 AccBlock::ServerToolUse { id, name, input } => {
                     content.push(Content::ServerToolUse { id, name, input });
+                }
+                AccBlock::ServerToolResult {
+                    tool_use_id,
+                    content: result_content,
+                    api_type,
+                } => {
+                    content.push(Content::ServerToolResult {
+                        tool_use_id,
+                        content: result_content,
+                        api_type,
+                    });
                 }
             }
         }

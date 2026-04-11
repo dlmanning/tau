@@ -146,7 +146,23 @@ pub(super) fn convert_messages(
                         Content::ServerToolUse { id, name, input } => {
                             Some(serde_json::json!({ "type": "server_tool_use", "id": id, "name": name, "input": input }))
                         }
-                        Content::Image { .. } | Content::ServerToolResult { .. } => None,
+                        Content::ServerToolResult {
+                            tool_use_id,
+                            content: result_content,
+                            api_type,
+                        } => {
+                            let block_type = if api_type.is_empty() {
+                                "server_tool_result"
+                            } else {
+                                api_type.as_str()
+                            };
+                            Some(serde_json::json!({
+                                "type": block_type,
+                                "tool_use_id": tool_use_id,
+                                "content": result_content
+                            }))
+                        }
+                        Content::Image { .. } => None,
                     })
                     .collect();
 

@@ -55,6 +55,10 @@ pub(super) struct ContentBlockInfo {
     pub name: Option<String>,
     pub data: Option<String>,
     pub input: Option<serde_json::Value>,
+    /// For server tool result blocks (e.g. web_search_tool_result)
+    pub tool_use_id: Option<String>,
+    /// Content of server tool results (search results array, etc.)
+    pub content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,12 +160,23 @@ pub(super) fn create_stream(
                                     );
                                 }
                                 "server_tool_use" => {
-                                    acc.add_server_tool_use(
+                                    for ev in acc.add_server_tool_use(
                                         index,
                                         data.content_block.id.unwrap_or_default(),
                                         data.content_block.name.unwrap_or_default(),
                                         data.content_block.input.unwrap_or(serde_json::Value::Null),
-                                    );
+                                    ) { yield ev; }
+                                }
+                                "web_search_tool_result" | "server_tool_result" => {
+                                    // Server tool result blocks arrive fully formed (no deltas)
+                                    let tool_use_id = data.content_block.tool_use_id.unwrap_or_default();
+                                    let content_val = data.content_block.content.unwrap_or(serde_json::Value::Null);
+                                    for ev in acc.add_server_tool_result(
+                                        index,
+                                        tool_use_id,
+                                        content_val,
+                                        data.content_block.block_type,
+                                    ) { yield ev; }
                                 }
                                 _ => {}
                             }

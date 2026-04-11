@@ -77,6 +77,9 @@ pub struct Agent {
     event_tx: broadcast::Sender<AgentEvent>,
     handle: AgentHandle,
 
+    /// Server-controlled tools (e.g. web search)
+    server_tools: Vec<tau_ai::ServerTool>,
+
     /// Optional hook to transform context messages before sending to transport
     transform_context: Option<Arc<TransformContextFn>>,
 
@@ -99,6 +102,7 @@ impl Agent {
             config,
             conversation: Conversation::default(),
             tools: vec![],
+            server_tools: vec![],
             transport,
             event_tx,
             handle: AgentHandle::new(),
@@ -198,6 +202,11 @@ impl Agent {
     /// Get tool names
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// Add a server-controlled tool (e.g. web search)
+    pub fn add_server_tool(&mut self, tool: tau_ai::ServerTool) {
+        self.server_tools.push(tool);
     }
 
     /// Clear all messages
@@ -417,6 +426,7 @@ impl Agent {
         AgentRunConfig {
             system_prompt: self.config.system_prompt.clone(),
             tools: self.tools.iter().map(|t| to_api_tool(t.as_ref())).collect(),
+            server_tools: self.server_tools.clone(),
             model: self.config.model.clone(),
             reasoning: Some(self.config.reasoning),
             thinking_adaptive: self.config.thinking_adaptive,

@@ -130,6 +130,41 @@ async fn create_provider_and_stream(
     }
 }
 
+/// Format a server tool result for display.
+/// Extracts titles and URLs from web_search_tool_result content.
+fn format_server_tool_result(api_type: &str, content: &serde_json::Value) -> String {
+    if api_type.contains("web_search") {
+        if let Some(results) = content.as_array() {
+            let entries: Vec<String> = results
+                .iter()
+                .filter_map(|r| {
+                    let title = r.get("title").and_then(|t| t.as_str())?;
+                    let url = r.get("url").and_then(|u| u.as_str())?;
+                    Some(format!("- {} ({})", title, url))
+                })
+                .collect();
+            if entries.is_empty() {
+                return "No results found".to_string();
+            }
+            return format!("{} results:\n{}", entries.len(), entries.join("\n"));
+        }
+        // Error response
+        if let Some(error_code) = content
+            .get("error_code")
+            .and_then(|e| e.as_str())
+        {
+            return format!("Search error: {}", error_code);
+        }
+    }
+    // Fallback: truncated JSON
+    let json = serde_json::to_string_pretty(content).unwrap_or_default();
+    if json.len() > 500 {
+        format!("{}...", &json[..500])
+    } else {
+        json
+    }
+}
+
 /// Check if an error is retryable
 fn is_retryable_error(error: &str) -> bool {
     // Rate limit errors
@@ -229,6 +264,8 @@ pub struct AgentRunConfig {
     pub system_prompt: Option<String>,
     /// Available tools (as API definitions)
     pub tools: Vec<tau_ai::Tool>,
+    /// Server-controlled tools (e.g. web search)
+    pub server_tools: Vec<tau_ai::ServerTool>,
     /// Model to use
     pub model: Model,
     /// Reasoning/thinking level
@@ -311,6 +348,7 @@ impl Transport for ProviderTransport {
             system_prompt: config.system_prompt.clone(),
             messages,
             tools: config.tools.clone(),
+            server_tools: config.server_tools.clone(),
         };
 
         let model = config.model.clone();
@@ -435,6 +473,22 @@ impl Transport for ProviderTransport {
                             metadata: tau_ai::AssistantMetadata::default(),
                         };
                         yield AgentEvent::MessageUpdate { message: partial };
+                    }
+                    tau_ai::stream::MessageEvent::ServerToolStart { id, name, input, .. } => {
+                        yield AgentEvent::ToolExecutionStart {
+                            tool_call_id: id.clone(),
+                            tool_name: name.clone(),
+                            arguments: input.clone(),
+                        };
+                    }
+                    tau_ai::stream::MessageEvent::ServerToolEnd { tool_use_id, api_type, content, .. } => {
+                        let result = format_server_tool_result(api_type, content);
+                        yield AgentEvent::ToolExecutionEnd {
+                            tool_call_id: tool_use_id.clone(),
+                            tool_name: api_type.clone(),
+                            result,
+                            is_error: false,
+                        };
                     }
                     tau_ai::stream::MessageEvent::Done { message, usage, .. } => {
                         final_message = Some(message.clone());

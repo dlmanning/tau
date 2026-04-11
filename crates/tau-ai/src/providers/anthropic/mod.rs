@@ -197,6 +197,9 @@ impl AnthropicProvider {
         if matches!(opts.cache_scope, Some(CacheScope::Global)) {
             betas.push("prompt-caching-scope-2026-01-05");
         }
+        if !context.server_tools.is_empty() {
+            betas.push("web-search-2025-03-05");
+        }
 
         if is_oauth {
             betas.insert(0, "oauth-2025-04-20");
@@ -291,13 +294,31 @@ impl AnthropicProvider {
             &options.cache_scope,
             &options.cache_ttl,
         );
-        let tools = if has_tools {
-            Some(convert_tools(
-                &context.tools,
-                true,
-                &options.cache_scope,
-                &options.cache_ttl,
-            ))
+        let has_server_tools = !context.server_tools.is_empty();
+        let tools = if has_tools || has_server_tools {
+            let mut all_tools: Vec<serde_json::Value> = vec![];
+
+            // Add client tools
+            if has_tools {
+                let client_tools = convert_tools(
+                    &context.tools,
+                    !has_server_tools, // cache_last only if no server tools follow
+                    &options.cache_scope,
+                    &options.cache_ttl,
+                );
+                for tool in client_tools {
+                    all_tools.push(serde_json::to_value(&tool).unwrap_or_default());
+                }
+            }
+
+            // Add server tools (web search, etc.)
+            for server_tool in &context.server_tools {
+                if let Ok(val) = serde_json::to_value(server_tool) {
+                    all_tools.push(val);
+                }
+            }
+
+            Some(serde_json::Value::Array(all_tools))
         } else {
             None
         };

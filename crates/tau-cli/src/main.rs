@@ -339,6 +339,16 @@ async fn main() -> anyhow::Result<()> {
     ));
     agent.add_tool(Arc::new(tools::SendMessageTool::new(mgr_for_send)));
 
+    // Enable web search for Anthropic models
+    if model.provider == tau_ai::Provider::Anthropic {
+        agent.add_server_tool(tau_ai::ServerTool::WebSearch {
+            name: "web_search".to_string(),
+            max_uses: Some(8),
+            allowed_domains: None,
+            blocked_domains: None,
+        });
+    }
+
     // Build dynamic system prompt based on registered tools
     let tool_names = agent.tool_names();
     let cwd = std::env::current_dir()
