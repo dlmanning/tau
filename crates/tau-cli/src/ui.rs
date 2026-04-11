@@ -31,6 +31,72 @@ struct PendingInteraction {
     selector: SelectorState,
 }
 
+/// Per-agent progress tracking for richer subagent display.
+struct AgentProgress {
+    tool_count: u32,
+    input_tokens: u32,
+    output_tokens: u32,
+    activity: String,
+    finished: bool,
+}
+
+impl AgentProgress {
+    fn new() -> Self {
+        Self {
+            tool_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            activity: "starting...".to_string(),
+            finished: false,
+        }
+    }
+
+}
+
+/// Build a human-readable description of what a tool is doing.
+fn describe_tool_activity(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let short_path = || {
+        arguments
+            .get("path")
+            .or_else(|| arguments.get("file_path"))
+            .and_then(|v| v.as_str())
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("file")
+    };
+
+    match tool_name {
+        "read" => format!("Reading {}", short_path()),
+        "write" => format!("Writing {}", short_path()),
+        "edit" => format!("Editing {}", short_path()),
+        "bash" => {
+            let cmd = arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("command");
+            let short: String = cmd.chars().take(30).collect();
+            format!("Running {}", short)
+        }
+        "grep" => {
+            let pattern = arguments
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("...");
+            format!("Searching for \"{}\"", pattern)
+        }
+        "glob" => {
+            let pattern = arguments
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("...");
+            format!("Finding {}", pattern)
+        }
+        "list" => "Listing directory".to_string(),
+        "lsp" => "Querying language server".to_string(),
+        "agent" => "Spawning agent".to_string(),
+        other => format!("Running {}", other),
+    }
+}
+
 /// Format a token count compactly (e.g. 1234 → "1.2k", 56 → "56")
 fn format_tokens(n: u32) -> String {
     if n >= 1000 {
@@ -63,8 +129,8 @@ pub enum UiMessage {
 pub struct TuiState {
     /// Chat messages
     messages: Vec<ChatMessage>,
-    /// Set of active subagent tool_call_ids (messages found by id field)
-    active_agents: std::collections::HashSet<String>,
+    /// Per-agent progress state keyed by agent_id.
+    agent_progress: std::collections::HashMap<String, AgentProgress>,
     /// Input box
     input: InputBox,
     /// Current scroll position
@@ -126,7 +192,7 @@ impl TuiState {
 
         Self {
             messages: vec![],
-            active_agents: std::collections::HashSet::new(),
+            agent_progress: std::collections::HashMap::new(),
             input,
             scroll: 0,
             is_processing: false,
@@ -261,7 +327,7 @@ impl TuiState {
                 )));
                 self.scroll_to_bottom();
             }
-            // Subagent events — dispatch inner event with agent context
+            // Subagent events — track in status bar, show summary on completion
             AgentEvent::Subagent {
                 agent_id,
                 description,
@@ -269,50 +335,27 @@ impl TuiState {
             } => {
                 match *event {
                     AgentEvent::AgentStart => {
-                        let msg = ChatMessage {
-                            role: format!("agent:{}", description),
-                            content: "starting...".to_string(),
-                            is_error: false,
-                            is_streaming: true,
-                            id: Some(agent_id.clone()),
-                        };
-                        self.messages.push(msg);
-                        self.active_agents.insert(agent_id);
-                        self.scroll_to_bottom();
+                        let progress = AgentProgress::new();
+                        self.agent_progress.insert(agent_id, progress);
                         self.status = format!("Agent: {}...", description);
                     }
-                    AgentEvent::ToolExecutionStart { ref tool_name, .. } => {
-                        if let Some(msg) = self
-                            .messages
-                            .iter_mut()
-                            .rev()
-                            .find(|m| m.id.as_deref() == Some(&agent_id))
-                        {
-                            msg.content = format!("[{}...]", tool_name);
-                        }
-                        self.status = format!("Agent [{}...]", tool_name);
-                        self.scroll_to_bottom();
-                    }
-                    AgentEvent::ToolExecutionEnd {
+                    AgentEvent::ToolExecutionStart {
                         ref tool_name,
-                        is_error,
+                        ref arguments,
                         ..
                     } => {
-                        if let Some(msg) = self
-                            .messages
-                            .iter_mut()
-                            .rev()
-                            .find(|m| m.id.as_deref() == Some(&agent_id))
-                        {
-                            if is_error {
-                                msg.content = format!("[{} error]", tool_name);
-                            } else {
-                                msg.content = format!("[{} done]", tool_name);
-                            }
+                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                            progress.tool_count += 1;
+                            progress.activity =
+                                describe_tool_activity(tool_name, arguments);
                         }
-                        self.scroll_to_bottom();
+                        self.status = format!("Agent: {} [{}]", description, tool_name);
                     }
                     AgentEvent::TurnEnd { ref usage, .. } => {
+                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                            progress.input_tokens += usage.input;
+                            progress.output_tokens += usage.output;
+                        }
                         self.total_input_tokens += usage.input;
                         self.total_output_tokens += usage.output;
                         self.total_cache_read += usage.cache_read;
@@ -321,29 +364,39 @@ impl TuiState {
                         self.total_cost += cost.total;
                     }
                     AgentEvent::AgentEnd { .. } => {
-                        self.active_agents.remove(&agent_id);
-                        if let Some(msg) = self
-                            .messages
-                            .iter_mut()
-                            .rev()
-                            .find(|m| m.id.as_deref() == Some(&agent_id))
-                        {
-                            msg.is_streaming = false;
-                            msg.content = "done".to_string();
+                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                            progress.finished = true;
+                            let tokens =
+                                format_tokens(progress.input_tokens + progress.output_tokens);
+                            let msg = ChatMessage {
+                                role: format!("agent:{}", description),
+                                content: format!(
+                                    "{} tools · {} tokens",
+                                    progress.tool_count, tokens
+                                ),
+                                is_error: false,
+                                is_streaming: false,
+                                id: Some(agent_id),
+                            };
+                            self.messages.push(msg);
+                            self.scroll_to_bottom();
                         }
+                        self.status = "Ready".to_string();
                     }
                     AgentEvent::Error { ref message } => {
-                        self.active_agents.remove(&agent_id);
-                        if let Some(msg) = self
-                            .messages
-                            .iter_mut()
-                            .rev()
-                            .find(|m| m.id.as_deref() == Some(&agent_id))
-                        {
-                            msg.is_streaming = false;
-                            msg.is_error = true;
-                            msg.content = format!("error: {}", message);
+                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                            progress.finished = true;
                         }
+                        let msg = ChatMessage {
+                            role: format!("agent:{}", description),
+                            content: message.clone(),
+                            is_error: true,
+                            is_streaming: false,
+                            id: Some(agent_id),
+                        };
+                        self.messages.push(msg);
+                        self.scroll_to_bottom();
+                        self.status = "Ready".to_string();
                     }
                     _ => {}
                 }
@@ -487,7 +540,7 @@ impl TuiState {
             Action::Clear => {
                 let _ = self.ui_tx.send(UiMessage::Clear).await;
                 self.messages.clear();
-                self.active_agents.clear();
+                self.agent_progress.clear();
                 self.total_input_tokens = 0;
                 self.total_output_tokens = 0;
                 self.total_cache_read = 0;
@@ -820,8 +873,9 @@ pub async fn run_tui(
             state.messages.push(ChatMessage::assistant_streaming(""));
             state.scroll_to_bottom();
 
-            // Get cancel handle before creating the future (so we can cancel without borrowing agent)
+            // Get handles before creating the future (so we can use them without borrowing agent)
             let cancel_handle = agent.cancel_handle();
+            let agent_handle = agent.handle();
 
             let mut prompt_future = std::pin::pin!(agent.prompt(&content));
 
@@ -890,6 +944,23 @@ pub async fn run_tui(
                                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                                         terminal.show_cursor()?;
                                         return Ok(());
+                                    }
+                                    Action::Submit => {
+                                        let content = state.input.content().to_string();
+                                        if !content.is_empty() {
+                                            state.input.clear();
+                                            // Use "steer" role to visually distinguish from
+                                            // normal prompts (▷ dim italic vs ▶ bold accent)
+                                            state.messages.push(ChatMessage {
+                                                role: "steer".to_string(),
+                                                content: content.clone(),
+                                                is_error: false,
+                                                is_streaming: false,
+                                                id: None,
+                                            });
+                                            state.scroll_to_bottom();
+                                            agent_handle.steer(tau_ai::Message::user(&content));
+                                        }
                                     }
                                     _ => {
                                         state.input.handle_action(&action, area_width);
@@ -1002,7 +1073,7 @@ pub async fn run_tui(
                                     state.total_cache_read = 0;
                                     state.total_cache_write = 0;
                                     state.total_cost = 0.0;
-                                    state.active_agents.clear();
+                                    state.agent_progress.clear();
                                     state.status = "Cleared".to_string();
                                 }
                                 CommandResult::ChangeModel(new_model) => {
@@ -1069,7 +1140,7 @@ pub async fn run_tui(
                                             state.total_cache_read = 0;
                                             state.total_cache_write = 0;
                                             state.total_cost = 0.0;
-                                            state.active_agents.clear();
+                                            state.agent_progress.clear();
                                         }
                                         Err(e) => {
                                             state.show_system_message(&format!("Failed to create branch: {}", e));
@@ -1095,7 +1166,7 @@ pub async fn run_tui(
                         state.total_cache_read = 0;
                         state.total_cache_write = 0;
                         state.total_cost = 0.0;
-                        state.active_agents.clear();
+                        state.agent_progress.clear();
                         state.status = "Cleared".to_string();
                     }
                     Some(UiMessage::Abort) => {

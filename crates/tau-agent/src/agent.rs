@@ -851,6 +851,16 @@ impl Agent {
             }
 
             DrainFollowUps => {
+                // Check steering queue first (user messages injected during execution)
+                let steering =
+                    self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
+                if !steering.is_empty() {
+                    return StartTurn {
+                        messages: steering,
+                        first_user_message: None,
+                    };
+                }
+
                 let follow_ups =
                     self.drain_queue(&self.handle.follow_up_queue, self.config.follow_up_mode);
 

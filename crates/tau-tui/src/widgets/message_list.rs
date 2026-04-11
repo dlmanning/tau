@@ -11,6 +11,49 @@ use textwrap;
 
 use crate::{theme::Theme, widgets::markdown::render_markdown};
 
+/// Get a tick counter for animations (~80ms per frame).
+fn animation_tick() -> usize {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 80) as usize
+}
+
+/// Color-cycling style for the streaming τ glyph.
+/// Cycles: green → cyan → blue → cyan → green
+fn streaming_tau_style() -> Style {
+    const COLORS: [Color; 6] = [
+        Color::Green,
+        Color::Cyan,
+        Color::Blue,
+        Color::Cyan,
+        Color::Green,
+        Color::LightGreen,
+    ];
+    let idx = animation_tick() % COLORS.len();
+    Style::default()
+        .fg(COLORS[idx])
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Orbiting braille dots around τ — returns (left_char, right_char).
+/// The dot pattern rotates: left, top-left, top, top-right, right, etc.
+fn orbiting_braille(tick: usize) -> (char, char) {
+    // 8 positions around τ, represented as (left, right) braille pairs
+    const FRAMES: [(char, char); 8] = [
+        ('⠂', ' '), // left
+        ('⠁', ' '), // upper-left
+        ('⠈', '⠁'), // top (split across both sides)
+        (' ', '⠈'), // upper-right
+        (' ', '⠐'), // right
+        (' ', '⠠'), // lower-right
+        ('⠠', '⠄'), // bottom (split across both sides)
+        ('⠄', ' '), // lower-left
+    ];
+    FRAMES[tick % FRAMES.len()]
+}
+
 /// A single message in the chat
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -111,11 +154,18 @@ impl<'a> MessageList<'a> {
 
         let (role_text, role_style, prefix) = match msg.role.as_str() {
             "user" => ("You", self.theme.accent_bold(), "▶ "),
-            "assistant" => (
-                "Assistant",
-                self.theme.success_style().add_modifier(Modifier::BOLD),
-                "◀ ",
-            ),
+            "assistant" => {
+                if msg.is_streaming {
+                    let tau_style = streaming_tau_style();
+                    ("τ", tau_style, "")
+                } else {
+                    (
+                        "τ",
+                        self.theme.success_style().add_modifier(Modifier::BOLD),
+                        "",
+                    )
+                }
+            }
             r if r.starts_with("agent:") => {
                 let desc = &r[6..];
                 let style = if msg.is_error {
@@ -125,6 +175,7 @@ impl<'a> MessageList<'a> {
                 };
                 (desc, style, "◇ ")
             }
+            "steer" => ("You", self.theme.dim_style().add_modifier(Modifier::ITALIC), "▷ "),
             "system" => ("System", self.theme.dim_style(), "● "),
             r if r.starts_with("tool:") => {
                 let tool_name = &r[5..];
@@ -138,29 +189,30 @@ impl<'a> MessageList<'a> {
             _ => ("Unknown", self.theme.dim_style(), "  "),
         };
 
-        let header = if msg.is_streaming {
-            format!("{}{} ▌", prefix, role_text)
+        if msg.role == "assistant" {
+            // Custom rendering for τ header with animations
+            let spans = if msg.is_streaming {
+                let tick = animation_tick();
+                let orbit = orbiting_braille(tick);
+                vec![
+                    Span::styled(orbit.0.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled("τ", role_style),
+                    Span::styled(orbit.1.to_string(), Style::default().fg(Color::DarkGray)),
+                ]
+            } else {
+                vec![Span::styled("τ", role_style)]
+            };
+            lines.push(Line::from(spans));
         } else {
-            format!("{}{}", prefix, role_text)
-        };
-
-        lines.push(Line::from(Span::styled(header, role_style)));
+            let header = format!("{}{}", prefix, role_text);
+            lines.push(Line::from(Span::styled(header, role_style)));
+        }
 
         let content_width = width.saturating_sub(2);
 
         if msg.role == "assistant" && !msg.is_error {
             if msg.content.is_empty() && msg.is_streaming {
-                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                let frame_idx = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    / 80) as usize
-                    % frames.len();
-                lines.push(Line::from(Span::styled(
-                    format!("  {} thinking...", frames[frame_idx]),
-                    Style::default().fg(Color::Yellow),
-                )));
+                // No content yet — the orbiting dots on the header are enough
             } else {
                 let md_lines = render_markdown(&msg.content, self.theme, content_width);
                 for line in md_lines {
@@ -189,6 +241,17 @@ impl<'a> MessageList<'a> {
             lines.push(Line::from(Span::styled(
                 display,
                 Style::default().fg(Color::Cyan),
+            )));
+        } else if msg.role.starts_with("agent:") {
+            // Finished agent — show ✓ or ✗ prefix with stats
+            let (indicator, style) = if msg.is_error {
+                ("✗", self.theme.error_style())
+            } else {
+                ("✓", self.theme.success_style())
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {} {}", indicator, msg.content),
+                style,
             )));
         } else {
             let content_style = if msg.is_error {
@@ -252,9 +315,7 @@ pub fn calculate_message_height(messages: &[ChatMessage], width: usize, theme: &
         total += 1;
 
         if msg.role == "assistant" && !msg.is_error {
-            if msg.content.is_empty() && msg.is_streaming {
-                total += 1;
-            } else {
+            if !(msg.content.is_empty() && msg.is_streaming) {
                 let md_lines = render_markdown(&msg.content, theme, content_width);
                 total += md_lines.len();
             }
