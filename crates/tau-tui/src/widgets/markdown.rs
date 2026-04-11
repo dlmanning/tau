@@ -1,6 +1,6 @@
 //! Markdown rendering for terminal UI
 
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -24,7 +24,10 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
     let mut current_row: Vec<String> = Vec::new();
     let mut current_cell = String::new();
 
-    let parser = Parser::new(text);
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(text, options);
 
     for event in parser {
         match event {
@@ -215,9 +218,9 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
             }
             Event::Code(code) => {
                 if in_table {
-                    current_cell.push_str("`");
+                    current_cell.push('`');
                     current_cell.push_str(&code);
-                    current_cell.push_str("`");
+                    current_cell.push('`');
                 } else {
                     let code_style = Style::default().fg(theme.code).add_modifier(Modifier::BOLD);
                     current_line.push(Span::styled(format!("`{}`", code), code_style));
