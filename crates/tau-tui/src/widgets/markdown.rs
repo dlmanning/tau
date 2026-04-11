@@ -18,6 +18,12 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
     let mut code_block_content = String::new();
     let mut list_depth: usize = 0;
 
+    // Table state
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut current_cell = String::new();
+
     let parser = Parser::new(text);
 
     for event in parser {
@@ -74,6 +80,22 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                 Tag::Link { .. } => {
                     current_style = Style::default().fg(theme.link);
                 }
+                Tag::Table(_) => {
+                    if !current_line.is_empty() {
+                        lines.push(Line::from(std::mem::take(&mut current_line)));
+                    }
+                    in_table = true;
+                    table_rows.clear();
+                }
+                Tag::TableHead => {
+                    current_row.clear();
+                }
+                Tag::TableRow => {
+                    current_row.clear();
+                }
+                Tag::TableCell => {
+                    current_cell.clear();
+                }
                 _ => {}
             },
             Event::End(tag_end) => match tag_end {
@@ -120,19 +142,86 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                 TagEnd::Link => {
                     current_style = theme.base_style();
                 }
+                TagEnd::TableCell => {
+                    current_row.push(std::mem::take(&mut current_cell));
+                }
+                TagEnd::TableHead => {
+                    table_rows.push(std::mem::take(&mut current_row));
+                }
+                TagEnd::TableRow => {
+                    table_rows.push(std::mem::take(&mut current_row));
+                }
+                TagEnd::Table => {
+                    // Calculate column widths
+                    let num_cols = table_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                    let mut col_widths = vec![0usize; num_cols];
+                    for row in &table_rows {
+                        for (i, cell) in row.iter().enumerate() {
+                            if i < num_cols {
+                                col_widths[i] = col_widths[i].max(cell.len());
+                            }
+                        }
+                    }
+                    // Clamp total width
+                    let total: usize = col_widths.iter().sum::<usize>() + num_cols.saturating_sub(1) * 3;
+                    if total > width {
+                        let scale = width as f64 / total as f64;
+                        for w in &mut col_widths {
+                            *w = (*w as f64 * scale).max(3.0) as usize;
+                        }
+                    }
+
+                    let head_style = theme.accent_style().add_modifier(Modifier::BOLD);
+                    let cell_style = theme.base_style();
+                    let sep_style = theme.dim_style();
+
+                    for (row_idx, row) in table_rows.iter().enumerate() {
+                        let mut spans: Vec<Span<'a>> = Vec::new();
+                        for (i, cell) in row.iter().enumerate() {
+                            if i > 0 {
+                                spans.push(Span::styled(" │ ", sep_style));
+                            }
+                            let w = col_widths.get(i).copied().unwrap_or(cell.len());
+                            let padded = format!("{:<width$}", cell, width = w);
+                            let style = if row_idx == 0 { head_style } else { cell_style };
+                            spans.push(Span::styled(padded, style));
+                        }
+                        lines.push(Line::from(spans));
+                        // Separator after header row
+                        if row_idx == 0 {
+                            let sep: String = col_widths
+                                .iter()
+                                .map(|w| "─".repeat(*w))
+                                .collect::<Vec<_>>()
+                                .join("─┼─");
+                            lines.push(Line::from(Span::styled(sep, sep_style)));
+                        }
+                    }
+                    lines.push(Line::from(""));
+                    in_table = false;
+                    table_rows.clear();
+                }
                 _ => {}
             },
             Event::Text(text) => {
                 if in_code_block {
                     code_block_content.push_str(&text);
+                } else if in_table {
+                    current_cell.push_str(&text);
                 } else {
                     let text_str = text.to_string();
                     current_line.push(Span::styled(text_str, current_style));
                 }
             }
             Event::Code(code) => {
-                let code_style = Style::default().fg(theme.code).add_modifier(Modifier::BOLD);
-                current_line.push(Span::styled(format!("`{}`", code), code_style));
+                if in_table {
+                    current_cell.push_str("`");
+                    current_cell.push_str(&code);
+                    current_cell.push_str("`");
+                } else {
+                    let code_style = Style::default().fg(theme.code).add_modifier(Modifier::BOLD);
+                    current_line.push(Span::styled(format!("`{}`", code), code_style));
+                }
             }
             Event::SoftBreak => {
                 current_line.push(Span::raw(" "));
