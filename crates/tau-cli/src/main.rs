@@ -306,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
     agent.add_tool(Arc::new(tools::GlobTool::new()));
     agent.add_tool(Arc::new(tools::GrepTool::new()));
     agent.add_tool(Arc::new(tools::ListTool::new()));
+    agent.add_tool(Arc::new(tools::WebFetchTool::new()));
 
     let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
     if lsp_manager.is_available() {

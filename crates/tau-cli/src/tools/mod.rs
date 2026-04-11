@@ -10,6 +10,7 @@ mod list;
 pub mod lsp;
 mod read;
 mod send_message;
+mod web_fetch;
 mod write;
 
 use std::path::{Path, PathBuf};
@@ -35,4 +36,5 @@ pub use list::ListTool;
 pub use lsp::LspTool;
 pub use read::ReadTool;
 pub use send_message::SendMessageTool;
+pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;

@@ -53,6 +53,8 @@ regex = "1.12"
 jsonschema = "0.45"
 toml = "1.1"
 glob = "0.3"
+htmd = "0.5"
+url = "2.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
