@@ -5,11 +5,84 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 use textwrap;
 
 use crate::{theme::Theme, widgets::markdown::render_markdown};
+
+/// Count the visual width of a Line (sum of span character widths).
+fn line_width(line: &Line) -> usize {
+    line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// How many visual rows a Line occupies at the given terminal width.
+fn visual_line_count(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let w = line_width(line);
+    if w == 0 {
+        1
+    } else {
+        (w + width - 1) / width
+    }
+}
+
+/// Split a Line that exceeds `width` into multiple Lines.
+/// Breaks at span boundaries and within spans at character positions.
+fn wrap_line_into<'a>(line: Line<'a>, width: usize, out: &mut Vec<Line<'a>>) {
+    if width == 0 || line_width(&line) <= width {
+        out.push(line);
+        return;
+    }
+
+    let mut current_spans: Vec<Span<'a>> = Vec::new();
+    let mut current_width: usize = 0;
+
+    for span in line.spans {
+        let span_text: &str = &span.content;
+        let style = span.style;
+
+        if span_text.is_empty() {
+            current_spans.push(span);
+            continue;
+        }
+
+        let mut remaining = span_text.to_string();
+        while !remaining.is_empty() {
+            let available = width.saturating_sub(current_width);
+            if available == 0 {
+                out.push(Line::from(std::mem::take(&mut current_spans)));
+                current_width = 0;
+                continue;
+            }
+
+            let char_count = remaining.chars().count();
+            if char_count <= available {
+                current_width += char_count;
+                current_spans.push(Span::styled(remaining, style));
+                break;
+            }
+
+            // Split at `available` characters
+            let split_at: usize = remaining
+                .char_indices()
+                .nth(available)
+                .map(|(i, _)| i)
+                .unwrap_or(remaining.len());
+            let (head, tail) = remaining.split_at(split_at);
+            current_spans.push(Span::styled(head.to_string(), style));
+            out.push(Line::from(std::mem::take(&mut current_spans)));
+            current_width = 0;
+            remaining = tail.to_string();
+        }
+    }
+
+    if !current_spans.is_empty() {
+        out.push(Line::from(current_spans));
+    }
+}
 
 /// Get a tick counter for animations (~80ms per frame).
 fn animation_tick() -> usize {
@@ -18,40 +91,6 @@ fn animation_tick() -> usize {
         .unwrap_or_default()
         .as_millis()
         / 80) as usize
-}
-
-/// Color-cycling style for the streaming τ glyph.
-/// Cycles: green → cyan → blue → cyan → green
-fn streaming_tau_style() -> Style {
-    const COLORS: [Color; 6] = [
-        Color::Green,
-        Color::Cyan,
-        Color::Blue,
-        Color::Cyan,
-        Color::Green,
-        Color::LightGreen,
-    ];
-    let idx = animation_tick() % COLORS.len();
-    Style::default()
-        .fg(COLORS[idx])
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Orbiting braille dots around τ — returns (left_char, right_char).
-/// The dot pattern rotates: left, top-left, top, top-right, right, etc.
-fn orbiting_braille(tick: usize) -> (char, char) {
-    // 8 positions around τ, represented as (left, right) braille pairs
-    const FRAMES: [(char, char); 8] = [
-        ('⠂', ' '), // left
-        ('⠁', ' '), // upper-left
-        ('⠈', '⠁'), // top (split across both sides)
-        (' ', '⠈'), // upper-right
-        (' ', '⠐'), // right
-        (' ', '⠠'), // lower-right
-        ('⠠', '⠄'), // bottom (split across both sides)
-        ('⠄', ' '), // lower-left
-    ];
-    FRAMES[tick % FRAMES.len()]
 }
 
 /// A single message in the chat
@@ -152,122 +191,117 @@ impl<'a> MessageList<'a> {
     fn render_message(&self, msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
-        let (role_text, role_style, prefix) = match msg.role.as_str() {
-            "user" => ("You", self.theme.accent_bold(), "▶ "),
+        // Prefix arrow and content width (arrow + space = 2 chars)
+        let content_width = width.saturating_sub(2);
+
+        match msg.role.as_str() {
+            "user" => {
+                let style = self.theme.accent_bold();
+                let wrapped = textwrap::wrap(&msg.content, content_width);
+                for (i, line) in wrapped.iter().enumerate() {
+                    let prefix = if i == 0 { "▶ " } else { "  " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{}", prefix, line),
+                        style,
+                    )));
+                }
+            }
+            "steer" => {
+                let style = self.theme.dim_style().add_modifier(Modifier::ITALIC);
+                let wrapped = textwrap::wrap(&msg.content, content_width);
+                for (i, line) in wrapped.iter().enumerate() {
+                    let prefix = if i == 0 { "▷ " } else { "  " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{}", prefix, line),
+                        style,
+                    )));
+                }
+            }
             "assistant" => {
-                if msg.is_streaming {
-                    let tau_style = streaming_tau_style();
-                    ("τ", tau_style, "")
+                if msg.content.is_empty() && msg.is_streaming {
+                    // No content yet — τ animation in status bar is enough
                 } else {
-                    (
-                        "τ",
-                        self.theme.success_style().add_modifier(Modifier::BOLD),
-                        "",
-                    )
+                    let arrow_style = self.theme.success_style().add_modifier(Modifier::BOLD);
+                    let md_lines = render_markdown(&msg.content, self.theme, content_width);
+                    for (i, line) in md_lines.into_iter().enumerate() {
+                        let mut spans = Vec::new();
+                        if i == 0 {
+                            spans.push(Span::styled("◀ ", arrow_style));
+                        } else {
+                            spans.push(Span::raw("  "));
+                        }
+                        spans.extend(
+                            line.spans
+                                .into_iter()
+                                .map(|s| Span::styled(s.content.into_owned(), s.style)),
+                        );
+                        lines.push(Line::from(spans));
+                    }
                 }
             }
             r if r.starts_with("agent:") => {
-                let desc = &r[6..];
-                let style = if msg.is_error {
-                    self.theme.error_style()
+                if msg.is_streaming {
+                    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let frame_idx = animation_tick() % frames.len();
+                    let display = if msg.content.is_empty() {
+                        format!("◇ {} working...", frames[frame_idx])
+                    } else {
+                        format!("◇ {} {}", frames[frame_idx], msg.content)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        display,
+                        Style::default().fg(Color::Cyan),
+                    )));
                 } else {
-                    Style::default().fg(Color::Cyan)
-                };
-                (desc, style, "◇ ")
-            }
-            "steer" => ("You", self.theme.dim_style().add_modifier(Modifier::ITALIC), "▷ "),
-            "system" => ("System", self.theme.dim_style(), "● "),
-            r if r.starts_with("tool:") => {
-                let tool_name = &r[5..];
-                let style = if msg.is_error {
-                    self.theme.error_style()
-                } else {
-                    Style::default().fg(Color::Magenta)
-                };
-                (tool_name, style, "⚙ ")
-            }
-            _ => ("Unknown", self.theme.dim_style(), "  "),
-        };
-
-        if msg.role == "assistant" {
-            // Custom rendering for τ header with animations
-            let spans = if msg.is_streaming {
-                let tick = animation_tick();
-                let orbit = orbiting_braille(tick);
-                vec![
-                    Span::styled(orbit.0.to_string(), Style::default().fg(Color::DarkGray)),
-                    Span::styled("τ", role_style),
-                    Span::styled(orbit.1.to_string(), Style::default().fg(Color::DarkGray)),
-                ]
-            } else {
-                vec![Span::styled("τ", role_style)]
-            };
-            lines.push(Line::from(spans));
-        } else {
-            let header = format!("{}{}", prefix, role_text);
-            lines.push(Line::from(Span::styled(header, role_style)));
-        }
-
-        let content_width = width.saturating_sub(2);
-
-        if msg.role == "assistant" && !msg.is_error {
-            if msg.content.is_empty() && msg.is_streaming {
-                // No content yet — the orbiting dots on the header are enough
-            } else {
-                let md_lines = render_markdown(&msg.content, self.theme, content_width);
-                for line in md_lines {
-                    let mut indented_spans = vec![Span::raw("  ")];
-                    indented_spans.extend(
-                        line.spans
-                            .into_iter()
-                            .map(|s| Span::styled(s.content.into_owned(), s.style)),
-                    );
-                    lines.push(Line::from(indented_spans));
+                    let (indicator, style) = if msg.is_error {
+                        ("✗", self.theme.error_style())
+                    } else {
+                        ("✓", self.theme.success_style())
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("◇ {} {}", indicator, msg.content),
+                        style,
+                    )));
                 }
             }
-        } else if msg.role.starts_with("agent:") && msg.is_streaming {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let frame_idx = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                / 80) as usize
-                % frames.len();
-            let display = if msg.content.is_empty() {
-                format!("  {} working...", frames[frame_idx])
-            } else {
-                format!("  {} {}", frames[frame_idx], msg.content)
-            };
-            lines.push(Line::from(Span::styled(
-                display,
-                Style::default().fg(Color::Cyan),
-            )));
-        } else if msg.role.starts_with("agent:") {
-            // Finished agent — show ✓ or ✗ prefix with stats
-            let (indicator, style) = if msg.is_error {
-                ("✗", self.theme.error_style())
-            } else {
-                ("✓", self.theme.success_style())
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  {} {}", indicator, msg.content),
-                style,
-            )));
-        } else {
-            let content_style = if msg.is_error {
-                self.theme.error_style()
-            } else if msg.role.starts_with("tool:") {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                self.theme.base_style()
-            };
-
-            let wrapped = textwrap::wrap(&msg.content, content_width);
-            for line in wrapped {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", line),
-                    content_style,
-                )));
+            "system" => {
+                let wrapped = textwrap::wrap(&msg.content, content_width);
+                for (i, line) in wrapped.iter().enumerate() {
+                    let prefix = if i == 0 { "● " } else { "  " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{}", prefix, line),
+                        self.theme.dim_style(),
+                    )));
+                }
+            }
+            r if r.starts_with("tool:") => {
+                let style = if msg.is_error {
+                    self.theme.error_style()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let wrapped = textwrap::wrap(&msg.content, content_width);
+                for (i, line) in wrapped.iter().enumerate() {
+                    let prefix = if i == 0 { "⚙ " } else { "  " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{}", prefix, line),
+                        style,
+                    )));
+                }
+            }
+            _ => {
+                let style = if msg.is_error {
+                    self.theme.error_style()
+                } else {
+                    self.theme.base_style()
+                };
+                let wrapped = textwrap::wrap(&msg.content, content_width);
+                for line in wrapped.iter() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        style,
+                    )));
+                }
             }
         }
 
@@ -292,7 +326,9 @@ impl Widget for MessageList<'_> {
         let mut all_lines: Vec<Line> = Vec::new();
 
         for msg in self.messages {
-            all_lines.extend(self.render_message(msg, width));
+            for line in self.render_message(msg, width) {
+                wrap_line_into(line, width, &mut all_lines);
+            }
         }
 
         let visible_lines: Vec<Line> = all_lines
@@ -301,30 +337,20 @@ impl Widget for MessageList<'_> {
             .take(inner.height as usize)
             .collect();
 
-        let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(visible_lines);
         paragraph.render(inner, buf);
     }
 }
 
-/// Calculate total height of messages
+/// Calculate total height of messages.
+/// Uses the same render path as `MessageList::render_message` to stay in sync.
 pub fn calculate_message_height(messages: &[ChatMessage], width: usize, theme: &Theme) -> usize {
+    let list = MessageList::new(messages, theme);
     let mut total = 0;
-    let content_width = width.saturating_sub(2);
-
     for msg in messages {
-        total += 1;
-
-        if msg.role == "assistant" && !msg.is_error {
-            if !(msg.content.is_empty() && msg.is_streaming) {
-                let md_lines = render_markdown(&msg.content, theme, content_width);
-                total += md_lines.len();
-            }
-        } else {
-            let wrapped = textwrap::wrap(&msg.content, content_width);
-            total += wrapped.len();
+        for line in list.render_message(msg, width) {
+            total += visual_line_count(&line, width);
         }
-
-        total += 1;
     }
     total
 }

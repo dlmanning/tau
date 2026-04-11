@@ -1,4 +1,17 @@
 //! TUI implementation for tau
+//!
+//! ## Screen layout
+//!
+//! The interface is divided into four horizontal strips, top to bottom:
+//!
+//! | Area | Height | Renderer | Contents |
+//! |------|--------|----------|----------|
+//! | **Header** | 1 | `render_header` | τ glyph (rainbow when processing, green when idle), cwd in `{ }` brackets, clock (MM/DD/YYYY HH:MM:SS AM) |
+//! | **Conversation** | flex | `render_conversation` | Message thread — user (▶), assistant (◀), tools (⚙), agents (◇), system (●), steer (▷) |
+//! | **Status line** | 1 | `render_status_line` | Model name, thinking level, token counts, cache stats, cost |
+//! | **Input** | 3 | `InputBox` widget | Text entry with placeholder |
+//!
+//! The header style is inspired by the HP 48GX calculator status area.
 
 use std::time::Instant;
 
@@ -18,7 +31,7 @@ use tau_tui::{
     input::Action,
     widgets::{
         InputBox, MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem,
-        SelectorState, Spinner, message_list::ChatMessage,
+        SelectorState, message_list::ChatMessage,
     },
 };
 use tokio::sync::mpsc;
@@ -97,6 +110,36 @@ fn describe_tool_activity(tool_name: &str, arguments: &serde_json::Value) -> Str
     }
 }
 
+/// Slow rainbow color shift for the τ glyph when agent is working.
+/// Smoothly interpolates through the spectrum over ~4 seconds.
+fn rainbow_tau_style() -> Style {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    // Full cycle every ~4 seconds (4096ms)
+    let phase = (ms % 4096) as f64 / 4096.0;
+    // HSV to RGB with S=1, V=1 — hue rotates through 0..360
+    let hue = phase * 360.0;
+    let c = 1.0_f64;
+    let x = 1.0 - ((hue / 60.0) % 2.0 - 1.0).abs();
+    let (r, g, b) = match hue as u32 {
+        0..60 => (c, x, 0.0),
+        60..120 => (x, c, 0.0),
+        120..180 => (0.0, c, x),
+        180..240 => (0.0, x, c),
+        240..300 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    Style::default()
+        .fg(Color::Rgb(
+            (r * 255.0) as u8,
+            (g * 255.0) as u8,
+            (b * 255.0) as u8,
+        ))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Format a token count compactly (e.g. 1234 → "1.2k", 56 → "56")
 fn format_tokens(n: u32) -> String {
     if n >= 1000 {
@@ -135,6 +178,8 @@ pub struct TuiState {
     input: InputBox,
     /// Current scroll position
     scroll: usize,
+    /// Whether to auto-follow new content at the bottom
+    follow_bottom: bool,
     /// Whether agent is currently processing
     is_processing: bool,
     /// Current status message
@@ -195,6 +240,7 @@ impl TuiState {
             agent_progress: std::collections::HashMap::new(),
             input,
             scroll: 0,
+            follow_bottom: true,
             is_processing: false,
             status: "Ready".to_string(),
             theme: Theme::dark(),
@@ -286,19 +332,7 @@ impl TuiState {
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_processing = false;
-                let cache_str = if self.total_cache_read > 0 || self.total_cache_write > 0 {
-                    format!(
-                        " | cache: {}r {}w",
-                        format_tokens(self.total_cache_read),
-                        format_tokens(self.total_cache_write),
-                    )
-                } else {
-                    String::new()
-                };
-                self.status = format!(
-                    "Ready | {} in, {} out{} | ${:.4}",
-                    self.total_input_tokens, self.total_output_tokens, cache_str, self.total_cost
-                );
+                self.status = "Ready".to_string();
             }
             AgentEvent::Error { message } => {
                 self.is_processing = false;
@@ -411,17 +445,18 @@ impl TuiState {
         match kind {
             MouseEventKind::ScrollUp => {
                 self.scroll = self.scroll.saturating_sub(3);
+                self.follow_bottom = false;
             }
             MouseEventKind::ScrollDown => {
                 self.scroll = self.scroll.saturating_add(3);
+                // Re-pin if we've scrolled to/past the bottom (resolved in render)
             }
             _ => {}
         }
     }
 
     fn scroll_to_bottom(&mut self) {
-        // Will be calculated during render based on content height
-        self.scroll = usize::MAX;
+        self.follow_bottom = true;
     }
 
     /// Show a system message
@@ -531,10 +566,12 @@ impl TuiState {
             }
             Action::PageUp => {
                 self.scroll = self.scroll.saturating_sub(10);
+                self.follow_bottom = false;
                 true
             }
             Action::PageDown => {
                 self.scroll = self.scroll.saturating_add(10);
+                // Re-pin resolved in render if we've reached the bottom
                 true
             }
             Action::Clear => {
@@ -566,20 +603,22 @@ impl TuiState {
     pub fn render(&mut self, frame: &mut Frame) {
         let size = frame.area();
 
-        // Layout: status bar (1), messages (flex), input (3)
+        // Layout: header (1), conversation (flex), status line (1), input (3)
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Status
-                Constraint::Min(1),    // Messages
-                Constraint::Length(3), // Input
+                Constraint::Length(1), // Header: τ glyph, cwd, clock
+                Constraint::Min(1),    // Conversation: message thread
+                Constraint::Length(1), // Status line: model, thinking, tokens, cost
+                Constraint::Length(3), // Input: text entry
             ])
             .split(size);
 
-        self.render_status(frame, chunks[0]);
-        self.render_messages(frame, chunks[1]);
+        self.render_header(frame, chunks[0]);
+        self.render_conversation(frame, chunks[1]);
+        self.render_status_line(frame, chunks[2]);
         self.input
-            .render(chunks[2], frame.buffer_mut(), &self.theme);
+            .render(chunks[3], frame.buffer_mut(), &self.theme);
 
         if self.pending_interaction.is_some() {
             self.render_question_selector(frame, size);
@@ -657,7 +696,7 @@ impl TuiState {
         selector.render_centered(area, frame.buffer_mut());
     }
 
-    fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border_style());
@@ -742,12 +781,15 @@ impl TuiState {
             &self.theme,
         );
 
-        if self.scroll == usize::MAX {
-            self.scroll = content_height.saturating_sub(inner.height as usize);
+        let max_scroll = content_height.saturating_sub(inner.height as usize);
+        if self.follow_bottom {
+            self.scroll = max_scroll;
         } else {
-            self.scroll = self
-                .scroll
-                .min(content_height.saturating_sub(inner.height as usize));
+            self.scroll = self.scroll.min(max_scroll);
+            // Re-pin if user scrolled to the bottom
+            if self.scroll >= max_scroll {
+                self.follow_bottom = true;
+            }
         }
 
         let message_list = MessageList::new(&self.messages, &self.theme).scroll(self.scroll);
@@ -768,54 +810,120 @@ impl TuiState {
         }
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect) {
-        if self.is_processing {
-            let spinner =
-                Spinner::new(&self.status, &self.theme).with_start_time(self.spinner_start);
-            frame.render_widget(spinner, area);
+    fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| {
+                if let Some(home) = dirs::home_dir() {
+                    if let Ok(rest) = p.strip_prefix(&home) {
+                        return Some(format!("~/{}", rest.display()));
+                    }
+                }
+                Some(p.display().to_string())
+            })
+            .unwrap_or_default();
+
+        let info_content = format!("{{ {} }}", cwd);
+
+        // τ glyph — rainbow cycle when processing, dim green when idle
+        let tau_style = if self.is_processing {
+            rainbow_tau_style()
         } else {
-            let model_name = self
-                .model
-                .id
-                .split('/')
-                .next_back()
-                .unwrap_or(&self.model.id);
-            let reasoning_str = match self.reasoning {
-                tau_ai::ReasoningLevel::Off => "",
-                tau_ai::ReasoningLevel::Minimal => " │ thinking: minimal",
-                tau_ai::ReasoningLevel::Low => " │ thinking: low",
-                tau_ai::ReasoningLevel::Medium => " │ thinking: medium",
-                tau_ai::ReasoningLevel::High => " │ thinking: high",
-            };
-            let adaptive_str = if self.thinking_adaptive && self.reasoning != tau_ai::ReasoningLevel::Off {
-                " (adaptive)"
-            } else {
-                ""
-            };
-            let left_content = format!(
-                "{}{}{} │ {}",
-                model_name, reasoning_str, adaptive_str, self.status
-            );
-            let right_content = "Ctrl+K: model │ Ctrl+L: clear │ Ctrl+C: quit";
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        };
 
-            let left_width = left_content.chars().count();
-            let right_width = right_content.chars().count();
-            let available = area.width as usize;
+        // Clock: MM/DD/YYYY HH:MM:SS AM
+        let now = chrono::Local::now();
+        let right_content = now.format("%m/%d/%Y %I:%M:%S%p").to_string();
 
-            let line = if left_width + right_width + 2 <= available {
-                let spacing = available - left_width - right_width;
-                Line::from(vec![
-                    Span::styled(&left_content, self.theme.dim_style()),
-                    Span::raw(" ".repeat(spacing)),
-                    Span::styled(right_content, Style::default().fg(Color::DarkGray)),
-                ])
-            } else {
-                Line::from(Span::styled(&left_content, self.theme.dim_style()))
-            };
+        let left_width = 2 + info_content.chars().count();
+        let right_width = right_content.chars().count();
+        let available = area.width as usize;
 
-            let status = Paragraph::new(line);
-            frame.render_widget(status, area);
+        let dim = Style::default().fg(Color::DarkGray);
+
+        let line = if left_width + right_width + 2 <= available {
+            let spacing = available - left_width - right_width;
+            Line::from(vec![
+                Span::styled("τ ", tau_style),
+                Span::styled(&info_content, dim),
+                Span::raw(" ".repeat(spacing)),
+                Span::styled(&right_content, dim),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("τ ", tau_style),
+                Span::styled(&info_content, dim),
+            ])
+        };
+
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    fn render_status_line(&self, frame: &mut Frame, area: Rect) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut parts: Vec<Span> = Vec::new();
+
+        // Model name
+        let model_name = self
+            .model
+            .id
+            .split('/')
+            .next_back()
+            .unwrap_or(&self.model.id);
+        parts.push(Span::styled(model_name, dim));
+
+        // Thinking level
+        let thinking_str = match self.reasoning {
+            tau_ai::ReasoningLevel::Off => None,
+            level => {
+                let name = match level {
+                    tau_ai::ReasoningLevel::Minimal => "min",
+                    tau_ai::ReasoningLevel::Low => "low",
+                    tau_ai::ReasoningLevel::Medium => "med",
+                    tau_ai::ReasoningLevel::High => "high",
+                    tau_ai::ReasoningLevel::Off => unreachable!(),
+                };
+                if self.thinking_adaptive {
+                    Some(format!("think:{}/a", name))
+                } else {
+                    Some(format!("think:{}", name))
+                }
+            }
+        };
+        if let Some(t) = thinking_str {
+            parts.push(Span::styled(" · ", dim));
+            parts.push(Span::styled(t, dim));
         }
+
+        // Token stats / processing status
+        if self.is_processing {
+            parts.push(Span::styled(" · ", dim));
+            parts.push(Span::styled(&self.status, dim));
+        } else if self.total_input_tokens > 0 || self.total_output_tokens > 0 {
+            parts.push(Span::styled(" · ", dim));
+            parts.push(Span::styled(
+                format!("{} in, {} out", format_tokens(self.total_input_tokens), format_tokens(self.total_output_tokens)),
+                dim,
+            ));
+
+            if self.total_cache_read > 0 || self.total_cache_write > 0 {
+                parts.push(Span::styled(" · ", dim));
+                parts.push(Span::styled(
+                    format!("cache: {}r {}w", format_tokens(self.total_cache_read), format_tokens(self.total_cache_write)),
+                    dim,
+                ));
+            }
+
+            if self.total_cost > 0.0 {
+                parts.push(Span::styled(" · ", dim));
+                parts.push(Span::styled(format!("${:.4}", self.total_cost), dim));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(parts)), area);
     }
 }
 
