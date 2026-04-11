@@ -5,12 +5,15 @@
 ## Features
 
 - **Multiple AI Providers**: Anthropic Claude, OpenAI, Google Gemini
-- **8 Built-in Tools**: bash, read, write, edit, glob, grep, list, lsp
+- **10 Built-in Tools**: bash, read, write, edit, glob, grep, list, lsp, web_fetch, agent
+- **Web Search**: Server-side web search via Anthropic API (automatic for Anthropic models)
 - **LSP Code Intelligence**: Go-to-definition, find-references, hover, document symbols via language servers
-- **TUI**: Full terminal UI with model selector, token/cost tracking, cache stats
+- **TUI**: Full terminal UI with HP 48GX-inspired header, inline message arrows, model selector, token/cost tracking
 - **Prompt Caching**: Scoped cache control with TTL, dynamic system prompt splitting
 - **Adaptive Thinking**: Model-driven reasoning with budget or adaptive mode
 - **Stream Watchdog**: Detects and recovers from stalled API connections
+- **Subagents**: Spawn background agents for parallel work with progress tracking
+- **Steering**: Inject messages while the agent is working
 - **Session Management**: Save, resume, and list conversation sessions
 - **Smart Retry**: Exponential backoff for rate limits and transient errors
 - **OAuth Support**: Direct login to Anthropic (no API key needed)
@@ -70,8 +73,12 @@ tau --reasoning-level high  # Deep reasoning
 | `grep` | Search file contents with regex |
 | `list` | List directory contents |
 | `lsp` | Code intelligence via language servers (definition, references, hover, symbols) |
+| `web_fetch` | Fetch URLs and convert HTML to markdown |
+| `agent` | Spawn subagents for parallel background work |
 
 The LSP tool auto-detects installed language servers: rust-analyzer, typescript-language-server, pyright, gopls, clangd.
+
+Anthropic models also get **server-side web search** — the model can search the web directly during a conversation without using a client tool.
 
 ## Configuration
 
@@ -111,13 +118,30 @@ tui = true
 
 TUI is the default. Use `--no-tui` for simple mode.
 
-**Status bar** shows model, thinking level, token usage, cache stats, and cost:
+The interface has four areas:
+
+| Area | Description |
+|------|-------------|
+| **Header** | τ glyph (rainbow when working, green when idle), cwd, clock |
+| **Conversation** | Message thread with inline arrows — `▶` user, `◀` assistant, `⚙` tools, `◇` agents |
+| **Status line** | Model name, thinking level, token counts, cache stats, cost |
+| **Input** | Text entry (active during both idle and processing for steering) |
+
 ```
-claude-sonnet-4-5 │ thinking: medium │ Ready | 98 in, 1131 out | cache: 28.0kr 10.4kw | $0.0645
+τ { ~/git/myproject }                                     04/11/2026 12:20:30AM
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ▶ Fix the login bug                                                         │
+│                                                                             │
+│ ◀ I found the issue in auth.rs...                                           │
+│                                                                             │
+│ ⚙ Editing auth.rs                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+claude-sonnet-4-5 · think:high/a · 1.2k in, 3.4k out · $0.0438
+> _
 ```
 
 **Keyboard shortcuts:**
-- `Enter` — Send message
+- `Enter` — Send message (or steer during processing)
 - `Ctrl+K` — Model selector
 - `Ctrl+L` — Clear conversation
 - `Ctrl+C` — Cancel current operation
