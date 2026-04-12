@@ -510,7 +510,6 @@ impl TuiState {
             }
             MouseEventKind::ScrollDown => {
                 self.scroll = self.scroll.saturating_add(3);
-                // Re-pin if we've scrolled to/past the bottom (resolved in render)
             }
             _ => {}
         }
