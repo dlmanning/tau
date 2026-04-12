@@ -13,7 +13,7 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Format a token count compactly (e.g. 1234567 → "1.2M", 1234 → "1.2k", 56 → "56")
-pub fn format_tokens(n: u32) -> String {
+pub fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {

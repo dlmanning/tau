@@ -16,9 +16,9 @@ pub struct CompactionConfig {
     /// Whether compaction is enabled
     pub enabled: bool,
     /// Reserve this many tokens below context_window to trigger proactive compaction
-    pub reserve_tokens: u32,
+    pub reserve_tokens: u64,
     /// Keep at least this many tokens of recent messages when compacting
-    pub keep_recent_tokens: u32,
+    pub keep_recent_tokens: u64,
 }
 
 impl Default for CompactionConfig {
@@ -38,7 +38,7 @@ pub struct CompactionResult {
     /// Index of first message kept (not summarized)
     pub first_kept_index: usize,
     /// Estimated tokens before compaction
-    pub tokens_before: u32,
+    pub tokens_before: u64,
     /// Files that were read during the summarized portion
     pub read_files: Vec<String>,
     /// Files that were modified during the summarized portion
@@ -68,18 +68,18 @@ struct CutPointResult {
 }
 
 /// Estimate token count for a single message (chars/4 heuristic)
-pub fn estimate_tokens(message: &Message) -> u32 {
+pub fn estimate_tokens(message: &Message) -> u64 {
     let char_count: usize = match message {
         Message::User { content, .. }
         | Message::Assistant { content, .. }
         | Message::ToolResult { content, .. }
         | Message::SystemInjection { content, .. } => content_char_count(content),
     };
-    (char_count / 4) as u32
+    (char_count / 4) as u64
 }
 
 /// Estimate total tokens for a slice of messages
-pub fn estimate_total_tokens(messages: &[Message]) -> u32 {
+pub fn estimate_total_tokens(messages: &[Message]) -> u64 {
     messages.iter().map(estimate_tokens).sum()
 }
 
@@ -285,13 +285,13 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 /// Find where to cut messages for compaction.
 /// Walks backwards from the end, keeping at least `keep_recent_tokens` tokens.
 /// Never cuts at a ToolResult — finds the nearest User or Assistant boundary.
-fn find_cut_point(messages: &[Message], keep_recent_tokens: u32, cancel: &CancellationToken) -> Option<CutPointResult> {
+fn find_cut_point(messages: &[Message], keep_recent_tokens: u64, cancel: &CancellationToken) -> Option<CutPointResult> {
     if messages.len() < 2 {
         return None;
     }
 
     // Walk backwards accumulating tokens
-    let mut accumulated: u32 = 0;
+    let mut accumulated: u64 = 0;
     let mut cut_index = messages.len();
 
     for i in (0..messages.len()).rev() {

@@ -152,18 +152,18 @@ pub enum InputType {
 /// Token usage information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
-    pub input: u32,
-    pub output: u32,
-    pub cache_read: u32,
-    pub cache_write: u32,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
     /// Thinking/reasoning tokens (Claude extended thinking)
-    pub thinking: u32,
+    pub thinking: u64,
     /// Granular cache creation breakdown by TTL tier
     #[serde(default)]
-    pub cache_creation_1h: u32,
+    pub cache_creation_1h: u64,
     /// Granular cache creation breakdown by TTL tier
     #[serde(default)]
-    pub cache_creation_5m: u32,
+    pub cache_creation_5m: u64,
     /// Service tier used for this request ("standard", "priority", "batch")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,

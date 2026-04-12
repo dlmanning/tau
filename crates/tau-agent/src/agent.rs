@@ -689,10 +689,7 @@ impl Agent {
             return;
         }
         let used = turn_usage.input + turn_usage.cache_read;
-        let limit = self
-            .config
-            .model
-            .context_window
+        let limit = (self.config.model.context_window as u64)
             .saturating_sub(self.config.compaction.reserve_tokens);
         if used > limit {
             let _ = self.run_compaction(CompactionReason::Threshold).await;

@@ -23,12 +23,12 @@ pub(super) struct MessageInfo {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct UsageInfo {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cache_read_input_tokens: Option<u32>,
-    pub cache_creation_input_tokens: Option<u32>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
-    pub thinking_output_tokens: Option<u32>,
+    pub thinking_output_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation: Option<CacheCreationUsage>,
     #[serde(default)]
@@ -37,8 +37,8 @@ pub(super) struct UsageInfo {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CacheCreationUsage {
-    pub ephemeral_1h_input_tokens: u32,
-    pub ephemeral_5m_input_tokens: u32,
+    pub ephemeral_1h_input_tokens: u64,
+    pub ephemeral_5m_input_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]

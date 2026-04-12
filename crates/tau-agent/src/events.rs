@@ -64,8 +64,8 @@ pub enum AgentEvent {
 
     /// Context compaction completed
     CompactionEnd {
-        tokens_before: u32,
-        tokens_after: u32,
+        tokens_before: u64,
+        tokens_after: u64,
     },
 
     /// Error occurred

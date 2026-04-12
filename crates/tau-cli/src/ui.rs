@@ -50,8 +50,8 @@ struct PendingInteraction {
 struct AgentProgress {
     description: String,
     tool_count: u32,
-    input_tokens: u32,
-    output_tokens: u32,
+    input_tokens: u64,
+    output_tokens: u64,
     activity: String,
     finished: bool,
 }
@@ -238,10 +238,10 @@ pub struct TuiState {
     /// Theme
     theme: Theme,
     /// Total tokens used
-    total_input_tokens: u32,
-    total_output_tokens: u32,
-    total_cache_read: u32,
-    total_cache_write: u32,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read: u64,
+    total_cache_write: u64,
     /// Model for cost calculation
     model: Model,
     /// Current reasoning level

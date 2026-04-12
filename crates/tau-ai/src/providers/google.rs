@@ -461,8 +461,8 @@ struct GeminiResponseFunctionCall {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiUsageMetadata {
-    prompt_token_count: Option<u32>,
-    candidates_token_count: Option<u32>,
+    prompt_token_count: Option<u64>,
+    candidates_token_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

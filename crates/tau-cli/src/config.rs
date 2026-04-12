@@ -52,9 +52,9 @@ pub struct CompactionSettings {
     /// Whether compaction is enabled (default: true)
     pub enabled: Option<bool>,
     /// Reserve this many tokens below context window to trigger proactive compaction
-    pub reserve_tokens: Option<u32>,
+    pub reserve_tokens: Option<u64>,
     /// Keep at least this many tokens of recent messages when compacting
-    pub keep_recent_tokens: Option<u32>,
+    pub keep_recent_tokens: Option<u64>,
 }
 
 /// API key configuration

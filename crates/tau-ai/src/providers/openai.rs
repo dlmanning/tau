@@ -453,8 +453,8 @@ struct StreamFunction {
 
 #[derive(Debug, Deserialize)]
 struct StreamUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[cfg(test)]

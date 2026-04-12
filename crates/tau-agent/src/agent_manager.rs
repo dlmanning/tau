@@ -74,8 +74,8 @@ type AgentToolFactory = Arc<dyn Fn(u32, AgentHandle) -> BoxedTool + Send + Sync>
 pub struct SubagentResult {
     pub agent_id: String,
     pub text: String,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub tool_use_count: u32,
     pub duration_ms: u64,
     pub worktree_path: Option<String>,

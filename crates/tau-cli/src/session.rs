@@ -24,17 +24,17 @@ pub enum SessionEntry {
     Message { message: Message, timestamp: i64 },
     /// Usage information for a turn
     Usage {
-        input: u32,
-        output: u32,
-        cache_read: u32,
-        cache_write: u32,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
         timestamp: i64,
     },
     /// Context compaction event
     Compaction {
         summary: String,
         first_kept_message_index: usize,
-        tokens_before: u32,
+        tokens_before: u64,
         read_files: Vec<String>,
         modified_files: Vec<String>,
         timestamp: i64,
@@ -180,7 +180,7 @@ impl SessionManager {
         &mut self,
         summary: &str,
         first_kept_message_index: usize,
-        tokens_before: u32,
+        tokens_before: u64,
         read_files: &[String],
         modified_files: &[String],
     ) -> std::io::Result<()> {
