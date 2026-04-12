@@ -1,11 +1,9 @@
 //! Subagent spawning — create independent agent instances for parallel work.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tau_ai::{Content, Message, Model, Usage};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -13,7 +11,9 @@ use crate::agent::{Agent, AgentConfig};
 use crate::events::AgentEvent;
 use crate::handle::AgentHandle;
 use crate::tool::BoxedTool;
+use crate::transcript::record_transcript;
 use crate::transport::Transport;
+use crate::worktree::{WorktreeInfo, create_worktree, cleanup_worktree};
 
 /// Maximum recursion depth for nested agent spawning.
 pub const MAX_AGENT_DEPTH: u32 = 3;
@@ -581,37 +581,6 @@ impl AgentManager {
     }
 }
 
-/// Record a subagent's conversation to disk for debugging.
-/// Writes JSONL to `~/.local/share/tau/agent-transcripts/{agent_id}.jsonl`.
-/// Overwrites any previous transcript for this agent (e.g. after resumption,
-/// the new snapshot includes the full conversation).
-/// Failures are logged and silently ignored.
-pub async fn record_transcript(agent_id: &str, messages: &[Message]) {
-    let dir = match dirs::data_dir() {
-        Some(d) => d.join("tau/agent-transcripts"),
-        None => return,
-    };
-
-    if tokio::fs::create_dir_all(&dir).await.is_err() {
-        return;
-    }
-
-    let path = dir.join(format!("{}.jsonl", agent_id));
-    let mut file = match tokio::fs::File::create(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!("Failed to create transcript file: {}", e);
-            return;
-        }
-    };
-
-    for msg in messages {
-        if let Ok(json) = serde_json::to_string(msg) {
-            let _ = file.write_all(format!("{}\n", json).as_bytes()).await;
-        }
-    }
-}
-
 fn build_tool_set(
     agent_type: &AgentType,
     all_tools: &[BoxedTool],
@@ -679,107 +648,6 @@ fn extract_final_text(messages: &[Message]) -> String {
             _ => None,
         })
         .unwrap_or_default()
-}
-
-struct WorktreeInfo {
-    path: PathBuf,
-    branch: String,
-    head_commit: String,
-}
-
-async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
-    let git_root_output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .await
-        .map_err(|e| format!("git rev-parse failed: {}", e))?;
-
-    if !git_root_output.status.success() {
-        return Err("Not in a git repository".into());
-    }
-
-    let git_root = PathBuf::from(String::from_utf8_lossy(&git_root_output.stdout).trim());
-    let branch = format!("worktree-agent-{}", agent_id);
-    let path = git_root.join(format!(".tau-worktrees/agent-{}", agent_id));
-
-    tokio::fs::create_dir_all(path.parent().expect("joined path has parent"))
-        .await
-        .map_err(|e| format!("Failed to create worktree directory: {}", e))?;
-
-    let output = tokio::process::Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            &path.display().to_string(),
-            "-b",
-            &branch,
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("git worktree add failed: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let head_output = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await
-        .map_err(|e| format!("git rev-parse HEAD failed: {}", e))?;
-
-    let head_commit = String::from_utf8_lossy(&head_output.stdout)
-        .trim()
-        .to_string();
-
-    Ok(WorktreeInfo {
-        path,
-        branch,
-        head_commit,
-    })
-}
-
-async fn cleanup_worktree(info: &WorktreeInfo) -> Result<bool, String> {
-    let path_str = info.path.display().to_string();
-
-    let diff = tokio::process::Command::new("git")
-        .args(["-C", &path_str, "diff", "--quiet", &info.head_commit])
-        .status()
-        .await
-        .map_err(|e| format!("git diff failed: {}", e))?;
-
-    let untracked = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            &path_str,
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("git ls-files failed: {}", e))?;
-
-    let has_untracked = !String::from_utf8_lossy(&untracked.stdout)
-        .trim()
-        .is_empty();
-
-    if diff.success() && !has_untracked {
-        let _ = tokio::process::Command::new("git")
-            .args(["worktree", "remove", &path_str])
-            .output()
-            .await;
-        let _ = tokio::process::Command::new("git")
-            .args(["branch", "-D", &info.branch])
-            .output()
-            .await;
-        Ok(true) // removed
-    } else {
-        Ok(false) // kept — has changes
-    }
 }
 
 #[cfg(test)]

@@ -12,11 +12,15 @@ pub mod events;
 pub mod handle;
 pub mod interaction;
 pub mod loop_state;
+pub(crate) mod overflow;
 pub mod prompts;
 pub mod agent_manager;
 pub mod stream;
 pub mod tool;
+pub(crate) mod tool_executor;
+pub mod transcript;
 pub mod transport;
+pub(crate) mod worktree;
 
 pub use agent::{Agent, AgentConfig, DequeueMode};
 pub use compaction::{CompactionConfig, CompactionReason};
