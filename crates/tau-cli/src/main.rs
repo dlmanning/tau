@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
 
     let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
     if lsp_manager.is_available() {
-        agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager)));
+        agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager.clone())));
     }
 
     // Add agent tool (subagent spawning)
@@ -340,31 +340,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Non-interactive mode
-    if let Some(command) = args.command {
-        return run_command(&mut agent, &command, &model, interaction_rx).await;
-    }
-
-    // TUI mode
-    if use_tui {
+    let result = if let Some(command) = args.command {
+        run_command(&mut agent, &command, &model, interaction_rx).await
+    } else if use_tui {
+        // TUI mode
         let mut model = model;
         let mut reasoning = reasoning;
         let available_models = get_available_models();
-        return ui::run_tui(
+        ui::run_tui(
             &mut agent,
             &mut model,
             &mut reasoning,
             &available_models,
             interaction_rx,
         )
-        .await;
-    }
+        .await
+    } else {
+        // Interactive mode (simple stdin/stdout)
+        let session = session::SessionManager::new(&model.id).ok();
+        let mut model = model;
+        let mut reasoning = reasoning;
+        run_interactive(&mut agent, &mut model, &mut reasoning, session, interaction_rx).await
+    };
 
-    // Interactive mode (simple stdin/stdout)
-    // Create a new session for auto-save
-    let session = session::SessionManager::new(&model.id).ok();
-    let mut model = model;
-    let mut reasoning = reasoning;
-    run_interactive(&mut agent, &mut model, &mut reasoning, session, interaction_rx).await
+    lsp_manager.shutdown_all().await;
+    result
 }
 
 async fn run_command(

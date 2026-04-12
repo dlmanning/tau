@@ -143,7 +143,6 @@ impl LspClient {
     }
 
     /// Send an LSP shutdown request and exit notification.
-    #[allow(dead_code)]
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let _: serde_json::Value = self.request("shutdown", serde_json::Value::Null).await?;
         self.notify("exit", serde_json::Value::Null).await?;

@@ -321,6 +321,33 @@ impl LspManager {
         Ok(format_hover_result(result))
     }
 
+    /// Gracefully shut down all running LSP servers.
+    pub async fn shutdown_all(&self) {
+        let mut unique: Vec<Arc<LspClient>> = Vec::new();
+        {
+            let servers = self.servers.lock().await;
+            let mut seen = HashSet::new();
+            for client in servers.values() {
+                if seen.insert(Arc::as_ptr(client) as usize) {
+                    unique.push(client.clone());
+                }
+            }
+        }
+        for client in &unique {
+            if client.is_alive().await {
+                if let Err(e) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.shutdown(),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("shutdown timed out")))
+                {
+                    tracing::debug!("LSP shutdown error: {}", e);
+                }
+            }
+        }
+    }
+
     /// Get document symbols for a file.
     pub async fn document_symbol(&self, path: &Path) -> anyhow::Result<String> {
         let (client, uri) = self.prepare(path).await?;
