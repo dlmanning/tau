@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use crossterm::event::{Event, EventStream, MouseEventKind};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -227,10 +227,12 @@ pub struct TuiState {
     follow_bottom: bool,
     /// Whether agent is currently processing
     is_processing: bool,
-    /// Cached git branch name (refreshed periodically)
+    /// Cached git branch name (refreshed periodically via background task)
     git_branch: Option<String>,
     /// When the git branch was last checked
     git_branch_checked: Instant,
+    /// Background task for refreshing git branch
+    git_branch_task: Option<tokio::task::JoinHandle<Option<String>>>,
     /// Current status message
     status: String,
     /// Theme
@@ -292,6 +294,7 @@ impl TuiState {
             is_processing: false,
             git_branch: get_git_branch(),
             git_branch_checked: Instant::now(),
+            git_branch_task: None,
             status: "Ready".to_string(),
             theme: Theme::dark(),
             total_input_tokens: 0,
@@ -1005,10 +1008,19 @@ impl TuiState {
             })
             .unwrap_or_default();
 
-        // Refresh git branch every 5 seconds
-        if self.git_branch_checked.elapsed() > std::time::Duration::from_secs(5) {
-            self.git_branch = get_git_branch();
+        // Collect result from a previously spawned git branch refresh
+        if self.git_branch_task.as_ref().is_some_and(|t| t.is_finished()) {
+            if let Ok(branch) = self.git_branch_task.take().unwrap().now_or_never().unwrap() {
+                self.git_branch = branch;
+            }
+        }
+
+        // Spawn a background refresh every 5 seconds
+        if self.git_branch_checked.elapsed() > std::time::Duration::from_secs(5)
+            && self.git_branch_task.is_none()
+        {
             self.git_branch_checked = Instant::now();
+            self.git_branch_task = Some(tokio::task::spawn_blocking(get_git_branch));
         }
 
         let info_content = match &self.git_branch {
@@ -1165,6 +1177,7 @@ pub async fn run_tui(
 
     use crossterm::{
         execute,
+        event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture},
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
     use ratatui::{Terminal, backend::CrosstermBackend};
@@ -1173,7 +1186,7 @@ pub async fn run_tui(
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1394,7 +1407,7 @@ pub async fn run_tui(
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
     result
