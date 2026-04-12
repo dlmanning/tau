@@ -408,10 +408,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Interactive mode (simple stdin/stdout)
     // Create a new session for auto-save
-    let mut session = session::SessionManager::new(&model.id).ok();
+    let session = session::SessionManager::new(&model.id).ok();
     let mut model = model;
     let mut reasoning = reasoning;
-    run_interactive(&mut agent, &mut model, &mut reasoning, session.as_mut(), interaction_rx).await
+    run_interactive(&mut agent, &mut model, &mut reasoning, session, interaction_rx).await
 }
 
 async fn run_command(
@@ -547,7 +547,7 @@ async fn run_interactive(
     agent: &mut Agent,
     model: &mut Model,
     reasoning: &mut ReasoningLevel,
-    mut session: Option<&mut session::SessionManager>,
+    mut session: Option<session::SessionManager>,
     interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
 ) -> anyhow::Result<()> {
     use std::io::{self, Write};
@@ -676,6 +676,7 @@ async fn run_interactive(
                                 } else {
                                     agent.clear_messages();
                                 }
+                                session = Some(new_session);
                                 println!("Continue from this point with a fresh context.");
                             }
                             Err(e) => {
