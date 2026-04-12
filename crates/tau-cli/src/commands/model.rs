@@ -39,8 +39,8 @@ fn list_models(current: &Model, models: &[Model]) -> String {
 
     let mut output = String::from("Available models:\n");
 
-    let mut by_provider: std::collections::HashMap<String, Vec<&Model>> =
-        std::collections::HashMap::new();
+    let mut by_provider: std::collections::BTreeMap<String, Vec<&Model>> =
+        std::collections::BTreeMap::new();
 
     for model in models {
         by_provider
@@ -49,7 +49,7 @@ fn list_models(current: &Model, models: &[Model]) -> String {
             .push(model);
     }
 
-    for (provider, models) in by_provider.iter() {
+    for (provider, models) in &by_provider {
         output.push_str(&format!("\n{}:\n", provider));
         for model in models {
             let marker = if model.id == current.id { " *" } else { "" };
