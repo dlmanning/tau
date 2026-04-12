@@ -41,6 +41,11 @@ where
 {
     let (verifier, challenge) = generate_pkce();
 
+    // Generate a separate CSRF state token (distinct from the PKCE verifier)
+    let mut state_bytes = [0u8; 16];
+    getrandom::fill(&mut state_bytes).expect("Failed to generate random bytes");
+    let state_token = URL_SAFE_NO_PAD.encode(state_bytes);
+
     let auth_params = [
         ("code", "true"),
         ("client_id", CLIENT_ID),
@@ -49,7 +54,7 @@ where
         ("scope", SCOPES),
         ("code_challenge", &challenge),
         ("code_challenge_method", "S256"),
-        ("state", &verifier),
+        ("state", &state_token),
     ];
 
     let params_str = auth_params
@@ -65,16 +70,21 @@ where
     let auth_code = on_prompt_code().await;
     let auth_code = auth_code.trim();
 
-    let (code, state) = auth_code
+    let (code, returned_state) = auth_code
         .split_once('#')
         .ok_or_else(|| "Invalid authorization code format. Expected: code#state".to_string())?;
+
+    // Validate CSRF state to prevent cross-site request forgery
+    if returned_state != state_token {
+        return Err("OAuth state mismatch — possible CSRF attack. Please try again.".to_string());
+    }
 
     let client = reqwest::Client::new();
     let token_request = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
         "code": code,
-        "state": state,
+        "state": returned_state,
         "redirect_uri": REDIRECT_URI,
         "code_verifier": verifier,
     });
