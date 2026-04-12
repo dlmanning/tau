@@ -197,11 +197,13 @@ fn validate_url(url_str: &str) -> Result<String, String> {
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()             // 127.0.0.0/8
             || v4.is_private()           // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
             || v4.is_link_local()        // 169.254.0.0/16 (includes cloud metadata)
             || v4.is_unspecified()       // 0.0.0.0
             || v4.is_broadcast()         // 255.255.255.255
+            || (o[0] == 100 && (o[1] & 0xC0) == 64)  // 100.64.0.0/10 shared/CGN
         }
         IpAddr::V6(v6) => {
             // Check IPv4-mapped addresses (::ffff:x.x.x.x) against IPv4 rules
