@@ -36,6 +36,8 @@ use tau_tui::{
 };
 use tokio::sync::mpsc;
 
+use crate::utils::format_tokens;
+
 /// Pending interaction request waiting for user input in the TUI.
 struct PendingInteraction {
     question: String,
@@ -190,8 +192,6 @@ fn get_git_branch() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-use crate::utils::format_tokens;
-
 /// Messages sent from UI to agent handler
 #[derive(Debug)]
 pub enum UiMessage {
@@ -252,8 +252,6 @@ pub struct TuiState {
     total_cost: f64,
     /// Channel to send messages to agent handler
     ui_tx: mpsc::Sender<UiMessage>,
-    /// Spinner start time for animation
-    spinner_start: Instant,
     /// Model selector state
     model_selector: SelectorState,
     /// Branch selector state
@@ -306,7 +304,6 @@ impl TuiState {
             available_models,
             total_cost: 0.0,
             ui_tx,
-            spinner_start: Instant::now(),
             model_selector,
             branch_selector: SelectorState::default(),
             pending_interaction: None,
@@ -1076,6 +1073,15 @@ impl TuiState {
         let dim = Style::default().fg(Color::DarkGray);
         let mut parts: Vec<Span> = Vec::new();
 
+        // Status indicator
+        let status_style = if self.is_processing {
+            Style::default().fg(Color::Yellow)
+        } else {
+            dim
+        };
+        parts.push(Span::styled(&self.status, status_style));
+        parts.push(Span::styled(" · ", dim));
+
         // Model name
         let model_name = self
             .model
@@ -1183,7 +1189,6 @@ pub async fn run_tui(
         // We create the future here where `content` is still in scope
         if let Some(content) = pending_prompt.take() {
             state.is_processing = true;
-            state.spinner_start = Instant::now();
             state.status = "Thinking...".to_string();
             state.messages.push(ChatMessage::assistant_streaming(""));
             state.scroll_to_bottom();
