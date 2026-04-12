@@ -561,6 +561,17 @@ impl TuiState {
         self.model = model;
     }
 
+    /// Reset token/cost counters and agent progress
+    pub fn reset_stats(&mut self) {
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+        self.total_cache_read = 0;
+        self.total_cache_write = 0;
+        self.total_cost = 0.0;
+        self.agent_progress.clear();
+        self.agent_order.clear();
+    }
+
     /// Handle keyboard action
     pub async fn handle_action(&mut self, action: Action, width: u16) -> bool {
         if self.branch_selector.visible {
@@ -668,13 +679,7 @@ impl TuiState {
             Action::Clear => {
                 let _ = self.ui_tx.send(UiMessage::Clear).await;
                 self.messages.clear();
-                self.agent_progress.clear();
-                self.agent_order.clear();
-                self.total_input_tokens = 0;
-                self.total_output_tokens = 0;
-                self.total_cache_read = 0;
-                self.total_cache_write = 0;
-                self.total_cost = 0.0;
+                self.reset_stats();
                 self.status = "Ready".to_string();
                 true
             }
@@ -1280,13 +1285,7 @@ pub async fn run_tui(
                                 CommandResult::Clear => {
                                     agent.clear_messages();
                                     state.messages.clear();
-                                    state.total_input_tokens = 0;
-                                    state.total_output_tokens = 0;
-                                    state.total_cache_read = 0;
-                                    state.total_cache_write = 0;
-                                    state.total_cost = 0.0;
-                                    state.agent_progress.clear();
-                                    state.agent_order.clear();
+                                    state.reset_stats();
                                     state.status = "Cleared".to_string();
                                 }
                                 CommandResult::ChangeModel(new_model) => {
@@ -1348,13 +1347,7 @@ pub async fn run_tui(
                                                 agent.clear_messages();
                                                 state.messages.clear();
                                             }
-                                            state.total_input_tokens = 0;
-                                            state.total_output_tokens = 0;
-                                            state.total_cache_read = 0;
-                                            state.total_cache_write = 0;
-                                            state.total_cost = 0.0;
-                                            state.agent_progress.clear();
-                                    state.agent_order.clear();
+                                            state.reset_stats();
                                         }
                                         Err(e) => {
                                             state.show_system_message(&format!("Failed to create branch: {}", e));
@@ -1375,13 +1368,7 @@ pub async fn run_tui(
                     Some(UiMessage::Clear) => {
                         agent.clear_messages();
                         state.messages.clear();
-                        state.total_input_tokens = 0;
-                        state.total_output_tokens = 0;
-                        state.total_cache_read = 0;
-                        state.total_cache_write = 0;
-                        state.total_cost = 0.0;
-                        state.agent_progress.clear();
-                        state.agent_order.clear();
+                        state.reset_stats();
                         state.status = "Cleared".to_string();
                     }
                     Some(UiMessage::Abort) => {
@@ -1408,9 +1395,7 @@ pub async fn run_tui(
                                     agent.clear_messages();
                                     state.messages.clear();
                                 }
-                                state.total_input_tokens = 0;
-                                state.total_output_tokens = 0;
-                                state.total_cost = 0.0;
+                                state.reset_stats();
                             }
                             Err(e) => {
                                 state.show_system_message(&format!("Failed to create branch: {}", e));
