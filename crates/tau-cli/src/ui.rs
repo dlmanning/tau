@@ -636,17 +636,7 @@ impl TuiState {
                 let _ = self.ui_tx.send(UiMessage::Quit).await;
                 false
             }
-            Action::Interrupt => {
-                if self.is_processing {
-                    let _ = self.ui_tx.send(UiMessage::Abort).await;
-                    self.status = "Cancelling...".to_string();
-                    true
-                } else {
-                    let _ = self.ui_tx.send(UiMessage::Quit).await;
-                    false
-                }
-            }
-            Action::Escape => {
+            Action::Interrupt | Action::Escape => {
                 if self.is_processing {
                     let _ = self.ui_tx.send(UiMessage::Abort).await;
                     self.status = "Cancelling...".to_string();
@@ -1128,6 +1118,41 @@ impl TuiState {
     }
 }
 
+/// Apply a branch operation: create a branch session and truncate conversation state.
+fn apply_branch(
+    state: &mut TuiState,
+    agent: &mut Agent,
+    model_id: &str,
+    branch_index: Option<usize>,
+) {
+    match crate::session::SessionManager::branch_from(
+        agent.messages(),
+        branch_index,
+        model_id,
+    ) {
+        Ok(new_session) => {
+            let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
+            state.show_system_message(&format!(
+                "Created branch: {} ({} messages)",
+                new_session.id(),
+                msg_count
+            ));
+            if let Some(idx) = branch_index {
+                let messages: Vec<_> = agent.messages().iter().take(idx + 1).cloned().collect();
+                agent.set_messages(messages);
+                state.messages.truncate(idx + 1);
+            } else {
+                agent.clear_messages();
+                state.messages.clear();
+            }
+            state.reset_stats();
+        }
+        Err(e) => {
+            state.show_system_message(&format!("Failed to create branch: {}", e));
+        }
+    }
+}
+
 /// Run the TUI application
 pub async fn run_tui(
     agent: &mut Agent,
@@ -1335,32 +1360,7 @@ pub async fn run_tui(
                                     }
                                 }
                                 CommandResult::BranchFrom(branch_index) => {
-                                    match crate::session::SessionManager::branch_from(
-                                        agent.messages(),
-                                        branch_index,
-                                        &model.id,
-                                    ) {
-                                        Ok(new_session) => {
-                                            let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
-                                            state.show_system_message(&format!(
-                                                "Created branch session: {} ({} messages)",
-                                                new_session.id(),
-                                                msg_count
-                                            ));
-                                            if let Some(idx) = branch_index {
-                                                let messages: Vec<_> = agent.messages().iter().take(idx + 1).cloned().collect();
-                                                agent.set_messages(messages);
-                                                state.messages.truncate(idx + 1);
-                                            } else {
-                                                agent.clear_messages();
-                                                state.messages.clear();
-                                            }
-                                            state.reset_stats();
-                                        }
-                                        Err(e) => {
-                                            state.show_system_message(&format!("Failed to create branch: {}", e));
-                                        }
-                                    }
+                                    apply_branch(&mut state, agent, &model.id, branch_index);
                                 }
                             }
                         }
@@ -1383,32 +1383,7 @@ pub async fn run_tui(
                         agent.abort();
                     }
                     Some(UiMessage::Branch(branch_index)) => {
-                        match crate::session::SessionManager::branch_from(
-                            agent.messages(),
-                            branch_index,
-                            &model.id,
-                        ) {
-                            Ok(new_session) => {
-                                let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
-                                state.show_system_message(&format!(
-                                    "Created branch: {} ({} messages)\nContinue from this point with a fresh context.",
-                                    new_session.id(),
-                                    msg_count
-                                ));
-                                if let Some(idx) = branch_index {
-                                    let messages: Vec<_> = agent.messages().iter().take(idx + 1).cloned().collect();
-                                    agent.set_messages(messages);
-                                    state.messages.truncate(idx + 1);
-                                } else {
-                                    agent.clear_messages();
-                                    state.messages.clear();
-                                }
-                                state.reset_stats();
-                            }
-                            Err(e) => {
-                                state.show_system_message(&format!("Failed to create branch: {}", e));
-                            }
-                        }
+                        apply_branch(&mut state, agent, &model.id, branch_index);
                     }
                     Some(UiMessage::Quit) | None => {
                         break Ok(());
