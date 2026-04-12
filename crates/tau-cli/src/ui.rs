@@ -246,7 +246,8 @@ pub struct TuiState {
     model: Model,
     /// Current reasoning level
     reasoning: tau_ai::ReasoningLevel,
-    /// Whether adaptive thinking is enabled
+    /// Whether adaptive thinking is enabled (fixed per session; reasoning level
+    /// can change at runtime but adaptive mode cannot be toggled).
     thinking_adaptive: bool,
     /// Available models for selection
     available_models: Vec<Model>,
@@ -405,9 +406,29 @@ impl TuiState {
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_processing = false;
+                // Clean up orphaned subagent progress if parent ends before children
+                if !self.agent_progress.is_empty() {
+                    if let Some(msg) = self.messages.iter_mut().rev()
+                        .find(|m| m.role == "agents" && m.is_streaming)
+                    {
+                        msg.is_streaming = false;
+                    }
+                    self.agent_progress.clear();
+                    self.agent_order.clear();
+                }
             }
             AgentEvent::Error { message } => {
                 self.is_processing = false;
+                if !self.agent_progress.is_empty() {
+                    if let Some(msg) = self.messages.iter_mut().rev()
+                        .find(|m| m.role == "agents")
+                    {
+                        msg.is_streaming = false;
+                        msg.is_error = true;
+                    }
+                    self.agent_progress.clear();
+                    self.agent_order.clear();
+                }
                 self.messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: format!("Error: {}", message),
@@ -539,6 +560,13 @@ impl TuiState {
         }
     }
 
+    /// Send a UI message, logging a warning if the channel is closed.
+    async fn send_ui(&self, msg: UiMessage) {
+        if self.ui_tx.send(msg).await.is_err() {
+            tracing::warn!("UI message channel closed");
+        }
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.follow_bottom = true;
     }
@@ -580,7 +608,7 @@ impl TuiState {
                 Action::Submit => {
                     let selected = self.branch_selector.selected;
                     self.branch_selector.hide();
-                    let _ = self.ui_tx.send(UiMessage::Branch(Some(selected))).await;
+                    self.send_ui(UiMessage::Branch(Some(selected))).await;
                     return true;
                 }
                 Action::Escape => {
@@ -606,7 +634,7 @@ impl TuiState {
                 Action::Submit => {
                     let selected = self.model_selector.selected;
                     self.model_selector.hide();
-                    let _ = self.ui_tx.send(UiMessage::ChangeModel(selected)).await;
+                    self.send_ui(UiMessage::ChangeModel(selected)).await;
                     return true;
                 }
                 Action::Escape | Action::ModelSelect => {
@@ -626,26 +654,26 @@ impl TuiState {
                     self.input.clear();
 
                     if content.starts_with('/') {
-                        let _ = self.ui_tx.send(UiMessage::Command(content)).await;
+                        self.send_ui(UiMessage::Command(content)).await;
                     } else {
                         self.messages.push(ChatMessage::user(&content));
                         self.scroll_to_bottom();
-                        let _ = self.ui_tx.send(UiMessage::Submit(content)).await;
+                        self.send_ui(UiMessage::Submit(content)).await;
                     }
                 }
                 true
             }
             Action::Quit => {
-                let _ = self.ui_tx.send(UiMessage::Quit).await;
+                self.send_ui(UiMessage::Quit).await;
                 false
             }
             Action::Interrupt | Action::Escape => {
                 if self.is_processing {
-                    let _ = self.ui_tx.send(UiMessage::Abort).await;
+                    self.send_ui(UiMessage::Abort).await;
                     self.status = "Cancelling...".to_string();
                     true
                 } else {
-                    let _ = self.ui_tx.send(UiMessage::Quit).await;
+                    self.send_ui(UiMessage::Quit).await;
                     false
                 }
             }
@@ -660,7 +688,7 @@ impl TuiState {
                 true
             }
             Action::Clear => {
-                let _ = self.ui_tx.send(UiMessage::Clear).await;
+                self.send_ui(UiMessage::Clear).await;
                 self.messages.clear();
                 self.reset_stats();
                 self.status = "Ready".to_string();
@@ -704,6 +732,7 @@ impl TuiState {
                     Action::Submit => {
                         if let Some(pi) = self.pending_interaction.take() {
                             let label = pi.options[pi.selector.selected].label.clone();
+                            // Oneshot: Err only if receiver dropped, which is fine
                             let _ = pi.response_tx.send(
                                 tau_agent::InteractionResponse::Answer(label),
                             );
@@ -1165,6 +1194,104 @@ fn apply_branch(
     }
 }
 
+/// Dispatch a UI message received from the input handler.
+/// Returns `false` if the TUI should exit.
+async fn dispatch_ui_message(
+    msg: UiMessage,
+    state: &mut TuiState,
+    agent: &mut Agent,
+    model: &mut Model,
+    reasoning: &mut tau_ai::ReasoningLevel,
+    available_models: &[Model],
+    pending_prompt: &mut Option<String>,
+) -> bool {
+    use crate::commands::{CommandResult, execute_command};
+
+    match msg {
+        UiMessage::Submit(content) => {
+            *pending_prompt = Some(content);
+        }
+        UiMessage::Command(cmd) => {
+            if let Some(result) = execute_command(&cmd, agent, model, *reasoning, available_models) {
+                match result {
+                    CommandResult::Message(msg) => {
+                        state.show_system_message(&msg);
+                    }
+                    CommandResult::Clear => {
+                        agent.clear_messages();
+                        state.messages.clear();
+                        state.reset_stats();
+                        state.status = "Cleared".to_string();
+                    }
+                    CommandResult::ChangeModel(new_model) => {
+                        state.show_system_message(&format!("Switched to: {}", new_model.id));
+                        *model = new_model.clone();
+                        state.set_model(new_model.clone());
+                        agent.set_model(new_model);
+                    }
+                    CommandResult::ChangeReasoning(level) => {
+                        state.show_system_message(&format!("Reasoning: {:?}", level));
+                        *reasoning = level;
+                        state.reasoning = level;
+                        agent.set_reasoning(level);
+                    }
+                    CommandResult::Exit => return false,
+                    CommandResult::Unknown(cmd) => {
+                        state.show_system_message(&format!(
+                            "Unknown command: /{}\nType /help for available commands.", cmd
+                        ));
+                    }
+                    CommandResult::OpenModelSelector => {
+                        state.model_selector.show();
+                    }
+                    CommandResult::OpenBranchSelector => {
+                        state.open_branch_selector();
+                    }
+                    CommandResult::Compact => {
+                        state.show_system_message("Compacting context...");
+                        match agent.run_compaction(tau_agent::CompactionReason::Manual).await {
+                            Ok(()) => {
+                                state.show_system_message(&format!(
+                                    "Context compacted. {} messages remaining.",
+                                    agent.messages().len()
+                                ));
+                            }
+                            Err(e) => {
+                                state.show_system_message(&format!("Compaction failed: {}", e));
+                            }
+                        }
+                    }
+                    CommandResult::BranchFrom(branch_index) => {
+                        apply_branch(state, agent, &model.id, branch_index);
+                    }
+                }
+            }
+        }
+        UiMessage::ChangeModel(index) => {
+            if let Some(new_model) = available_models.get(index) {
+                state.show_system_message(&format!("Switched to: {}", new_model.id));
+                *model = new_model.clone();
+                state.set_model(new_model.clone());
+                agent.set_model(new_model.clone());
+            }
+        }
+        UiMessage::Clear => {
+            agent.clear_messages();
+            state.messages.clear();
+            state.reset_stats();
+            state.status = "Cleared".to_string();
+        }
+        UiMessage::Abort => {
+            agent.abort();
+        }
+        UiMessage::Branch(branch_index) => {
+            apply_branch(state, agent, &model.id, branch_index);
+        }
+        UiMessage::Quit => return false,
+    }
+    true
+}
+
 /// Run the TUI application
 pub async fn run_tui(
     agent: &mut Agent,
@@ -1181,8 +1308,6 @@ pub async fn run_tui(
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
     use ratatui::{Terminal, backend::CrosstermBackend};
-
-    use crate::commands::{CommandResult, execute_command};
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1210,6 +1335,7 @@ pub async fn run_tui(
     // This is stored as a String so it lives long enough for the future
     let mut pending_prompt: Option<String> = None;
 
+    // Captures Ok/Err from various break points in the nested event loops.
     let result = 'outer: loop {
         // If there's a pending prompt, start processing it
         // We create the future here where `content` is still in scope
@@ -1319,88 +1445,15 @@ pub async fn run_tui(
 
             msg = ui_rx.recv() => {
                 match msg {
-                    Some(UiMessage::Submit(content)) => {
-                        pending_prompt = Some(content);
-                    }
-                    Some(UiMessage::Command(cmd)) => {
-                        if let Some(result) = execute_command(&cmd, agent, model, *reasoning, available_models) {
-                            match result {
-                                CommandResult::Message(msg) => {
-                                    state.show_system_message(&msg);
-                                }
-                                CommandResult::Clear => {
-                                    agent.clear_messages();
-                                    state.messages.clear();
-                                    state.reset_stats();
-                                    state.status = "Cleared".to_string();
-                                }
-                                CommandResult::ChangeModel(new_model) => {
-                                    state.show_system_message(&format!("Switched to: {}", new_model.id));
-                                    *model = new_model.clone();
-                                    state.set_model(new_model.clone());
-                                    agent.set_model(new_model);
-                                }
-                                CommandResult::ChangeReasoning(level) => {
-                                    state.show_system_message(&format!("Reasoning: {:?}", level));
-                                    *reasoning = level;
-                                    state.reasoning = level;
-                                    agent.set_reasoning(level);
-                                }
-                                CommandResult::Exit => {
-                                    break Ok(());
-                                }
-                                CommandResult::Unknown(cmd) => {
-                                    state.show_system_message(&format!("Unknown command: /{}\nType /help for available commands.", cmd));
-                                }
-                                CommandResult::OpenModelSelector => {
-                                    state.model_selector.show();
-                                }
-                                CommandResult::OpenBranchSelector => {
-                                    state.open_branch_selector();
-                                }
-                                CommandResult::Compact => {
-                                    state.show_system_message("Compacting context...");
-                                    match agent.run_compaction(tau_agent::CompactionReason::Manual).await {
-                                        Ok(()) => {
-                                            state.show_system_message(&format!(
-                                                "Context compacted. {} messages remaining.",
-                                                agent.messages().len()
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            state.show_system_message(&format!("Compaction failed: {}", e));
-                                        }
-                                    }
-                                }
-                                CommandResult::BranchFrom(branch_index) => {
-                                    apply_branch(&mut state, agent, &model.id, branch_index);
-                                }
-                            }
+                    Some(msg) => {
+                        if !dispatch_ui_message(
+                            msg, &mut state, agent, model, reasoning,
+                            available_models, &mut pending_prompt,
+                        ).await {
+                            break Ok(());
                         }
                     }
-                    Some(UiMessage::ChangeModel(index)) => {
-                        if let Some(new_model) = available_models.get(index) {
-                            state.show_system_message(&format!("Switched to: {}", new_model.id));
-                            *model = new_model.clone();
-                            state.set_model(new_model.clone());
-                            agent.set_model(new_model.clone());
-                        }
-                    }
-                    Some(UiMessage::Clear) => {
-                        agent.clear_messages();
-                        state.messages.clear();
-                        state.reset_stats();
-                        state.status = "Cleared".to_string();
-                    }
-                    Some(UiMessage::Abort) => {
-                        agent.abort();
-                    }
-                    Some(UiMessage::Branch(branch_index)) => {
-                        apply_branch(&mut state, agent, &model.id, branch_index);
-                    }
-                    Some(UiMessage::Quit) | None => {
-                        break Ok(());
-                    }
+                    None => break Ok(()),
                 }
             }
         }
