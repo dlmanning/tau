@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use tau_ai::{Content, Message};
+use tokio_util::sync::CancellationToken;
 
 use crate::transport::{AgentRunConfig, Transport};
 
@@ -284,7 +285,7 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 /// Find where to cut messages for compaction.
 /// Walks backwards from the end, keeping at least `keep_recent_tokens` tokens.
 /// Never cuts at a ToolResult — finds the nearest User or Assistant boundary.
-fn find_cut_point(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPointResult> {
+fn find_cut_point(messages: &[Message], keep_recent_tokens: u32, cancel: &CancellationToken) -> Option<CutPointResult> {
     if messages.len() < 2 {
         return None;
     }
@@ -294,6 +295,9 @@ fn find_cut_point(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPo
     let mut cut_index = messages.len();
 
     for i in (0..messages.len()).rev() {
+        if cancel.is_cancelled() {
+            return None;
+        }
         accumulated += estimate_tokens(&messages[i]);
         if accumulated >= keep_recent_tokens {
             cut_index = i + 1; // Keep from i+1 onwards
@@ -320,6 +324,9 @@ fn find_cut_point(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPo
     // Walk forward from cut_index to find a User or start-of-turn boundary
     let mut first_kept = cut_index;
     while first_kept < messages.len() {
+        if cancel.is_cancelled() {
+            return None;
+        }
         match &messages[first_kept] {
             Message::User { .. } | Message::SystemInjection { .. } => break,
             Message::Assistant { .. } => break,
@@ -449,11 +456,21 @@ pub async fn compact(
     agent_config: &crate::agent::AgentConfig,
     transport: &Arc<dyn Transport>,
     previous_summary: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Result<CompactionResult, String> {
     let tokens_before = estimate_total_tokens(messages);
 
-    let cut = find_cut_point(messages, config.keep_recent_tokens)
-        .ok_or_else(|| "Not enough messages to compact".to_string())?;
+    if cancel.is_cancelled() {
+        return Err("Compaction cancelled".to_string());
+    }
+    let cut = find_cut_point(messages, config.keep_recent_tokens, cancel)
+        .ok_or_else(|| {
+            if cancel.is_cancelled() {
+                "Compaction cancelled".to_string()
+            } else {
+                "Not enough messages to compact".to_string()
+            }
+        })?;
 
     let messages_to_summarize = &messages[..cut.first_kept_index];
 
@@ -494,14 +511,17 @@ pub async fn compact(
                 TURN_PREFIX_SUMMARIZATION_PROMPT.replace("{conversation}", &turn_prefix_text);
 
             let turn_summary =
-                call_summarization_llm(&turn_prompt, agent_config, transport).await?;
+                call_summarization_llm(&turn_prompt, agent_config, transport, cancel).await?;
             full_summary.push_str("## Split Turn Context\n");
             full_summary.push_str(&turn_summary);
             full_summary.push_str("\n\n");
         }
     }
 
-    let main_summary = call_summarization_llm(&prompt, agent_config, transport).await?;
+    if cancel.is_cancelled() {
+        return Err("Compaction cancelled".to_string());
+    }
+    let main_summary = call_summarization_llm(&prompt, agent_config, transport, cancel).await?;
     full_summary.push_str(&main_summary);
 
     Ok(CompactionResult {
@@ -518,6 +538,7 @@ async fn call_summarization_llm(
     prompt: &str,
     agent_config: &crate::agent::AgentConfig,
     transport: &Arc<dyn Transport>,
+    cancel: &CancellationToken,
 ) -> Result<String, String> {
     use futures::StreamExt;
 
@@ -536,10 +557,9 @@ async fn call_summarization_llm(
     };
 
     let user_message = Message::user(prompt);
-    let cancel = tokio_util::sync::CancellationToken::new();
 
     let mut event_stream = transport
-        .run(vec![user_message], &run_config, cancel)
+        .run(vec![user_message], &run_config, cancel.clone())
         .await
         .map_err(|e| format!("Compaction LLM call failed: {}", e))?;
 
@@ -632,11 +652,13 @@ mod tests {
     #[test]
     fn test_find_cut_point_not_enough_messages() {
         let messages = vec![user_msg("hi")];
-        assert!(find_cut_point(&messages, 100).is_none());
+        let cancel = CancellationToken::new();
+        assert!(find_cut_point(&messages, 100, &cancel).is_none());
     }
 
     #[test]
     fn test_find_cut_point_basic() {
+        let cancel = CancellationToken::new();
         // Create messages with known token sizes
         let messages = vec![
             user_msg(&"a".repeat(400)),      // 100 tokens
@@ -645,12 +667,13 @@ mod tests {
             assistant_msg(&"d".repeat(400)), // 100 tokens
         ];
         // keep_recent_tokens=150 -> should keep last ~2 messages
-        let cut = find_cut_point(&messages, 150).unwrap();
+        let cut = find_cut_point(&messages, 150, &cancel).unwrap();
         assert!(cut.first_kept_index >= 2);
     }
 
     #[test]
     fn test_find_cut_point_skips_tool_result() {
+        let cancel = CancellationToken::new();
         let messages = vec![
             user_msg(&"a".repeat(400)),
             assistant_with_tool_call("let me read", "read", serde_json::json!({"path": "/foo"})),
@@ -659,7 +682,7 @@ mod tests {
             assistant_msg(&"c".repeat(400)),
         ];
         // Should never have first_kept_index pointing at a ToolResult
-        let cut = find_cut_point(&messages, 200);
+        let cut = find_cut_point(&messages, 200, &cancel);
         if let Some(cut) = cut {
             assert!(!matches!(
                 &messages[cut.first_kept_index],

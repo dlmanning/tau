@@ -230,6 +230,22 @@ impl Tool for BashTool {
                 status = child.wait() => {
                     match status {
                         Ok(exit_status) => {
+                            // Drain remaining pipe data. Use a bounded select so
+                            // inherited fds from grandchild processes can't hang us.
+                            let drain_timeout = tokio::time::Duration::from_secs(5);
+                            tokio::select! {
+                                _ = async {
+                                    while let Ok(Some(l)) = stdout_reader.next_line().await {
+                                        stdout_collector.push_line(l);
+                                    }
+                                    while let Ok(Some(l)) = stderr_reader.next_line().await {
+                                        stderr_collector.push_line(l);
+                                    }
+                                } => {}
+                                _ = ctx.cancel.cancelled() => {}
+                                _ = tokio::time::sleep(drain_timeout) => {}
+                            }
+
                             let mut result = stdout_collector.into_string();
 
                             let err_output = stderr_collector.into_string();

@@ -321,12 +321,14 @@ impl Agent {
 
         let tokens_before = compaction::estimate_total_tokens(&self.conversation.messages);
 
+        let cancel = self.handle.cancel.lock().clone();
         let result = compaction::compact(
             &self.conversation.messages,
             &self.config.compaction,
             &self.config,
             &self.transport,
             self.conversation.previous_summary.as_deref(),
+            &cancel,
         )
         .await
         .map_err(crate::error::Error::Compaction)?;
@@ -493,6 +495,7 @@ impl Agent {
         if !self.config.compaction.enabled || !is_context_overflow(error) {
             return false;
         }
+        let drain_start = self.conversation.messages.len();
         for m in messages_to_add.drain(..) {
             self.conversation.messages.push(m);
         }
@@ -506,6 +509,8 @@ impl Agent {
             }
             return true;
         }
+        // Compaction failed — undo the drain to keep conversation state clean
+        *messages_to_add = self.conversation.messages.drain(drain_start..).collect();
         false
     }
 

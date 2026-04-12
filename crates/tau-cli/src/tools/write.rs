@@ -1,10 +1,27 @@
 //! File writing tool
 
+use std::path::{Component, Path, PathBuf};
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::fs;
+
+/// Normalize a path by resolving `.` and `..` components without filesystem access.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    result
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteArgs {
@@ -57,10 +74,10 @@ impl Tool for WriteTool {
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        if args.path == "~" {
+        let path = ctx.resolve_path(&args.path);
+        if dirs::home_dir().is_some_and(|h| normalize_path(&path) == h) {
             return ToolResult::error("Cannot write to home directory itself");
         }
-        let path = ctx.resolve_path(&args.path);
 
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
