@@ -13,6 +13,8 @@
 //!
 //! The header style is inspired by the HP 48GX calculator status area.
 
+mod constants;
+
 use std::time::Instant;
 
 use crossterm::event::{Event, EventStream, MouseEventKind};
@@ -113,8 +115,8 @@ fn rainbow_tau_style() -> Style {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    // Full cycle every ~4 seconds (4096ms)
-    let phase = (ms % 4096) as f64 / 4096.0;
+    // Full hue rotation cycle
+    let phase = (ms % constants::RAINBOW_CYCLE_MS) as f64 / constants::RAINBOW_CYCLE_MS as f64;
     // HSV to RGB with S=1, V=1 — hue rotates through 0..360
     let hue = phase * 360.0;
     let c = 1.0_f64;
@@ -340,7 +342,7 @@ impl TuiState {
                 is_error,
                 ..
             } => {
-                let preview = crate::utils::truncate_chars(&result, 200);
+                let preview = crate::utils::truncate_chars(&result, constants::TOOL_RESULT_PREVIEW_CHARS);
                 if let Some(msg) = self.messages.iter_mut().rev()
                     .find(|m| m.id.as_deref() == Some(&tool_call_id))
                 {
@@ -505,11 +507,11 @@ impl TuiState {
     fn handle_mouse_scroll(&mut self, kind: MouseEventKind) {
         match kind {
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(3);
+                self.scroll = self.scroll.saturating_sub(constants::SCROLL_LINES_MOUSE);
                 self.follow_bottom = false;
             }
             MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_add(3);
+                self.scroll = self.scroll.saturating_add(constants::SCROLL_LINES_MOUSE);
             }
             _ => {}
         }
@@ -633,12 +635,12 @@ impl TuiState {
                 }
             }
             Action::PageUp => {
-                self.scroll = self.scroll.saturating_sub(10);
+                self.scroll = self.scroll.saturating_sub(constants::SCROLL_LINES_PAGE);
                 self.follow_bottom = false;
                 true
             }
             Action::PageDown => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll = self.scroll.saturating_add(constants::SCROLL_LINES_PAGE);
                 // Re-pin resolved in render if we've reached the bottom
                 true
             }
@@ -854,7 +856,7 @@ impl TuiState {
             .iter()
             .enumerate()
             .map(|(i, msg)| {
-                let preview = crate::utils::truncate_chars(&msg.content, 50);
+                let preview = crate::utils::truncate_chars(&msg.content, constants::BRANCH_PREVIEW_CHARS);
                 let preview = preview.replace('\n', " ");
                 OwnedSelectorItem {
                     label: format!("{}: [{}] {}", i, msg.role, preview),
@@ -1010,8 +1012,8 @@ impl TuiState {
             }
         }
 
-        // Spawn a background refresh every 5 seconds
-        if self.git_branch_checked.elapsed() > std::time::Duration::from_secs(5)
+        // Spawn a background refresh if enough time has elapsed
+        if self.git_branch_checked.elapsed() > std::time::Duration::from_secs(constants::GIT_BRANCH_REFRESH_SECS)
             && self.git_branch_task.is_none()
         {
             self.git_branch_checked = Instant::now();
@@ -1272,7 +1274,7 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(32);
+    let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(constants::UI_CHANNEL_CAPACITY);
 
     let mut state = TuiState::new(
         model.clone(),
@@ -1286,7 +1288,7 @@ pub async fn run_tui(
     let mut event_stream = EventStream::new();
 
     // Tick interval for animations (80ms for smooth spinner)
-    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(80));
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(constants::TICK_INTERVAL_MS));
 
     // Pending prompt content - we'll process this at the start of the next loop iteration
     // This is stored as a String so it lives long enough for the future
