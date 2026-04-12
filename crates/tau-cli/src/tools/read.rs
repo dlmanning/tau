@@ -103,11 +103,14 @@ impl Tool for ReadTool {
             .enumerate()
             .map(|(i, line)| {
                 let line_num = offset + i + 1; // 1-indexed
-                let content = if line.len() > MAX_LINE_LENGTH {
+                let truncated = line.chars().count() > MAX_LINE_LENGTH;
+                if truncated {
                     had_truncated = true;
-                    &line[..MAX_LINE_LENGTH]
+                }
+                let content: String = if truncated {
+                    line.chars().take(MAX_LINE_LENGTH).collect()
                 } else {
-                    line
+                    line.to_string()
                 };
                 format!("{:>width$}\t{}", line_num, content, width = num_width)
             })

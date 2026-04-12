@@ -165,13 +165,9 @@ fn collect_files(path: &Path, glob_pattern: Option<&str>) -> Vec<PathBuf> {
     files
 }
 
-/// Truncate a line if it exceeds MAX_LINE_LENGTH
+/// Truncate a line if it exceeds MAX_LINE_LENGTH (Unicode-safe)
 fn truncate_line(line: &str) -> String {
-    if line.len() > MAX_LINE_LENGTH {
-        format!("{}...", &line[..MAX_LINE_LENGTH])
-    } else {
-        line.to_string()
-    }
+    crate::utils::truncate_chars(line, MAX_LINE_LENGTH)
 }
 
 fn search_file(
