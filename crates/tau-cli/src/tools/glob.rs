@@ -61,14 +61,10 @@ impl Tool for GlobTool {
             .cwd
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
-        let cwd = Some(cwd);
 
         let limit = args.limit.unwrap_or(100) as usize;
 
-        let full_pattern = match &cwd {
-            Some(dir) => dir.join(&args.pattern).to_string_lossy().to_string(),
-            None => args.pattern.clone(),
-        };
+        let full_pattern = cwd.join(&args.pattern).to_string_lossy().to_string();
 
         let entries = match glob(&full_pattern) {
             Ok(paths) => paths,
