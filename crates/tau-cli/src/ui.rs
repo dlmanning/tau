@@ -7,7 +7,7 @@
 //! | Area | Height | Renderer | Contents |
 //! |------|--------|----------|----------|
 //! | **Header** | 1 | `render_header` | τ glyph (rainbow when processing, green when idle), cwd in `{ }` brackets, clock (MM/DD/YYYY HH:MM:SS AM) |
-//! | **Conversation** | flex | `render_conversation` | Message thread — user (▶), assistant (◀), tools (⚙), agents (◇), system (●), steer (▷) |
+//! | **Conversation** | flex | `render_conversation` | Message thread — user (▶), assistant (◀), tools (⚙), agents (◇), system (●), steer (▷). Bottom border shows status (Ready/Thinking/Cancelling). |
 //! | **Status line** | 1 | `render_status_line` | Model name, thinking level, token counts, cache stats, cost |
 //! | **Input** | 3 | `InputBox` widget | Text entry with placeholder |
 //!
@@ -406,6 +406,7 @@ impl TuiState {
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_processing = false;
+                self.status = "Ready".to_string();
                 // Clean up orphaned subagent progress if parent ends before children
                 if !self.agent_progress.is_empty() {
                     if let Some(msg) = self.messages.iter_mut().rev()
@@ -419,6 +420,7 @@ impl TuiState {
             }
             AgentEvent::Error { message } => {
                 self.is_processing = false;
+                self.status = "Ready".to_string();
                 if !self.agent_progress.is_empty() {
                     if let Some(msg) = self.messages.iter_mut().rev()
                         .find(|m| m.role == "agents")
@@ -916,9 +918,19 @@ impl TuiState {
     }
 
     fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
+        let status_style = if self.is_processing {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(self.theme.border_style());
+            .border_style(self.theme.border_style())
+            .title_bottom(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(&self.status, status_style),
+                Span::raw(" "),
+            ]));
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1037,7 +1049,8 @@ impl TuiState {
             })
             .unwrap_or_default();
 
-        // Collect result from a previously spawned git branch refresh
+        // Collect result from a previously spawned git branch refresh.
+        // unwrap()s are safe: is_some_and guards the take(), is_finished() guarantees now_or_never() returns Some.
         if self.git_branch_task.as_ref().is_some_and(|t| t.is_finished()) {
             if let Ok(branch) = self.git_branch_task.take().unwrap().now_or_never().unwrap() {
                 self.git_branch = branch;
@@ -1097,15 +1110,6 @@ impl TuiState {
     fn render_status_line(&self, frame: &mut Frame, area: Rect) {
         let dim = Style::default().fg(Color::DarkGray);
         let mut parts: Vec<Span> = Vec::new();
-
-        // Status indicator
-        let status_style = if self.is_processing {
-            Style::default().fg(Color::Yellow)
-        } else {
-            dim
-        };
-        parts.push(Span::styled(&self.status, status_style));
-        parts.push(Span::styled(" · ", dim));
 
         // Model name
         parts.push(Span::styled(&self.model.name, dim));
@@ -1174,7 +1178,7 @@ fn apply_branch(
         Ok(new_session) => {
             let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
             state.show_system_message(&format!(
-                "Created branch: {} ({} messages)",
+                "Created branch: {} ({} messages)\nContinue from this point with a fresh context.",
                 new_session.id(),
                 msg_count
             ));
