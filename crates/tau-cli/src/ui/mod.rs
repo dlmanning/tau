@@ -14,11 +14,13 @@
 //! The header style is inspired by the HP 48GX calculator status area.
 
 mod constants;
+mod types;
 
-use std::time::Instant;
+pub use types::UiMessage;
+use types::{GitBranchState, PendingInteraction, rainbow_tau_style};
 
 use crossterm::event::{Event, EventStream, MouseEventKind};
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -39,14 +41,6 @@ use tau_tui::{
 use tokio::sync::mpsc;
 
 use crate::utils::format_tokens;
-
-/// Pending interaction request waiting for user input in the TUI.
-struct PendingInteraction {
-    question: String,
-    options: Vec<tau_agent::QuestionOption>,
-    response_tx: tokio::sync::oneshot::Sender<tau_agent::InteractionResponse>,
-    selector: SelectorState,
-}
 
 /// Per-agent progress tracking for richer subagent display.
 struct AgentProgress {
@@ -108,67 +102,6 @@ fn build_agent_tree(
     lines.join("\n")
 }
 
-/// Slow rainbow color shift for the τ glyph when agent is working.
-/// Smoothly interpolates through the spectrum over ~4 seconds.
-fn rainbow_tau_style() -> Style {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    // Full hue rotation cycle
-    let phase = (ms % constants::RAINBOW_CYCLE_MS) as f64 / constants::RAINBOW_CYCLE_MS as f64;
-    // HSV to RGB with S=1, V=1 — hue rotates through 0..360
-    let hue = phase * 360.0;
-    let c = 1.0_f64;
-    let x = 1.0 - ((hue / 60.0) % 2.0 - 1.0).abs();
-    let (r, g, b) = match hue as u32 {
-        0..60 => (c, x, 0.0),
-        60..120 => (x, c, 0.0),
-        120..180 => (0.0, c, x),
-        180..240 => (0.0, x, c),
-        240..300 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    Style::default()
-        .fg(Color::Rgb(
-            (r * 255.0) as u8,
-            (g * 255.0) as u8,
-            (b * 255.0) as u8,
-        ))
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Get the current git branch name, or None if not in a git repo.
-fn get_git_branch() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Messages sent from UI to agent handler
-#[derive(Debug)]
-pub enum UiMessage {
-    /// User submitted input
-    Submit(String),
-    /// User requested quit
-    Quit,
-    /// User requested clear
-    Clear,
-    /// User requested abort of current operation
-    Abort,
-    /// Slash command
-    Command(String),
-    /// Change model (index into available_models)
-    ChangeModel(usize),
-    /// Create branch from message index (None = empty branch)
-    Branch(Option<usize>),
-}
-
 /// TUI application state
 pub struct TuiState {
     /// Chat messages
@@ -185,12 +118,8 @@ pub struct TuiState {
     follow_bottom: bool,
     /// Whether agent is currently processing
     is_processing: bool,
-    /// Cached git branch name (refreshed periodically via background task)
-    git_branch: Option<String>,
-    /// When the git branch was last checked
-    git_branch_checked: Instant,
-    /// Background task for refreshing git branch
-    git_branch_task: Option<tokio::task::JoinHandle<Option<String>>>,
+    /// Git branch name with background refresh.
+    git_branch: GitBranchState,
     /// Current status message
     status: String,
     /// Theme
@@ -251,9 +180,7 @@ impl TuiState {
             scroll: 0,
             follow_bottom: true,
             is_processing: false,
-            git_branch: get_git_branch(),
-            git_branch_checked: Instant::now(),
-            git_branch_task: None,
+            git_branch: GitBranchState::new(),
             status: "Ready".to_string(),
             theme: Theme::dark(),
             total_input_tokens: 0,
@@ -1004,23 +931,10 @@ impl TuiState {
             })
             .unwrap_or_default();
 
-        // Collect result from a previously spawned git branch refresh.
-        // unwrap()s are safe: is_some_and guards the take(), is_finished() guarantees now_or_never() returns Some.
-        if self.git_branch_task.as_ref().is_some_and(|t| t.is_finished()) {
-            if let Ok(branch) = self.git_branch_task.take().unwrap().now_or_never().unwrap() {
-                self.git_branch = branch;
-            }
-        }
+        self.git_branch.poll();
+        self.git_branch.maybe_refresh();
 
-        // Spawn a background refresh if enough time has elapsed
-        if self.git_branch_checked.elapsed() > std::time::Duration::from_secs(constants::GIT_BRANCH_REFRESH_SECS)
-            && self.git_branch_task.is_none()
-        {
-            self.git_branch_checked = Instant::now();
-            self.git_branch_task = Some(tokio::task::spawn_blocking(get_git_branch));
-        }
-
-        let info_content = match &self.git_branch {
+        let info_content = match &self.git_branch.branch {
             Some(b) => format!("{{ {} · {} }}", cwd, b),
             None => format!("{{ {} }}", cwd),
         };
