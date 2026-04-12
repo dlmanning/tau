@@ -212,13 +212,9 @@ impl LspManager {
         server_for_extension(&self.configs, ext)
     }
 
-    /// Go to definition at the given position.
-    pub async fn go_to_definition(
-        &self,
-        path: &Path,
-        line: u32,
-        character: u32,
-    ) -> anyhow::Result<String> {
+    /// Prepare a client for the given file: ensure the server is running,
+    /// the file is opened, and return the client + file URI.
+    async fn prepare(&self, path: &Path) -> anyhow::Result<(Arc<LspClient>, Uri)> {
         let config = self.config_for_path(path).cloned();
         let client = self.ensure_server(path).await?;
         let lang_id = config
@@ -235,8 +231,18 @@ impl LspManager {
             &lang_id,
         )
         .await?;
-
         let uri = file_uri(path)?;
+        Ok((client, uri))
+    }
+
+    /// Go to definition at the given position.
+    pub async fn go_to_definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<String> {
+        let (client, uri) = self.prepare(path).await?;
         let result: Option<GotoDefinitionResponse> = client
             .request(
                 "textDocument/definition",
@@ -264,24 +270,7 @@ impl LspManager {
         line: u32,
         character: u32,
     ) -> anyhow::Result<String> {
-        let config = self.config_for_path(path).cloned();
-        let client = self.ensure_server(path).await?;
-        let lang_id = config
-            .as_ref()
-            .and_then(|c| {
-                let ext = path.extension()?.to_str()?;
-                c.language_id_for(ext).map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "plaintext".into());
-        self.ensure_file_open(
-            &client,
-            path,
-            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
-            &lang_id,
-        )
-        .await?;
-
-        let uri = file_uri(path)?;
+        let (client, uri) = self.prepare(path).await?;
         let result: Option<Vec<Location>> = client
             .request(
                 "textDocument/references",
@@ -312,24 +301,7 @@ impl LspManager {
         line: u32,
         character: u32,
     ) -> anyhow::Result<String> {
-        let config = self.config_for_path(path).cloned();
-        let client = self.ensure_server(path).await?;
-        let lang_id = config
-            .as_ref()
-            .and_then(|c| {
-                let ext = path.extension()?.to_str()?;
-                c.language_id_for(ext).map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "plaintext".into());
-        self.ensure_file_open(
-            &client,
-            path,
-            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
-            &lang_id,
-        )
-        .await?;
-
-        let uri = file_uri(path)?;
+        let (client, uri) = self.prepare(path).await?;
         let result: Option<Hover> = client
             .request(
                 "textDocument/hover",
@@ -351,24 +323,7 @@ impl LspManager {
 
     /// Get document symbols for a file.
     pub async fn document_symbol(&self, path: &Path) -> anyhow::Result<String> {
-        let config = self.config_for_path(path).cloned();
-        let client = self.ensure_server(path).await?;
-        let lang_id = config
-            .as_ref()
-            .and_then(|c| {
-                let ext = path.extension()?.to_str()?;
-                c.language_id_for(ext).map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "plaintext".into());
-        self.ensure_file_open(
-            &client,
-            path,
-            config.as_ref().map(|c| c.command.as_str()).unwrap_or(""),
-            &lang_id,
-        )
-        .await?;
-
-        let uri = file_uri(path)?;
+        let (client, uri) = self.prepare(path).await?;
         let result: Option<DocumentSymbolResponse> = client
             .request(
                 "textDocument/documentSymbol",
