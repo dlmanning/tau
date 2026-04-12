@@ -11,6 +11,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
+/// Maximum file size to search (10 MB) — skip larger files to avoid OOM
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Maximum matches to return by default
 const DEFAULT_LIMIT: usize = 50;
 /// Maximum length of a matching line before truncation
@@ -136,32 +139,35 @@ impl Tool for GrepTool {
 }
 
 fn collect_files(path: &Path, glob_pattern: Option<&str>) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-
     if path.is_file() {
-        files.push(path.to_path_buf());
-        return files;
+        return vec![path.to_path_buf()];
     }
 
-    let pattern = match glob_pattern {
-        Some(g) => path.join(g).to_string_lossy().to_string(),
-        None => path.join("**/*").to_string_lossy().to_string(),
-    };
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .hidden(true) // skip hidden files by default
+        .git_ignore(true) // respect .gitignore
+        .git_exclude(true) // respect .git/info/exclude
+        .git_global(true); // respect global gitignore
 
-    if let Ok(entries) = glob::glob(&pattern) {
-        for entry in entries.flatten() {
-            if entry.is_file() {
-                let path_str = entry.to_string_lossy();
-                if !path_str.contains("/.git/")
-                    && !path_str.contains("/node_modules/")
-                    && !path_str.contains("/target/")
-                {
-                    files.push(entry);
-                }
+    // Apply glob filter if provided — use overrides so path globs like
+    // "src/**/*.ts" work, not just filename patterns.
+    if let Some(g) = glob_pattern {
+        let mut overrides = ignore::overrides::OverrideBuilder::new(path);
+        // Whitelist only files matching the glob; everything else is excluded.
+        if overrides.add(g).is_ok() {
+            if let Ok(ov) = overrides.build() {
+                builder.overrides(ov);
             }
         }
     }
 
+    let mut files = Vec::new();
+    for entry in builder.build().flatten() {
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            files.push(entry.into_path());
+        }
+    }
     files
 }
 
@@ -175,6 +181,12 @@ fn search_file(
     regex: &regex::Regex,
     context_lines: usize,
 ) -> std::io::Result<Vec<String>> {
+    // Skip files that are too large to avoid OOM
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_FILE_SIZE {
+        return Ok(Vec::new());
+    }
+
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
