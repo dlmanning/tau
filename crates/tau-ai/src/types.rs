@@ -59,6 +59,46 @@ impl Provider {
             Provider::Custom => None,
         }
     }
+
+    /// Parse a provider from a case-insensitive string identifier.
+    pub fn from_id(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "anthropic" => Provider::Anthropic,
+            "openai" => Provider::OpenAI,
+            "google" => Provider::Google,
+            "groq" => Provider::Groq,
+            "cerebras" => Provider::Cerebras,
+            "xai" => Provider::XAI,
+            "openrouter" => Provider::OpenRouter,
+            "ollama" => Provider::Ollama,
+            _ => Provider::Custom,
+        }
+    }
+
+    /// Default API type for this provider.
+    pub fn default_api(&self) -> Api {
+        match self {
+            Provider::Anthropic => Api::AnthropicMessages,
+            Provider::OpenAI => Api::OpenAIResponses,
+            Provider::Google => Api::GoogleGenerativeAI,
+            _ => Api::OpenAICompletions,
+        }
+    }
+
+    /// Default base URL for this provider's API.
+    pub fn default_base_url(&self) -> &'static str {
+        match self {
+            Provider::Anthropic => "https://api.anthropic.com",
+            Provider::OpenAI => "https://api.openai.com/v1",
+            Provider::Google => "https://generativelanguage.googleapis.com/v1beta",
+            Provider::Groq => "https://api.groq.com/openai/v1",
+            Provider::Cerebras => "https://api.cerebras.ai/v1",
+            Provider::XAI => "https://api.x.ai/v1",
+            Provider::OpenRouter => "https://openrouter.ai/api/v1",
+            Provider::Ollama => "http://localhost:11434/v1",
+            Provider::Custom => "",
+        }
+    }
 }
 
 /// Cost information for a model (per million tokens)

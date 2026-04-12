@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tau_agent::{Agent, AgentConfig, AgentEvent};
-use tau_ai::{Api, CostInfo, InputType, Model, Provider, ReasoningLevel};
+use tau_ai::{CostInfo, InputType, Model, Provider, ReasoningLevel};
 
 /// tau - AI-powered coding agent
 #[derive(Parser, Debug)]
@@ -87,67 +87,20 @@ fn parse_reasoning_level(s: &str) -> ReasoningLevel {
     }
 }
 
-fn parse_provider(s: &str) -> Provider {
-    match s.to_lowercase().as_str() {
-        "anthropic" => Provider::Anthropic,
-        "openai" => Provider::OpenAI,
-        "google" => Provider::Google,
-        "groq" => Provider::Groq,
-        "cerebras" => Provider::Cerebras,
-        "xai" => Provider::XAI,
-        "openrouter" => Provider::OpenRouter,
-        "ollama" => Provider::Ollama,
-        _ => Provider::Custom,
-    }
-}
-
 fn get_model(provider: &str, model_id: &str) -> Model {
     if let Some(model) = tau_ai::models::get_model_by_id(model_id) {
         return model;
     }
 
     // Fallback: construct a default model for unknown/custom model IDs
-    let provider_enum = parse_provider(provider);
-
-    let (api, base_url) = match provider {
-        "anthropic" => (
-            Api::AnthropicMessages,
-            "https://api.anthropic.com".to_string(),
-        ),
-        "openai" => (
-            Api::OpenAIResponses,
-            "https://api.openai.com/v1".to_string(),
-        ),
-        "google" => (
-            Api::GoogleGenerativeAI,
-            "https://generativelanguage.googleapis.com/v1beta".to_string(),
-        ),
-        "groq" => (
-            Api::OpenAICompletions,
-            "https://api.groq.com/openai/v1".to_string(),
-        ),
-        "cerebras" => (
-            Api::OpenAICompletions,
-            "https://api.cerebras.ai/v1".to_string(),
-        ),
-        "xai" => (Api::OpenAICompletions, "https://api.x.ai/v1".to_string()),
-        "openrouter" => (
-            Api::OpenAICompletions,
-            "https://openrouter.ai/api/v1".to_string(),
-        ),
-        "ollama" => (
-            Api::OpenAICompletions,
-            "http://localhost:11434/v1".to_string(),
-        ),
-        _ => (Api::OpenAICompletions, String::new()),
-    };
+    let provider_enum = Provider::from_id(provider);
 
     Model {
         id: model_id.to_string(),
         name: model_id.to_string(),
-        api,
+        api: provider_enum.default_api(),
         provider: provider_enum,
-        base_url,
+        base_url: provider_enum.default_base_url().to_string(),
         reasoning: false,
         input_types: vec![InputType::Text],
         cost: CostInfo::default(),
