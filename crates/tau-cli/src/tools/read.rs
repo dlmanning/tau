@@ -40,6 +40,11 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn activity_description(&self, arguments: &serde_json::Value) -> String {
+        let name = super::short_filename(arguments);
+        format!("Reading {}", name)
+    }
+
     fn description(&self) -> &str {
         "Read the contents of a file. Output uses cat -n format with line numbers. For large files, use offset and limit parameters."
     }

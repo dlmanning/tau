@@ -886,6 +886,7 @@ mod tests {
                 tool_call_id: "c1".into(),
                 tool_name: "bash".into(),
                 arguments: serde_json::json!({}),
+                activity: "Running bash".into(),
             })
             .unwrap();
         child_tx

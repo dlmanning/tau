@@ -52,6 +52,11 @@ impl Tool for WriteTool {
         "write"
     }
 
+    fn activity_description(&self, arguments: &serde_json::Value) -> String {
+        let name = super::short_filename(arguments);
+        format!("Writing {}", name)
+    }
+
     fn description(&self) -> &str {
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
     }

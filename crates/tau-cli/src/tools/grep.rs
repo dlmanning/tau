@@ -56,6 +56,14 @@ impl Tool for GrepTool {
         "grep"
     }
 
+    fn activity_description(&self, arguments: &serde_json::Value) -> String {
+        let pattern = arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("...");
+        format!("Searching for \"{}\"", pattern)
+    }
+
     fn description(&self) -> &str {
         "Search for a pattern in files. Returns matching lines with file paths and line numbers."
     }

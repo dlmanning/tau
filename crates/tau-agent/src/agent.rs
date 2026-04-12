@@ -404,6 +404,7 @@ impl Agent {
                     tool_call_id: skip_id.clone(),
                     tool_name: skip_name.clone(),
                     arguments: serde_json::Value::Null,
+                    activity: "Skipped".to_string(),
                 },
             );
             let skip_result = ToolResult::error("Skipped due to steering message");

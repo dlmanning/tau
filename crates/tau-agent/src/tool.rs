@@ -280,6 +280,13 @@ pub trait Tool: Send + Sync {
         Concurrency::Parallel
     }
 
+    /// Short, human-readable description of what this invocation is doing,
+    /// shown in the TUI while the tool executes (e.g. "Reading main.rs").
+    /// Default: "Running {name}".
+    fn activity_description(&self, _arguments: &serde_json::Value) -> String {
+        format!("Running {}", self.name())
+    }
+
     /// Execute the tool with the given arguments and execution context.
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult;
 }

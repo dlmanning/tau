@@ -41,6 +41,10 @@ impl Tool for LspTool {
         "lsp"
     }
 
+    fn activity_description(&self, _arguments: &serde_json::Value) -> String {
+        "Querying language server".to_string()
+    }
+
     fn description(&self) -> &str {
         "Query language servers for code intelligence. Supports go-to-definition, \
          find-references, hover (type info), and document symbols. Requires a language \

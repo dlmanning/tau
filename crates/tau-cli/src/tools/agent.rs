@@ -59,6 +59,10 @@ impl Tool for AgentTool {
         "agent"
     }
 
+    fn activity_description(&self, _arguments: &serde_json::Value) -> String {
+        "Spawning agent".to_string()
+    }
+
     fn description(&self) -> &str {
         "Spawn a subagent to handle a task independently, or send a message to a \
          previously spawned agent. The subagent makes its own API calls and has its \

@@ -41,6 +41,11 @@ impl Tool for EditTool {
         "edit"
     }
 
+    fn activity_description(&self, arguments: &serde_json::Value) -> String {
+        let name = super::short_filename(arguments);
+        format!("Editing {}", name)
+    }
+
     fn description(&self) -> &str {
         "Edit a file by replacing exact text. The old_text must match exactly (including whitespace). Use this for precise, surgical edits."
     }

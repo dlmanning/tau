@@ -27,6 +27,8 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         arguments: serde_json::Value,
+        /// Human-readable activity description (e.g. "Reading main.rs")
+        activity: String,
     },
 
     /// Tool execution progress update (emitted by tools during execution)

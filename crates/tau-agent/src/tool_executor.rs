@@ -22,12 +22,17 @@ pub(crate) async fn run_single_tool(
     event_tx: broadcast::Sender<AgentEvent>,
     ctx: ExecutionContext,
 ) -> ToolResult {
+    let activity = tool
+        .as_ref()
+        .map(|t| t.activity_description(&args))
+        .unwrap_or_else(|| format!("Running {}", name));
     send_event(
         &event_tx,
         AgentEvent::ToolExecutionStart {
             tool_call_id: id.clone(),
             tool_name: name.clone(),
             arguments: args.clone(),
+            activity,
         },
     );
 

@@ -414,6 +414,7 @@ impl Transport for ProviderTransport {
                             tool_call_id: id.clone(),
                             tool_name: name.clone(),
                             arguments: input.clone(),
+                            activity: format!("Running {}", name),
                         };
                     }
                     tau_ai::stream::MessageEvent::ServerToolEnd { tool_use_id, api_type, content, .. } => {

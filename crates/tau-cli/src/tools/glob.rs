@@ -39,6 +39,14 @@ impl Tool for GlobTool {
         "glob"
     }
 
+    fn activity_description(&self, arguments: &serde_json::Value) -> String {
+        let pattern = arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("...");
+        format!("Finding {}", pattern)
+    }
+
     fn description(&self) -> &str {
         "Find files matching a glob pattern. Supports patterns like '**/*.rs', 'src/*.ts', etc."
     }

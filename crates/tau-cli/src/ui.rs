@@ -106,50 +106,6 @@ fn build_agent_tree(
     lines.join("\n")
 }
 
-/// Build a human-readable description of what a tool is doing.
-fn describe_tool_activity(tool_name: &str, arguments: &serde_json::Value) -> String {
-    let short_path = || {
-        arguments
-            .get("path")
-            .or_else(|| arguments.get("file_path"))
-            .and_then(|v| v.as_str())
-            .and_then(|p| p.rsplit('/').next())
-            .unwrap_or("file")
-    };
-
-    match tool_name {
-        "read" => format!("Reading {}", short_path()),
-        "write" => format!("Writing {}", short_path()),
-        "edit" => format!("Editing {}", short_path()),
-        "bash" => {
-            let cmd = arguments
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("command");
-            let short: String = cmd.chars().take(30).collect();
-            format!("Running {}", short)
-        }
-        "grep" => {
-            let pattern = arguments
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("...");
-            format!("Searching for \"{}\"", pattern)
-        }
-        "glob" => {
-            let pattern = arguments
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("...");
-            format!("Finding {}", pattern)
-        }
-        "list" => "Listing directory".to_string(),
-        "lsp" => "Querying language server".to_string(),
-        "agent" => "Spawning agent".to_string(),
-        other => format!("Running {}", other),
-    }
-}
-
 /// Slow rainbow color shift for the τ glyph when agent is working.
 /// Smoothly interpolates through the spectrum over ~4 seconds.
 fn rainbow_tau_style() -> Style {
@@ -354,9 +310,9 @@ impl TuiState {
             AgentEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
-                arguments,
+                activity,
+                ..
             } => {
-                let activity = describe_tool_activity(&tool_name, &arguments);
                 self.messages.push(ChatMessage {
                     role: format!("tool:{}", tool_name),
                     content: activity,
@@ -464,14 +420,12 @@ impl TuiState {
                         self.update_agent_tree();
                     }
                     AgentEvent::ToolExecutionStart {
-                        ref tool_name,
-                        ref arguments,
+                        ref activity,
                         ..
                     } => {
                         if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
                             progress.tool_count += 1;
-                            progress.activity =
-                                describe_tool_activity(tool_name, arguments);
+                            progress.activity = activity.clone();
                         }
                         self.update_agent_tree();
                     }

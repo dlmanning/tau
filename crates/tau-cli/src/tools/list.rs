@@ -44,6 +44,10 @@ impl Tool for ListTool {
         "list"
     }
 
+    fn activity_description(&self, _arguments: &serde_json::Value) -> String {
+        "Listing directory".to_string()
+    }
+
     fn description(&self) -> &str {
         "List contents of a directory with file metadata."
     }

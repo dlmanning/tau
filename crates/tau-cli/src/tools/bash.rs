@@ -130,6 +130,15 @@ impl Tool for BashTool {
         "bash"
     }
 
+    fn activity_description(&self, arguments: &serde_json::Value) -> String {
+        let cmd = arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("command");
+        let short: String = cmd.chars().take(30).collect();
+        format!("Running {}", short)
+    }
+
     fn description(&self) -> &str {
         "Execute a bash command in the current working directory. Returns stdout and stderr."
     }

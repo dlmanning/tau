@@ -23,6 +23,16 @@ macro_rules! cached_schema {
     }};
 }
 
+/// Extract a short filename from a tool's `path` or `file_path` argument.
+pub(crate) fn short_filename(arguments: &serde_json::Value) -> &str {
+    arguments
+        .get("path")
+        .or_else(|| arguments.get("file_path"))
+        .and_then(|v| v.as_str())
+        .and_then(|p| p.rsplit('/').next())
+        .unwrap_or("file")
+}
+
 pub mod agent;
 mod ask;
 mod bash;
