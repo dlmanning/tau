@@ -120,7 +120,16 @@ impl Config {
         fs::create_dir_all(dir)?;
 
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fs::write(path, content)
+        fs::write(&path, content)?;
+
+        // Restrict permissions since the file may contain API keys
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+
+        Ok(())
     }
 
     /// Create a default config file if it doesn't exist
@@ -157,6 +166,9 @@ impl Config {
         };
 
         if from_config.is_some() {
+            tracing::warn!(
+                "Using API key from config file. Consider using environment variables instead for better security."
+            );
             return from_config;
         }
 
