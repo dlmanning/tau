@@ -176,6 +176,16 @@ fn truncate_line(line: &str) -> String {
     crate::utils::truncate_chars(line, MAX_LINE_LENGTH)
 }
 
+/// Check if a file appears to be binary by reading the first 8KB and looking
+/// for null bytes, which don't appear in text files.
+fn is_binary(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut buf = [0u8; 8192];
+    let mut file = File::open(path)?;
+    let n = file.read(&mut buf)?;
+    Ok(buf[..n].contains(&0))
+}
+
 fn search_file(
     path: &PathBuf,
     regex: &regex::Regex,
@@ -184,6 +194,11 @@ fn search_file(
     // Skip files that are too large to avoid OOM
     let metadata = std::fs::metadata(path)?;
     if metadata.len() > MAX_FILE_SIZE {
+        return Ok(Vec::new());
+    }
+
+    // Skip binary files
+    if is_binary(path)? {
         return Ok(Vec::new());
     }
 
