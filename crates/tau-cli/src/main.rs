@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         return show_auth_status();
     }
 
-    let cfg = config::Config::load();
+    let cfg = config::Config::load()?;
 
     if let Some(ref dir) = args.working_dir {
         std::env::set_current_dir(dir)?;

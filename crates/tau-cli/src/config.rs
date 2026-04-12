@@ -2,6 +2,7 @@
 
 use std::{fs, path::PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for tau
@@ -82,33 +83,17 @@ impl Config {
     }
 
     /// Load config from file
-    pub fn load() -> Self {
+    pub fn load() -> anyhow::Result<Self> {
         let path = Self::config_path();
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
 
-        match fs::read_to_string(&path) {
-            Ok(content) => match toml::from_str(&content) {
-                Ok(config) => config,
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to parse config file {}: {}",
-                        path.display(),
-                        e
-                    );
-                    Self::default()
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to read config file {}: {}",
-                    path.display(),
-                    e
-                );
-                Self::default()
-            }
-        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file {}", path.display()))?;
+
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file {}", path.display()))
     }
 
     /// Save config to file
