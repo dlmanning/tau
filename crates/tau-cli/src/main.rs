@@ -483,6 +483,7 @@ async fn run_command(
                         "\n[Tokens: {} in, {} out | Cost: ${:.4}]",
                         total_usage.input, total_usage.output, cost.total
                     );
+                    break;
                 }
                 _ => {}
             }
@@ -493,9 +494,11 @@ async fn run_command(
 
     agent.prompt(command).await?;
 
-    // Wait a bit for final events
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    handle.abort();
+    // Wait for event handler to finish (it breaks on AgentEnd)
+    match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+        Ok(_) => {}
+        Err(_) => tracing::debug!("Event handler did not finish in time"),
+    }
     interaction_handle.abort();
 
     Ok(())
@@ -756,6 +759,7 @@ async fn run_interactive(
                                 total_usage.input, total_usage.output, cost.total
                             );
                         }
+                        break;
                     }
                     AgentEvent::CompactionStart { reason } => {
                         println!(
@@ -795,8 +799,10 @@ async fn run_interactive(
             let _ = s.append_usage(&agent.state().total_usage);
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        handle.abort();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+            Ok(_) => {}
+            Err(_) => tracing::debug!("Event handler did not finish in time"),
+        }
 
         println!();
     }
