@@ -1,8 +1,9 @@
 //! WebFetch tool - fetches and converts web content
 
 use async_trait::async_trait;
-use serde_json::json;
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 /// Maximum content size to return (characters)
 const MAX_CONTENT_CHARS: usize = 100_000;
@@ -10,6 +11,14 @@ const MAX_CONTENT_CHARS: usize = 100_000;
 const FETCH_TIMEOUT_SECS: u64 = 60;
 /// Maximum HTTP response body size (10 MB)
 const MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024;
+
+#[derive(Deserialize, JsonSchema)]
+struct WebFetchArgs {
+    /// The URL to fetch content from
+    url: String,
+    /// The prompt describing what information to extract from the page
+    prompt: Option<String>,
+}
 
 /// Tool for fetching web content and converting HTML to markdown
 pub struct WebFetchTool;
@@ -55,36 +64,17 @@ impl Tool for WebFetchTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The URL to fetch content from"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The prompt describing what information to extract from the page"
-                }
-            },
-            "required": ["url", "prompt"]
-        })
-    }
-
-    fn concurrency(&self) -> Concurrency {
-        Concurrency::Parallel
+        cached_schema!(WebFetchArgs)
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
-        let url_str = match arguments.get("url").and_then(|v| v.as_str()) {
-            Some(u) => u,
-            None => return ToolResult::error("Missing 'url' argument"),
+        let args: WebFetchArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let prompt = arguments
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let url_str = &args.url;
+        let prompt = args.prompt.as_deref().unwrap_or("");
 
         // Validate and normalize URL
         let url = match validate_url(url_str) {

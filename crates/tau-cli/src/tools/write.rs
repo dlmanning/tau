@@ -1,11 +1,18 @@
 //! File writing tool
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
-use serde_json::json;
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::fs;
+
+#[derive(Deserialize, JsonSchema)]
+struct WriteArgs {
+    /// Path to the file to write (relative or absolute)
+    path: String,
+    /// Content to write to the file
+    content: String,
+}
 
 /// Tool for writing file contents
 pub struct WriteTool;
@@ -32,21 +39,12 @@ impl Tool for WriteTool {
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
     }
 
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
-            },
-            "required": ["path", "content"]
-        })
+        cached_schema!(WriteArgs)
     }
 
     async fn execute(
@@ -54,35 +52,21 @@ impl Tool for WriteTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return ToolResult::error("Missing 'path' argument"),
+        let args: WriteArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let content = match arguments.get("content").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => return ToolResult::error("Missing 'content' argument"),
-        };
-
-        let path = if let Some(stripped) = path_str.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(stripped)
-            } else {
-                PathBuf::from(path_str)
-            }
-        } else if path_str == "~" {
+        if args.path == "~" {
             return ToolResult::error("Cannot write to home directory itself");
-        } else {
-            super::resolve_path(path_str, &ctx.cwd)
-        };
+        }
+        let path = ctx.resolve_path(&args.path);
 
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
-        // Enforce read-before-write: must read existing files before overwriting
-        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if let Err(e) = ctx.file_access.lock().require_read(&canonical) {
+        if let Err(e) = ctx.require_read(&path) {
             return ToolResult::error(e);
         }
 
@@ -94,11 +78,11 @@ impl Tool for WriteTool {
             }
         }
 
-        match fs::write(&path, content).await {
+        match fs::write(&path, &args.content).await {
             Ok(()) => ToolResult::text(format!(
                 "Successfully wrote {} bytes to {}",
-                content.len(),
-                path_str
+                args.content.len(),
+                args.path
             )),
             Err(e) => ToolResult::error(format!("Failed to write file: {}", e)),
         }

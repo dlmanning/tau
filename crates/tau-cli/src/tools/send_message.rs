@@ -3,9 +3,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tau_agent::agent_manager::{AgentManager, AgentStatus};
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+
+#[derive(Deserialize, JsonSchema)]
+struct SendMessageArgs {
+    /// Agent name (matched against description) or agent ID
+    to: String,
+    /// Message to send to the agent
+    message: String,
+}
 
 pub struct SendMessageTool {
     manager: Arc<AgentManager>,
@@ -30,37 +39,18 @@ impl Tool for SendMessageTool {
          and this tool blocks until it finishes."
     }
 
-    fn concurrency(&self) -> Concurrency {
-        Concurrency::Parallel
-    }
-
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "to": {
-                    "type": "string",
-                    "description": "Agent name (matched against description) or agent ID"
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Message to send to the agent"
-                }
-            },
-            "required": ["to", "message"]
-        })
+        cached_schema!(SendMessageArgs)
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
-        let to = match arguments.get("to").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => return ToolResult::error("Missing 'to'"),
+        let args: SendMessageArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let message = match arguments.get("message").and_then(|v| v.as_str()) {
-            Some(m) => m,
-            None => return ToolResult::error("Missing 'message'"),
-        };
+        let to = &args.to;
+        let message = &args.message;
 
         let (agent_id, description, status) = match self.manager.find_agent(to).await {
             Some(found) => found,

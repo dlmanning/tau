@@ -1,14 +1,23 @@
 //! File reading tool
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio::fs;
 
 const MAX_LINES: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
+
+#[derive(Deserialize, JsonSchema)]
+struct ReadArgs {
+    /// Path to the file to read (relative or absolute)
+    path: String,
+    /// Line number to start reading from (1-indexed)
+    offset: Option<u64>,
+    /// Maximum number of lines to read
+    limit: Option<u64>,
+}
 
 /// Tool for reading file contents
 pub struct ReadTool;
@@ -36,24 +45,7 @@ impl Tool for ReadTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to read (relative or absolute)"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start reading from (1-indexed)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read"
-                }
-            },
-            "required": ["path"]
-        })
+        cached_schema!(ReadArgs)
     }
 
     async fn execute(
@@ -61,22 +53,12 @@ impl Tool for ReadTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return ToolResult::error("Missing 'path' argument"),
+        let args: ReadArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let path = if let Some(stripped) = path_str.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(stripped)
-            } else {
-                PathBuf::from(path_str)
-            }
-        } else if path_str == "~" {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            super::resolve_path(path_str, &ctx.cwd)
-        };
+        let path = ctx.resolve_path(&args.path);
 
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
@@ -87,22 +69,18 @@ impl Tool for ReadTool {
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
 
-        // Track this file as read for the read-before-write policy
-        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        ctx.file_access.lock().mark_read(canonical);
+        ctx.mark_read(&path);
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        let offset = arguments
-            .get("offset")
-            .and_then(|v| v.as_u64())
+        let offset = args
+            .offset
             .map(|o| (o as usize).saturating_sub(1)) // 1-indexed to 0-indexed
             .unwrap_or(0);
 
-        let limit = arguments
-            .get("limit")
-            .and_then(|v| v.as_u64())
+        let limit = args
+            .limit
             .map(|l| l as usize)
             .unwrap_or(MAX_LINES);
 

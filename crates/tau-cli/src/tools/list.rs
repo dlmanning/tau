@@ -6,9 +6,22 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Deserialize, JsonSchema)]
+struct ListArgs {
+    /// Directory path to list (defaults to current directory)
+    path: Option<String>,
+    /// Whether to list recursively (default: false)
+    recursive: Option<bool>,
+    /// Whether to show hidden files (default: false)
+    show_hidden: Option<bool>,
+    /// Maximum number of entries to return (default: 100)
+    limit: Option<u64>,
+}
 
 /// Tool for listing directory contents
 pub struct ListTool;
@@ -36,28 +49,7 @@ impl Tool for ListTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Directory path to list (defaults to current directory)"
-                },
-                "recursive": {
-                    "type": "boolean",
-                    "description": "Whether to list recursively (default: false)"
-                },
-                "show_hidden": {
-                    "type": "boolean",
-                    "description": "Whether to show hidden files (default: false)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of entries to return (default: 100)"
-                }
-            },
-            "required": []
-        })
+        cached_schema!(ListArgs)
     }
 
     async fn execute(
@@ -65,26 +57,20 @@ impl Tool for ListTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let path = arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| super::resolve_path(p, &ctx.cwd))
+        let args: ListArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        };
+
+        let path = args
+            .path
+            .as_deref()
+            .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.cwd.clone());
 
-        let recursive = arguments
-            .get("recursive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let show_hidden = arguments
-            .get("show_hidden")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let limit = arguments
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(100) as usize;
+        let recursive = args.recursive.unwrap_or(false);
+        let show_hidden = args.show_hidden.unwrap_or(false);
+        let limit = args.limit.unwrap_or(100) as usize;
 
         if !path.exists() {
             return ToolResult::error(format!("Path does not exist: {}", path.display()));

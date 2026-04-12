@@ -1,9 +1,29 @@
 //! AskUserQuestion tool — ask the user a multiple-choice question.
 
 use async_trait::async_trait;
-use serde_json::json;
-use tau_agent::interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tau_agent::interaction::{
+    InteractionKind, InteractionRequest, InteractionResponse, QuestionOption,
+};
 use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+
+#[derive(Deserialize, JsonSchema)]
+struct AskOption {
+    /// Short label for this option
+    label: String,
+    /// Longer explanation of what this option means
+    description: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AskArgs {
+    /// The question to ask the user
+    question: String,
+    /// Options for the user to choose from (2-5 items)
+    #[schemars(extend("minItems" = 2, "maxItems" = 5))]
+    options: Vec<AskOption>,
+}
 
 pub struct AskTool;
 
@@ -30,62 +50,27 @@ impl Tool for AskTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question to ask the user"
-                },
-                "options": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {
-                                "type": "string",
-                                "description": "Short label for this option"
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Longer explanation of what this option means"
-                            }
-                        },
-                        "required": ["label", "description"]
-                    },
-                    "minItems": 2,
-                    "maxItems": 5,
-                    "description": "Options for the user to choose from"
-                }
-            },
-            "required": ["question", "options"]
-        })
+        cached_schema!(AskArgs)
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
-        let question = match arguments.get("question").and_then(|v| v.as_str()) {
-            Some(q) => q.to_string(),
-            None => return ToolResult::error("Missing 'question'"),
+        let args: AskArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let options_val = match arguments.get("options").and_then(|v| v.as_array()) {
-            Some(arr) => arr,
-            None => return ToolResult::error("Missing 'options' array"),
-        };
-
-        let mut options = Vec::new();
-        for opt in options_val {
-            let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("");
-            let description = opt.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            options.push(QuestionOption {
-                label: label.to_string(),
-                description: description.to_string(),
-            });
-        }
-
-        if options.len() < 2 {
+        if args.options.len() < 2 {
             return ToolResult::error("At least 2 options are required");
         }
+
+        let options: Vec<QuestionOption> = args
+            .options
+            .into_iter()
+            .map(|o| QuestionOption {
+                label: o.label,
+                description: o.description,
+            })
+            .collect();
 
         let interaction_tx = match ctx.interaction {
             Some(ref tx) => tx.clone(),
@@ -95,7 +80,10 @@ impl Tool for AskTool {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         let request = InteractionRequest {
-            kind: InteractionKind::AskQuestion { question, options },
+            kind: InteractionKind::AskQuestion {
+                question: args.question,
+                options,
+            },
             response_tx,
         };
 

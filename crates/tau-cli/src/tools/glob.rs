@@ -4,8 +4,19 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use glob::glob;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+
+#[derive(Deserialize, JsonSchema)]
+struct GlobArgs {
+    /// The glob pattern to match (e.g., '**/*.rs', 'src/**/*.ts')
+    pattern: String,
+    /// Working directory for the pattern (optional, defaults to current directory)
+    cwd: Option<String>,
+    /// Maximum number of results to return (optional, defaults to 100)
+    limit: Option<u64>,
+}
 
 /// Tool for finding files matching a glob pattern
 pub struct GlobTool;
@@ -33,24 +44,7 @@ impl Tool for GlobTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The glob pattern to match (e.g., '**/*.rs', 'src/**/*.ts')"
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the pattern (optional, defaults to current directory)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (optional, defaults to 100)"
-                }
-            },
-            "required": ["pattern"]
-        })
+        cached_schema!(GlobArgs)
     }
 
     async fn execute(
@@ -58,26 +52,22 @@ impl Tool for GlobTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let pattern = match arguments.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return ToolResult::error("Missing 'pattern' argument"),
+        let args: GlobArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let cwd = arguments
-            .get("cwd")
-            .and_then(|v| v.as_str())
+        let cwd = args
+            .cwd
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
         let cwd = Some(cwd);
 
-        let limit = arguments
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(100) as usize;
+        let limit = args.limit.unwrap_or(100) as usize;
 
         let full_pattern = match &cwd {
-            Some(dir) => dir.join(pattern).to_string_lossy().to_string(),
-            None => pattern.to_string(),
+            Some(dir) => dir.join(&args.pattern).to_string_lossy().to_string(),
+            None => args.pattern.clone(),
         };
 
         let entries = match glob(&full_pattern) {

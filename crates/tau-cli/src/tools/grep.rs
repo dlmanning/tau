@@ -7,13 +7,30 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 /// Maximum matches to return by default
 const DEFAULT_LIMIT: usize = 50;
 /// Maximum length of a matching line before truncation
 const MAX_LINE_LENGTH: usize = 500;
+
+#[derive(Deserialize, JsonSchema)]
+struct GrepArgs {
+    /// The regex pattern to search for
+    pattern: String,
+    /// File or directory to search in (defaults to current directory)
+    path: Option<String>,
+    /// Glob pattern to filter files (e.g., '*.rs', '**/*.ts')
+    glob: Option<String>,
+    /// Whether to ignore case (default: false)
+    case_insensitive: Option<bool>,
+    /// Maximum number of matches to return (default: 50)
+    limit: Option<u64>,
+    /// Number of context lines before and after match (default: 0)
+    context: Option<u64>,
+}
 
 /// Tool for searching file contents with regex
 pub struct GrepTool;
@@ -41,36 +58,7 @@ impl Tool for GrepTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The regex pattern to search for"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File or directory to search in (defaults to current directory)"
-                },
-                "glob": {
-                    "type": "string",
-                    "description": "Glob pattern to filter files (e.g., '*.rs', '**/*.ts')"
-                },
-                "case_insensitive": {
-                    "type": "boolean",
-                    "description": "Whether to ignore case (default: false)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of matches to return (default: 50)"
-                },
-                "context": {
-                    "type": "integer",
-                    "description": "Number of context lines before and after match (default: 0)"
-                }
-            },
-            "required": ["pattern"]
-        })
+        cached_schema!(GrepArgs)
     }
 
     async fn execute(
@@ -78,20 +66,17 @@ impl Tool for GrepTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let pattern_str = match arguments.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return ToolResult::error("Missing 'pattern' argument"),
+        let args: GrepArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let case_insensitive = arguments
-            .get("case_insensitive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let case_insensitive = args.case_insensitive.unwrap_or(false);
 
         let regex_pattern = if case_insensitive {
-            format!("(?i){}", pattern_str)
+            format!("(?i){}", args.pattern)
         } else {
-            pattern_str.to_string()
+            args.pattern.clone()
         };
 
         let regex = match regex::Regex::new(&regex_pattern) {
@@ -99,23 +84,17 @@ impl Tool for GrepTool {
             Err(e) => return ToolResult::error(format!("Invalid regex pattern: {}", e)),
         };
 
-        let path = arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| super::resolve_path(p, &ctx.cwd))
+        let path = args
+            .path
+            .as_deref()
+            .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.cwd.clone());
 
-        let glob_pattern = arguments.get("glob").and_then(|v| v.as_str());
+        let glob_pattern = args.glob.as_deref();
 
-        let limit = arguments
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_LIMIT as u64) as usize;
+        let limit = args.limit.unwrap_or(DEFAULT_LIMIT as u64) as usize;
 
-        let context_lines = arguments
-            .get("context")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let context_lines = args.context.unwrap_or(0) as usize;
 
         let files = collect_files(&path, glob_pattern);
 

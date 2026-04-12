@@ -3,8 +3,9 @@
 use std::{collections::VecDeque, process::Stdio};
 
 use async_trait::async_trait;
-use serde_json::json;
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -14,6 +15,14 @@ use tokio::{
 const MAX_OUTPUT_SIZE: usize = 30_000; // 30KB
 /// Maximum number of lines before truncation
 const MAX_OUTPUT_LINES: usize = 500;
+
+#[derive(Deserialize, JsonSchema)]
+struct BashArgs {
+    /// The bash command to execute
+    command: String,
+    /// Timeout in seconds (optional)
+    timeout: Option<u64>,
+}
 
 /// Tool for executing bash commands
 pub struct BashTool;
@@ -125,21 +134,12 @@ impl Tool for BashTool {
         "Execute a bash command in the current working directory. Returns stdout and stderr."
     }
 
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The bash command to execute"
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (optional)"
-                }
-            },
-            "required": ["command"]
-        })
+        cached_schema!(BashArgs)
     }
 
     async fn execute(
@@ -147,15 +147,13 @@ impl Tool for BashTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let command = match arguments.get("command").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => return ToolResult::error("Missing 'command' argument"),
+        let args: BashArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let timeout_secs = arguments
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(120);
+        let command = &args.command;
+        let timeout_secs = args.timeout.unwrap_or(120);
 
         let (shell, shell_arg) = if cfg!(target_os = "windows") {
             ("cmd", "/C")

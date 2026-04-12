@@ -3,10 +3,33 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tau_agent::handle::AgentHandle;
 use tau_agent::agent_manager::{AgentManager, AgentType, SpawnRequest};
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+
+#[derive(Deserialize, JsonSchema)]
+struct AgentArgs {
+    /// Short (3-5 word) description of the task
+    description: String,
+    /// Detailed task instructions for the subagent
+    prompt: String,
+    /// Resume a previous agent by ID. Use with prompt to send a follow-up message.
+    to: Option<String>,
+    /// Type of agent. Explore/Plan are read-only.
+    #[schemars(extend("enum" = ["general-purpose", "Explore", "Plan"]))]
+    subagent_type: Option<String>,
+    /// Override model for this subagent
+    model: Option<String>,
+    /// Working directory for the subagent
+    cwd: Option<String>,
+    /// Run in an isolated git worktree
+    #[schemars(extend("enum" = ["worktree"]))]
+    isolation: Option<String>,
+    /// Run in background and return immediately
+    run_in_background: Option<bool>,
+}
 
 /// Tool for spawning independent subagents.
 pub struct AgentTool {
@@ -43,105 +66,43 @@ impl Tool for AgentTool {
          changes in a git worktree."
     }
 
-    fn concurrency(&self) -> Concurrency {
-        Concurrency::Parallel
-    }
-
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "Short (3-5 word) description of the task"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Detailed task instructions for the subagent"
-                },
-                "to": {
-                    "type": "string",
-                    "description": "Resume a previous agent by ID. Use with prompt to send a follow-up message."
-                },
-                "subagent_type": {
-                    "type": "string",
-                    "enum": ["general-purpose", "Explore", "Plan"],
-                    "description": "Type of agent. Explore/Plan are read-only."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Override model for this subagent"
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the subagent"
-                },
-                "isolation": {
-                    "type": "string",
-                    "enum": ["worktree"],
-                    "description": "Run in an isolated git worktree"
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": "Run in background and return immediately"
-                }
-            },
-            "required": ["description", "prompt"]
-        })
+        cached_schema!(AgentArgs)
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
-        let prompt = match arguments.get("prompt").and_then(|v| v.as_str()) {
-            Some(p) => p.to_string(),
-            None => return ToolResult::error("Missing 'prompt'"),
+        let args: AgentArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        if let Some(agent_id) = arguments.get("to").and_then(|v| v.as_str()) {
-            return match self.manager.send(agent_id, &prompt, ctx.cancel).await {
+        if let Some(ref agent_id) = args.to {
+            return match self.manager.send(agent_id, &args.prompt, ctx.cancel).await {
                 Ok(result) => ToolResult::text(format_result(&result)),
                 Err(e) => ToolResult::error(format!("Resume failed: {}", e)),
             };
         }
 
-        let description = arguments
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("subagent")
-            .to_string();
-
-        let agent_type = arguments
-            .get("subagent_type")
-            .and_then(|v| v.as_str())
+        let agent_type = args
+            .subagent_type
+            .as_deref()
             .and_then(AgentType::parse)
             .unwrap_or(AgentType::GeneralPurpose);
 
-        let model = arguments
-            .get("model")
-            .and_then(|v| v.as_str())
+        let model = args
+            .model
+            .as_deref()
             .and_then(tau_ai::models::get_model_by_id);
 
-        let cwd = arguments
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        let isolation = arguments
-            .get("isolation")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        let run_in_background = arguments
-            .get("run_in_background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let run_in_background = args.run_in_background.unwrap_or(false);
 
         let request = SpawnRequest {
             agent_type,
-            prompt,
-            description: description.clone(),
+            prompt: args.prompt,
+            description: args.description.clone(),
             model,
-            cwd,
-            isolation,
+            cwd: args.cwd,
+            isolation: args.isolation,
             depth: self.depth,
         };
 
@@ -153,7 +114,7 @@ impl Tool for AgentTool {
                     .await;
                 ToolResult::text(format!(
                     "Agent launched in background ({}): {}",
-                    agent_id, description
+                    agent_id, args.description
                 ))
             } else {
                 ToolResult::error("Cannot run background agent: no parent handle")

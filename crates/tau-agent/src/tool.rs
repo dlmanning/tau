@@ -72,8 +72,9 @@ impl FileAccessTracker {
 }
 
 /// Resolve a file path from tool arguments, handling `~/`, relative paths,
-/// and canonicalization.
-pub fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
+/// and canonicalization. Used by `FileAccessTracker::rebuild_from_messages`
+/// which operates on historical data without an `ExecutionContext`.
+fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
     let path_str = args.get("path").and_then(|v| v.as_str())?;
     let path = if let Some(rest) = path_str.strip_prefix("~/") {
         dirs::home_dir()
@@ -222,6 +223,39 @@ pub struct ExecutionContext {
     pub file_access: Arc<Mutex<FileAccessTracker>>,
 }
 
+impl ExecutionContext {
+    /// Resolve a path string against the working directory.
+    /// Handles `~/`, relative paths, and absolute passthrough.
+    pub fn resolve_path(&self, path_str: &str) -> PathBuf {
+        if let Some(rest) = path_str.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(path_str))
+        } else if path_str == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            let p = PathBuf::from(path_str);
+            if p.is_absolute() {
+                p
+            } else {
+                self.cwd.join(p)
+            }
+        }
+    }
+
+    /// Mark a path as read in the file access tracker.
+    pub fn mark_read(&self, path: &Path) {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.file_access.lock().mark_read(canonical);
+    }
+
+    /// Check read-before-write policy. Returns error if file exists but hasn't been read.
+    pub fn require_read(&self, path: &Path) -> Result<(), String> {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.file_access.lock().require_read(&canonical)
+    }
+}
+
 /// Trait for executable tools
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -240,8 +274,10 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> serde_json::Value;
 
     /// Whether this tool can run concurrently with other Parallel tools.
+    /// Defaults to `Parallel`. Override to `Sequential` for tools that
+    /// mutate files, require UI exclusivity, or have side effects.
     fn concurrency(&self) -> Concurrency {
-        Concurrency::Sequential
+        Concurrency::Parallel
     }
 
     /// Execute the tool with the given arguments and execution context.
@@ -404,5 +440,66 @@ mod tests {
         tracker.clear();
         // After clear, the path is forgotten
         assert!(tracker.read_files.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_path_absolute() {
+        let ctx = make_ctx("/work");
+        assert_eq!(ctx.resolve_path("/usr/bin/ls"), PathBuf::from("/usr/bin/ls"));
+    }
+
+    #[test]
+    fn test_resolve_path_relative() {
+        let ctx = make_ctx("/work");
+        assert_eq!(ctx.resolve_path("src/main.rs"), PathBuf::from("/work/src/main.rs"));
+    }
+
+    #[test]
+    fn test_resolve_path_tilde_prefix() {
+        let ctx = make_ctx("/work");
+        let resolved = ctx.resolve_path("~/Documents/file.txt");
+        let home = dirs::home_dir().expect("home dir exists in test");
+        assert_eq!(resolved, home.join("Documents/file.txt"));
+    }
+
+    #[test]
+    fn test_resolve_path_tilde_alone() {
+        let ctx = make_ctx("/work");
+        let resolved = ctx.resolve_path("~");
+        let home = dirs::home_dir().expect("home dir exists in test");
+        assert_eq!(resolved, home);
+    }
+
+    #[test]
+    fn test_ctx_mark_and_require_read() {
+        let ctx = make_ctx("/tmp");
+        let path = PathBuf::from("/tmp/test-ctx-mark-require");
+        std::fs::write(&path, "test").ok();
+
+        // Before marking: require fails
+        assert!(ctx.require_read(&path).is_err());
+        // After marking: require passes
+        ctx.mark_read(&path);
+        assert!(ctx.require_read(&path).is_ok());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_ctx_require_read_new_file() {
+        let ctx = make_ctx("/tmp");
+        // Non-existent file: require passes (new file creation allowed)
+        assert!(ctx.require_read(Path::new("/nonexistent/file.txt")).is_ok());
+    }
+
+    fn make_ctx(cwd: &str) -> ExecutionContext {
+        let (tx, _rx) = broadcast::channel(16);
+        ExecutionContext {
+            cwd: PathBuf::from(cwd),
+            cancel: CancellationToken::new(),
+            progress: ProgressSender::new(tx, "test", "test"),
+            interaction: None,
+            file_access: Arc::new(Mutex::new(FileAccessTracker::default())),
+        }
     }
 }

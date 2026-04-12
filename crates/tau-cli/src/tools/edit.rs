@@ -1,12 +1,24 @@
 //! File editing tool
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::fs;
+
+#[derive(Deserialize, JsonSchema)]
+struct EditArgs {
+    /// Path to the file to edit (relative or absolute)
+    path: String,
+    /// Exact text to find and replace (must match exactly)
+    old_text: String,
+    /// New text to replace the old text with
+    new_text: String,
+    /// Replace all occurrences instead of requiring a unique match (default: false)
+    replace_all: Option<bool>,
+}
 
 /// Tool for editing files with find/replace
 pub struct EditTool;
@@ -33,29 +45,12 @@ impl Tool for EditTool {
         "Edit a file by replacing exact text. The old_text must match exactly (including whitespace). Use this for precise, surgical edits."
     }
 
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to edit (relative or absolute)"
-                },
-                "old_text": {
-                    "type": "string",
-                    "description": "Exact text to find and replace (must match exactly)"
-                },
-                "new_text": {
-                    "type": "string",
-                    "description": "New text to replace the old text with"
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "Replace all occurrences instead of requiring a unique match (default: false)"
-                }
-            },
-            "required": ["path", "old_text", "new_text"]
-        })
+        cached_schema!(EditArgs)
     }
 
     async fn execute(
@@ -63,38 +58,18 @@ impl Tool for EditTool {
         arguments: serde_json::Value,
         ctx: ExecutionContext,
     ) -> ToolResult {
-        let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return ToolResult::error("Missing 'path' argument"),
+        let args: EditArgs = match serde_json::from_value(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
-        let old_text = match arguments.get("old_text").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => return ToolResult::error("Missing 'old_text' argument"),
-        };
-
-        let new_text = match arguments.get("new_text").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => return ToolResult::error("Missing 'new_text' argument"),
-        };
-
-        let path = if let Some(rest) = path_str.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(rest)
-            } else {
-                PathBuf::from(path_str)
-            }
-        } else {
-            super::resolve_path(path_str, &ctx.cwd)
-        };
+        let path = ctx.resolve_path(&args.path);
 
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Operation cancelled");
         }
 
-        // Enforce read-before-write: must read existing files before editing
-        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if let Err(e) = ctx.file_access.lock().require_read(&canonical) {
+        if let Err(e) = ctx.require_read(&path) {
             return ToolResult::error(e);
         }
 
@@ -103,35 +78,32 @@ impl Tool for EditTool {
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
 
-        let replace_all = arguments
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let replace_all = args.replace_all.unwrap_or(false);
 
-        if !content.contains(old_text) {
+        if !content.contains(&args.old_text) {
             return ToolResult::error(format!(
                 "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
-                path_str
+                args.path
             ));
         }
 
-        let occurrences = content.matches(old_text).count();
+        let occurrences = content.matches(&args.old_text).count();
 
         let new_content = if replace_all {
-            content.replace(old_text, new_text)
+            content.replace(&args.old_text, &args.new_text)
         } else if occurrences > 1 {
             return ToolResult::error(format!(
                 "Found {} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique, or set replace_all to true.",
-                occurrences, path_str
+                occurrences, args.path
             ));
         } else {
-            content.replacen(old_text, new_text, 1)
+            content.replacen(&args.old_text, &args.new_text, 1)
         };
 
         if content == new_content {
             return ToolResult::error(format!(
                 "No changes made to {}. The replacement produced identical content.",
-                path_str
+                args.path
             ));
         }
 
@@ -146,12 +118,12 @@ impl Tool for EditTool {
                 let result = if replace_all && occurrences > 1 {
                     format!(
                         "Successfully replaced {} occurrences in {}.\n\nDiff:\n{}",
-                        occurrences, path_str, diff
+                        occurrences, args.path, diff
                     )
                 } else {
                     format!(
                         "Successfully replaced text in {}. Changed {} characters to {} characters.\n\nDiff:\n{}",
-                        path_str, old_text.len(), new_text.len(), diff
+                        args.path, args.old_text.len(), args.new_text.len(), diff
                     )
                 };
                 ToolResult::text(result).with_details(json!({ "diff": diff }))
