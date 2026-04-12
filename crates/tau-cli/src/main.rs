@@ -77,13 +77,17 @@ struct Args {
     auth_status: bool,
 }
 
-fn parse_reasoning_level(s: &str) -> ReasoningLevel {
+fn parse_reasoning_level(s: &str) -> anyhow::Result<ReasoningLevel> {
     match s.to_lowercase().as_str() {
-        "minimal" => ReasoningLevel::Minimal,
-        "low" => ReasoningLevel::Low,
-        "medium" => ReasoningLevel::Medium,
-        "high" => ReasoningLevel::High,
-        _ => ReasoningLevel::Off,
+        "off" => Ok(ReasoningLevel::Off),
+        "minimal" => Ok(ReasoningLevel::Minimal),
+        "low" => Ok(ReasoningLevel::Low),
+        "medium" => Ok(ReasoningLevel::Medium),
+        "high" => Ok(ReasoningLevel::High),
+        _ => anyhow::bail!(
+            "Invalid reasoning level '{}'. Valid options: off, minimal, low, medium, high",
+            s
+        ),
     }
 }
 
@@ -177,11 +181,12 @@ async fn main() -> anyhow::Result<()> {
     let reasoning = if args.reasoning {
         ReasoningLevel::Medium
     } else if let Some(ref level) = args.reasoning_level {
-        parse_reasoning_level(level)
+        parse_reasoning_level(level)?
     } else {
         cfg.reasoning_level
             .as_ref()
             .map(|s| parse_reasoning_level(s))
+            .transpose()?
             .unwrap_or(ReasoningLevel::Off)
     };
 
