@@ -2,12 +2,6 @@
 //!
 //! ## Known limitations
 //!
-//! - No `textDocument/didChange` or `textDocument/didSave` notifications are sent.
-//!   After the model edits a file, the server's view becomes stale until the file
-//!   is re-opened (which happens on the next tool call for that file if the server
-//!   has crashed and restarted, but not otherwise). A future improvement would track
-//!   file edits and send change notifications.
-//!
 //! - The request timeout is fixed at 60 seconds. rust-analyzer's initial workspace
 //!   indexing can exceed this on very large codebases. The first request after server
 //!   start may time out; a retry will typically succeed once indexing completes.
@@ -21,6 +15,7 @@ mod servers;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use lsp_types::*;
 use tokio::sync::Mutex;
@@ -31,6 +26,14 @@ use servers::{ServerConfig, server_for_extension};
 
 /// Maximum file size we'll send to an LSP server via didOpen (10 MB).
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Tracks an opened file's state so we can detect external modifications.
+struct OpenedFile {
+    /// File modification time when we last sent didOpen.
+    mtime: Option<SystemTime>,
+    /// Version counter for didOpen (incremented on re-open).
+    version: i32,
+}
 
 /// Convert a file path to a file:// URI with proper percent-encoding.
 fn file_uri(path: &Path) -> anyhow::Result<Uri> {
@@ -64,8 +67,9 @@ pub struct LspManager {
     servers: Mutex<HashMap<String, Arc<LspClient>>>,
     configs: Vec<ServerConfig>,
     workspace_root: PathBuf,
-    /// URIs of files sent didOpen, keyed by server command to reset on restart
-    opened_files: Mutex<HashMap<String, HashSet<String>>>,
+    /// Files sent didOpen, keyed by server command → URI → state.
+    /// Reset per-server on restart so files get re-opened.
+    opened_files: Mutex<HashMap<String, HashMap<String, OpenedFile>>>,
 }
 
 impl LspManager {
@@ -163,6 +167,7 @@ impl LspManager {
 
     /// Ensure a file is open in the server (textDocument/didOpen).
     /// Tracks per-server so a server restart correctly re-opens files.
+    /// If the file was modified since last opened, sends didClose + didOpen to refresh.
     async fn ensure_file_open(
         &self,
         client: &LspClient,
@@ -173,12 +178,6 @@ impl LspManager {
         let uri = file_uri(path)?;
         let uri_str = uri.as_str().to_string();
 
-        let mut opened = self.opened_files.lock().await;
-        let server_files = opened.entry(server_command.to_string()).or_default();
-        if server_files.contains(&uri_str) {
-            return Ok(());
-        }
-
         let metadata = tokio::fs::metadata(path).await?;
         if metadata.len() > MAX_FILE_SIZE {
             return Err(anyhow::anyhow!(
@@ -187,8 +186,39 @@ impl LspManager {
                 MAX_FILE_SIZE as f64 / 1_048_576.0,
             ));
         }
+        let current_mtime = metadata.modified().ok();
+
+        let mut opened = self.opened_files.lock().await;
+        let server_files = opened.entry(server_command.to_string()).or_default();
+
+        if let Some(state) = server_files.get(&uri_str) {
+            // File is already open — check if it was modified externally
+            let stale = match (state.mtime, current_mtime) {
+                (Some(old), Some(new)) => new > old,
+                _ => true, // if we can't compare, refresh to be safe
+            };
+            if !stale {
+                return Ok(());
+            }
+
+            // Close stale file so we can re-open with fresh content
+            client
+                .notify(
+                    "textDocument/didClose",
+                    DidCloseTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    },
+                )
+                .await?;
+            tracing::debug!("LSP: re-opening modified file {}", path.display());
+        }
 
         let text = tokio::fs::read_to_string(path).await?;
+        let version = server_files
+            .get(&uri_str)
+            .map(|s| s.version + 1)
+            .unwrap_or(1);
+
         client
             .notify(
                 "textDocument/didOpen",
@@ -196,14 +226,20 @@ impl LspManager {
                     text_document: TextDocumentItem {
                         uri,
                         language_id: language_id.to_string(),
-                        version: 1,
+                        version,
                         text,
                     },
                 },
             )
             .await?;
 
-        server_files.insert(uri_str);
+        server_files.insert(
+            uri_str,
+            OpenedFile {
+                mtime: current_mtime,
+                version,
+            },
+        );
         Ok(())
     }
 
