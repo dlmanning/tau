@@ -190,14 +190,7 @@ fn get_git_branch() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Format a token count compactly (e.g. 1234 → "1.2k", 56 → "56")
-fn format_tokens(n: u32) -> String {
-    if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        n.to_string()
-    }
-}
+use crate::utils::format_tokens;
 
 /// Messages sent from UI to agent handler
 #[derive(Debug)]

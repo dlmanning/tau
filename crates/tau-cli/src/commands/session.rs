@@ -85,12 +85,4 @@ impl SessionCommand {
     }
 }
 
-fn format_number(n: u32) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
+use crate::utils::format_tokens as format_number;
