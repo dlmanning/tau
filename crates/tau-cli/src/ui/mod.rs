@@ -14,10 +14,12 @@
 //! The header style is inspired by the HP 48GX calculator status area.
 
 mod constants;
+mod state;
 mod types;
 
 pub use types::UiMessage;
-use types::{GitBranchState, PendingInteraction, rainbow_tau_style};
+use state::{AgentProgress, TuiState};
+use types::{PendingInteraction, rainbow_tau_style};
 
 use crossterm::event::{Event, EventStream, MouseEventKind};
 use futures::StreamExt;
@@ -31,39 +33,15 @@ use ratatui::{
 use tau_agent::{Agent, AgentEvent};
 use tau_ai::Model;
 use tau_tui::{
-    Theme,
     input::Action,
     widgets::{
-        InputBox, MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem,
+        MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem,
         SelectorState, message_list::ChatMessage,
     },
 };
 use tokio::sync::mpsc;
 
 use crate::utils::format_tokens;
-
-/// Per-agent progress tracking for richer subagent display.
-struct AgentProgress {
-    description: String,
-    tool_count: u32,
-    input_tokens: u64,
-    output_tokens: u64,
-    activity: String,
-    finished: bool,
-}
-
-impl AgentProgress {
-    fn new(description: String) -> Self {
-        Self {
-            description,
-            tool_count: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            activity: "starting...".to_string(),
-            finished: false,
-        }
-    }
-}
 
 /// Build a tree diagram of active/completed subagents.
 fn build_agent_tree(
@@ -102,111 +80,7 @@ fn build_agent_tree(
     lines.join("\n")
 }
 
-/// TUI application state
-pub struct TuiState {
-    /// Chat messages
-    messages: Vec<ChatMessage>,
-    /// Per-agent progress state keyed by agent_id.
-    agent_progress: std::collections::HashMap<String, AgentProgress>,
-    /// Insertion order of agent IDs for tree rendering.
-    agent_order: Vec<String>,
-    /// Input box
-    input: InputBox,
-    /// Current scroll position
-    scroll: usize,
-    /// Whether to auto-follow new content at the bottom
-    follow_bottom: bool,
-    /// Whether agent is currently processing
-    is_processing: bool,
-    /// Git branch name with background refresh.
-    git_branch: GitBranchState,
-    /// Current status message
-    status: String,
-    /// Theme
-    theme: Theme,
-    /// Total tokens used
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    total_cache_read: u64,
-    total_cache_write: u64,
-    /// Model for cost calculation
-    model: Model,
-    /// Current reasoning level
-    reasoning: tau_ai::ReasoningLevel,
-    /// Whether adaptive thinking is enabled (fixed per session; reasoning level
-    /// can change at runtime but adaptive mode cannot be toggled).
-    thinking_adaptive: bool,
-    /// Available models for selection
-    available_models: Vec<Model>,
-    /// Total cost
-    total_cost: f64,
-    /// Channel to send messages to agent handler
-    ui_tx: mpsc::Sender<UiMessage>,
-    /// Model selector state
-    model_selector: SelectorState,
-    /// Branch selector state
-    branch_selector: SelectorState,
-    /// Pending interaction request (question waiting for user to pick an option)
-    pending_interaction: Option<PendingInteraction>,
-}
-
 impl TuiState {
-    pub fn new(
-        model: Model,
-        reasoning: tau_ai::ReasoningLevel,
-        thinking_adaptive: bool,
-        available_models: Vec<Model>,
-        ui_tx: mpsc::Sender<UiMessage>,
-    ) -> Self {
-        let mut input = InputBox::new().with_placeholder("Type a message...");
-        input.set_focused(true);
-
-        // Find the current model's index in available models
-        let current_index = available_models
-            .iter()
-            .position(|m| m.id == model.id)
-            .unwrap_or(0);
-
-        let model_selector = SelectorState {
-            selected: current_index,
-            ..Default::default()
-        };
-
-        Self {
-            messages: vec![],
-            agent_progress: std::collections::HashMap::new(),
-            agent_order: Vec::new(),
-            input,
-            scroll: 0,
-            follow_bottom: true,
-            is_processing: false,
-            git_branch: GitBranchState::new(),
-            status: "Ready".to_string(),
-            theme: Theme::dark(),
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read: 0,
-            total_cache_write: 0,
-            model,
-            reasoning,
-            thinking_adaptive,
-            available_models,
-            total_cost: 0.0,
-            ui_tx,
-            model_selector,
-            branch_selector: SelectorState::default(),
-            pending_interaction: None,
-        }
-    }
-
-    /// Open the branch selector popup
-    pub fn open_branch_selector(&mut self) {
-        if !self.messages.is_empty() {
-            self.branch_selector.selected = self.messages.len().saturating_sub(1);
-            self.branch_selector.show();
-        }
-    }
-
     /// Handle agent events
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
@@ -282,12 +156,7 @@ impl TuiState {
                 self.scroll_to_bottom();
             }
             AgentEvent::TurnEnd { usage, .. } => {
-                self.total_input_tokens += usage.input;
-                self.total_output_tokens += usage.output;
-                self.total_cache_read += usage.cache_read;
-                self.total_cache_write += usage.cache_write;
-                let cost = usage.calculate_cost(&self.model);
-                self.total_cost += cost.total;
+                self.usage.accumulate(&usage, &self.model);
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_processing = false;
@@ -363,12 +232,7 @@ impl TuiState {
                             progress.input_tokens += usage.input;
                             progress.output_tokens += usage.output;
                         }
-                        self.total_input_tokens += usage.input;
-                        self.total_output_tokens += usage.output;
-                        self.total_cache_read += usage.cache_read;
-                        self.total_cache_write += usage.cache_write;
-                        let cost = usage.calculate_cost(&self.model);
-                        self.total_cost += cost.total;
+                        self.usage.accumulate(usage, &self.model);
                     }
                     AgentEvent::AgentEnd { .. } => {
                         if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
@@ -442,39 +306,6 @@ impl TuiState {
             }
             _ => {}
         }
-    }
-
-    /// Send a UI message, logging a warning if the channel is closed.
-    async fn send_ui(&self, msg: UiMessage) {
-        if self.ui_tx.send(msg).await.is_err() {
-            tracing::warn!("UI message channel closed");
-        }
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.follow_bottom = true;
-    }
-
-    /// Show a system message
-    pub fn show_system_message(&mut self, content: &str) {
-        self.messages.push(ChatMessage::system(content));
-        self.scroll_to_bottom();
-    }
-
-    /// Update the model
-    pub fn set_model(&mut self, model: Model) {
-        self.model = model;
-    }
-
-    /// Reset token/cost counters and agent progress
-    pub fn reset_stats(&mut self) {
-        self.total_input_tokens = 0;
-        self.total_output_tokens = 0;
-        self.total_cache_read = 0;
-        self.total_cache_write = 0;
-        self.total_cost = 0.0;
-        self.agent_progress.clear();
-        self.agent_order.clear();
     }
 
     /// Handle keyboard action
@@ -1007,24 +838,24 @@ impl TuiState {
         }
 
         // Token stats
-        if self.total_input_tokens > 0 || self.total_output_tokens > 0 {
+        if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
             parts.push(Span::styled(" · ", dim));
             parts.push(Span::styled(
-                format!("{} in, {} out", format_tokens(self.total_input_tokens), format_tokens(self.total_output_tokens)),
+                format!("{} in, {} out", format_tokens(self.usage.input_tokens), format_tokens(self.usage.output_tokens)),
                 dim,
             ));
 
-            if self.total_cache_read > 0 || self.total_cache_write > 0 {
+            if self.usage.cache_read > 0 || self.usage.cache_write > 0 {
                 parts.push(Span::styled(" · ", dim));
                 parts.push(Span::styled(
-                    format!("cache: {}r {}w", format_tokens(self.total_cache_read), format_tokens(self.total_cache_write)),
+                    format!("cache: {}r {}w", format_tokens(self.usage.cache_read), format_tokens(self.usage.cache_write)),
                     dim,
                 ));
             }
 
-            if self.total_cost > 0.0 {
+            if self.usage.cost > 0.0 {
                 parts.push(Span::styled(" · ", dim));
-                parts.push(Span::styled(format!("${:.4}", self.total_cost), dim));
+                parts.push(Span::styled(format!("${:.4}", self.usage.cost), dim));
             }
         }
 
