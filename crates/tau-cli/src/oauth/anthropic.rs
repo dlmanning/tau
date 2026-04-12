@@ -110,8 +110,12 @@ where
         .await
         .map_err(|e| format!("Failed to parse token response: {}", e))?;
 
+    let refresh = token_data
+        .refresh_token
+        .ok_or("Server did not return a refresh token during login")?;
+
     Ok(OAuthCredentials::new(
-        token_data.refresh_token.unwrap_or_default(),
+        refresh,
         token_data.access_token,
         token_data.expires_in,
     ))
@@ -147,8 +151,12 @@ pub async fn refresh_anthropic_token(refresh_token: &str) -> Result<OAuthCredent
         .await
         .map_err(|e| format!("Failed to parse token response: {}", e))?;
 
+    let refresh = token_data
+        .refresh_token
+        .unwrap_or_else(|| refresh_token.to_string());
+
     Ok(OAuthCredentials::new(
-        token_data.refresh_token.unwrap_or_default(),
+        refresh,
         token_data.access_token,
         token_data.expires_in,
     ))
