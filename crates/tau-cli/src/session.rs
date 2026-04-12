@@ -243,38 +243,36 @@ impl SessionManager {
     fn read_session_info(path: &PathBuf) -> Option<SessionInfo> {
         let file = File::open(path).ok()?;
         let reader = BufReader::new(file);
-        let first_line = reader.lines().next()?.ok()?;
+        let mut lines = reader.lines();
 
-        if let Ok(SessionEntry::Metadata {
+        let first_line = lines.next()?.ok()?;
+        let Ok(SessionEntry::Metadata {
             id,
             created_at,
             model,
             working_dir,
         }) = serde_json::from_str(&first_line)
-        {
-            let file = File::open(path).ok()?;
-            let reader = BufReader::new(file);
-            let message_count = reader
-                .lines()
-                .map_while(Result::ok)
-                .filter(|l| {
-                    matches!(
-                        serde_json::from_str::<SessionEntry>(l),
-                        Ok(SessionEntry::Message { .. })
-                    )
-                })
-                .count();
+        else {
+            return None;
+        };
 
-            Some(SessionInfo {
-                id,
-                created_at,
-                model,
-                working_dir,
-                message_count,
+        let message_count = lines
+            .map_while(Result::ok)
+            .filter(|l| {
+                matches!(
+                    serde_json::from_str::<SessionEntry>(l),
+                    Ok(SessionEntry::Message { .. })
+                )
             })
-        } else {
-            None
-        }
+            .count();
+
+        Some(SessionInfo {
+            id,
+            created_at,
+            model,
+            working_dir,
+            message_count,
+        })
     }
 
     /// Create a branched session from messages up to (and including) branch_index.
