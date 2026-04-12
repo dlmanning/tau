@@ -241,7 +241,8 @@ static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// Regex for HTTP 400 status codes in error strings (e.g. "400 Bad Request", "HTTP 400", "status: 400").
 /// Requires word boundary to avoid matching port numbers or IDs containing "400".
 static HTTP_400_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:status|http|error)[:\s]*400\b|\b400\s+bad\s+request").unwrap()
+    Regex::new(r"(?i)(?:status|http|error)[:\s]*400\b|\b400\s+bad\s+request")
+        .expect("valid regex literal")
 });
 
 /// Check if an error indicates a context overflow / too many tokens

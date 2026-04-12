@@ -257,7 +257,7 @@ impl AgentManager {
                     id
                 ))
             })?;
-            agents.remove(pos).unwrap().1
+            agents.remove(pos).expect("pos was found via position()").1
         };
 
         // Use the stored snapshot (not current total_usage) for correct delta
@@ -702,7 +702,7 @@ async fn create_worktree(agent_id: &str) -> Result<WorktreeInfo, String> {
     let branch = format!("worktree-agent-{}", agent_id);
     let path = git_root.join(format!(".tau-worktrees/agent-{}", agent_id));
 
-    tokio::fs::create_dir_all(path.parent().unwrap())
+    tokio::fs::create_dir_all(path.parent().expect("joined path has parent"))
         .await
         .map_err(|e| format!("Failed to create worktree directory: {}", e))?;
 

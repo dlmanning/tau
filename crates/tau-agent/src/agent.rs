@@ -568,7 +568,7 @@ impl Agent {
         for group in &groups {
             // Check steering before each group (except the first)
             if !tool_results.is_empty() {
-                let from = *group.first().unwrap();
+                let from = group[0];
                 if self.apply_steering(&tool_calls[from..], &mut tool_results) {
                     break;
                 }
@@ -665,7 +665,7 @@ impl Agent {
                     ));
                 }
 
-                let after = *group.last().unwrap() + 1;
+                let after = group[group.len() - 1] + 1;
                 if self.apply_steering(&tool_calls[after..], &mut tool_results) {
                     break;
                 }

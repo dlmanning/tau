@@ -228,7 +228,10 @@ pub(super) fn convert_messages(
         if let Some(last) = consolidated.last_mut() {
             if last.role == msg.role {
                 if let serde_json::Value::Array(new_blocks) = msg.content {
-                    last.content.as_array_mut().unwrap().extend(new_blocks);
+                    last.content
+                        .as_array_mut()
+                        .expect("content is always a JSON array")
+                        .extend(new_blocks);
                 }
                 continue;
             }
@@ -247,7 +250,8 @@ pub(super) fn convert_messages(
                 {
                     let mut cc = serde_json::json!({"type": "ephemeral"});
                     if let Some(scope) = cache_scope {
-                        cc["scope"] = serde_json::to_value(scope).unwrap();
+                        cc["scope"] = serde_json::to_value(scope)
+                            .expect("CacheScope serializes to JSON");
                     }
                     if let Some(ttl) = cache_ttl {
                         cc["ttl"] = serde_json::json!(ttl);

@@ -727,7 +727,9 @@ impl TuiState {
 
     /// Render the question selector popup
     fn render_question_selector(&self, frame: &mut Frame, area: Rect) {
-        let pi = self.pending_interaction.as_ref().unwrap();
+        let Some(pi) = self.pending_interaction.as_ref() else {
+            return;
+        };
         let items: Vec<OwnedSelectorItem> = pi
             .options
             .iter()
@@ -1113,27 +1115,31 @@ pub async fn run_tui(
                                 let action = tau_tui::input::key_to_action(key);
                                 match action {
                                     Action::Up => {
-                                        let pi = state.pending_interaction.as_mut().unwrap();
-                                        pi.selector.up(pi.options.len());
+                                        if let Some(pi) = state.pending_interaction.as_mut() {
+                                            pi.selector.up(pi.options.len());
+                                        }
                                     }
                                     Action::Down => {
-                                        let pi = state.pending_interaction.as_mut().unwrap();
-                                        pi.selector.down(pi.options.len());
+                                        if let Some(pi) = state.pending_interaction.as_mut() {
+                                            pi.selector.down(pi.options.len());
+                                        }
                                     }
                                     Action::Submit => {
-                                        let pi = state.pending_interaction.take().unwrap();
-                                        let label = pi.options[pi.selector.selected].label.clone();
-                                        let _ = pi.response_tx.send(
-                                            tau_agent::InteractionResponse::Answer(label),
-                                        );
-                                        state.status = "Thinking...".to_string();
+                                        if let Some(pi) = state.pending_interaction.take() {
+                                            let label = pi.options[pi.selector.selected].label.clone();
+                                            let _ = pi.response_tx.send(
+                                                tau_agent::InteractionResponse::Answer(label),
+                                            );
+                                            state.status = "Thinking...".to_string();
+                                        }
                                     }
                                     Action::Escape | Action::Interrupt => {
-                                        let pi = state.pending_interaction.take().unwrap();
-                                        let _ = pi.response_tx.send(
-                                            tau_agent::InteractionResponse::Cancelled,
-                                        );
-                                        state.status = "Thinking...".to_string();
+                                        if let Some(pi) = state.pending_interaction.take() {
+                                            let _ = pi.response_tx.send(
+                                                tau_agent::InteractionResponse::Cancelled,
+                                            );
+                                            state.status = "Thinking...".to_string();
+                                        }
                                     }
                                     _ => {} // consume all other input while modal is open
                                 }

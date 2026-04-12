@@ -116,7 +116,7 @@ impl Config {
     /// Save config to file
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::config_path();
-        let dir = path.parent().unwrap();
+        let dir = path.parent().expect("config path has parent directory");
         fs::create_dir_all(dir)?;
 
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
