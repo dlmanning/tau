@@ -6,6 +6,7 @@ mod streaming;
 #[cfg(test)]
 mod tests;
 
+use reqwest::header::HeaderValue;
 use reqwest_eventsource::EventSource;
 use serde::Serialize;
 
@@ -106,6 +107,10 @@ impl ToolChoice {
 }
 
 const SPOOFED_SDK_VERSION: &str = "0.85.0";
+const SPOOFED_LANG: HeaderValue = HeaderValue::from_static("js");
+const SPOOFED_RUNTIME: HeaderValue = HeaderValue::from_static("node");
+const SPOOFED_RUNTIME_VERSION: HeaderValue = HeaderValue::from_static("v22.12.0");
+const ANTHROPIC_VERSION: HeaderValue = HeaderValue::from_static("2023-06-01");
 
 /// Apply Stainless SDK identification headers.
 ///
@@ -133,18 +138,18 @@ fn apply_stainless_headers(headers: &mut reqwest::header::HeaderMap) {
         "User-Agent",
         format!("Anthropic/JS {}", SPOOFED_SDK_VERSION)
             .parse()
-            .unwrap(),
+            .expect("valid User-Agent header"),
     );
-    headers.insert("X-Stainless-Lang", "js".parse().unwrap());
+    headers.insert("X-Stainless-Lang", SPOOFED_LANG);
     headers.insert(
         "X-Stainless-Package-Version",
-        SPOOFED_SDK_VERSION.parse().unwrap(),
+        HeaderValue::from_static(SPOOFED_SDK_VERSION),
     );
-    headers.insert("X-Stainless-OS", os.parse().unwrap());
-    headers.insert("X-Stainless-Arch", arch.parse().unwrap());
-    headers.insert("X-Stainless-Runtime", "node".parse().unwrap());
-    headers.insert("X-Stainless-Runtime-Version", "v22.12.0".parse().unwrap());
-    headers.insert("X-Stainless-Retry-Count", "0".parse().unwrap());
+    headers.insert("X-Stainless-OS", HeaderValue::from_static(os));
+    headers.insert("X-Stainless-Arch", HeaderValue::from_static(arch));
+    headers.insert("X-Stainless-Runtime", SPOOFED_RUNTIME);
+    headers.insert("X-Stainless-Runtime-Version", SPOOFED_RUNTIME_VERSION);
+    headers.insert("X-Stainless-Retry-Count", HeaderValue::from_static("0"));
 }
 
 /// Anthropic API client
@@ -205,19 +210,32 @@ impl AnthropicProvider {
             betas.insert(0, "oauth-2025-04-20");
             headers.insert(
                 "Authorization",
-                format!("Bearer {}", self.api_key).parse().unwrap(),
+                format!("Bearer {}", self.api_key)
+                    .parse()
+                    .map_err(|_| Error::InvalidConfig("invalid API key for header".into()))?,
             );
             headers.insert(
                 "anthropic-dangerous-direct-browser-access",
-                "true".parse().unwrap(),
+                HeaderValue::from_static("true"),
             );
         } else {
-            headers.insert("x-api-key", self.api_key.parse().unwrap());
+            headers.insert(
+                "x-api-key",
+                self.api_key
+                    .parse()
+                    .map_err(|_| Error::InvalidConfig("invalid API key for header".into()))?,
+            );
         }
-        headers.insert("anthropic-beta", betas.join(",").parse().unwrap());
-        headers.insert("accept", "application/json".parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert(
+            "anthropic-beta",
+            betas
+                .join(",")
+                .parse()
+                .map_err(|_| Error::InvalidConfig("invalid beta header".into()))?,
+        );
+        headers.insert("accept", super::APPLICATION_JSON);
+        headers.insert("content-type", super::APPLICATION_JSON);
+        headers.insert("anthropic-version", ANTHROPIC_VERSION);
 
         apply_stainless_headers(&mut headers);
 

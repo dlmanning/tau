@@ -73,7 +73,7 @@ impl GoogleProvider {
         );
 
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("content-type", super::APPLICATION_JSON);
 
         for (key, value) in &model.headers {
             if let (Ok(name), Ok(val)) = (
