@@ -1,5 +1,7 @@
 //! WebFetch tool - fetches and converts web content
 
+use std::net::IpAddr;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -81,6 +83,11 @@ impl Tool for WebFetchTool {
             Ok(u) => u,
             Err(e) => return ToolResult::error(e),
         };
+
+        // Block requests to private/internal IPs (SSRF protection)
+        if let Err(e) = check_host_safety(&url).await {
+            return ToolResult::error(e);
+        }
 
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("Cancelled");
@@ -186,6 +193,70 @@ fn validate_url(url_str: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// Check if an IP address is private, loopback, or link-local.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()             // 127.0.0.0/8
+            || v4.is_private()           // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()        // 169.254.0.0/16 (includes cloud metadata)
+            || v4.is_unspecified()       // 0.0.0.0
+            || v4.is_broadcast()         // 255.255.255.255
+        }
+        IpAddr::V6(v6) => {
+            // Check IPv4-mapped addresses (::ffff:x.x.x.x) against IPv4 rules
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(mapped));
+            }
+            v6.is_loopback()             // ::1
+            || v6.is_unspecified()       // ::
+            || (v6.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 link-local
+            || (v6.segments()[0] & 0xfe00) == 0xfc00   // fc00::/7 unique-local
+        }
+    }
+}
+
+/// Resolve a URL's host and reject private/internal IP addresses.
+///
+/// Note: DNS is resolved here then again by reqwest, so a TOCTOU gap
+/// exists (DNS rebinding). Low risk for a local CLI tool.
+async fn check_host_safety(url_str: &str) -> Result<(), String> {
+    let url = url::Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;
+
+    let host = url.host_str().ok_or("URL has no host")?;
+
+    // If the host is already an IP literal, check it directly
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err(format!("Blocked request to private/internal address: {}", ip));
+        }
+        return Ok(());
+    }
+
+    // Resolve hostname and check all returned IPs
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await
+        .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?;
+
+    let addrs: Vec<_> = addrs.collect();
+    if addrs.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {}", host));
+    }
+
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(format!(
+                "Blocked request: {} resolves to private/internal address {}",
+                host,
+                addr.ip()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Check if two URLs have the same domain (ignoring www. prefix)
 fn is_same_domain(a: &str, b: &str) -> bool {
     fn strip_www(host: &str) -> &str {
@@ -248,6 +319,9 @@ async fn fetch_url(url: &str) -> Result<FetchResponse, String> {
                 .or_else(|_| url::Url::parse(&current_url).and_then(|base| base.join(location)))
                 .map_err(|e| format!("Invalid redirect URL: {}", e))?
                 .to_string();
+
+            // Block redirects to private/internal IPs
+            check_host_safety(&redirect_url).await?;
 
             // Block cross-domain redirects — report to model so it can re-request
             if !is_same_domain(&current_url, &redirect_url) {
