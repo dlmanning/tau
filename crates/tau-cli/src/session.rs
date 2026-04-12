@@ -45,8 +45,6 @@ pub enum SessionEntry {
 pub struct SessionManager {
     /// Session ID
     id: String,
-    /// Path to the session file
-    _path: PathBuf,
     /// Writer for appending entries
     writer: Option<BufWriter<File>>,
 }
@@ -83,7 +81,6 @@ impl SessionManager {
 
         Ok(Self {
             id,
-            _path: path,
             writer: Some(writer),
         })
     }
@@ -152,8 +149,7 @@ impl SessionManager {
         Ok((
             Self {
                 id: id.to_string(),
-                _path: path,
-                writer: Some(writer),
+                    writer: Some(writer),
             },
             messages,
             previous_summary,
@@ -321,7 +317,6 @@ impl SessionManager {
 
         Ok(Self {
             id,
-            _path: path,
             writer: Some(writer),
         })
     }

@@ -18,8 +18,6 @@ pub struct Config {
     pub thinking_adaptive: Option<bool>,
     /// Whether to use TUI mode by default
     pub tui: Option<bool>,
-    /// Custom system prompt file path
-    pub system_prompt_file: Option<String>,
     /// API keys (alternative to environment variables)
     #[serde(default)]
     pub api_keys: ApiKeys,
@@ -145,7 +143,6 @@ impl Config {
             reasoning_level: Some("off".to_string()),
             thinking_adaptive: None,
             tui: Some(true),
-            system_prompt_file: None,
             api_keys: ApiKeys::default(),
             compaction: None,
             cache: None,
@@ -224,9 +221,6 @@ reasoning_level = "off"
 # Whether to use TUI mode by default (true by default)
 # Set to false for simple stdin/stdout mode
 tui = true
-
-# Custom system prompt file (optional)
-# system_prompt_file = "~/.config/tau/system_prompt.txt"
 
 # API keys (optional - can also use environment variables)
 # It's recommended to use environment variables instead for security
