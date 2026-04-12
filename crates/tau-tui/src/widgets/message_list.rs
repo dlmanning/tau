@@ -264,6 +264,23 @@ impl<'a> MessageList<'a> {
                     )));
                 }
             }
+            "agents" => {
+                // Pre-formatted tree diagram of parallel agents
+                let branch_style = Style::default().fg(Color::Cyan);
+                let activity_style = Style::default().fg(Color::DarkGray);
+                for text_line in msg.content.lines() {
+                    // Activity lines (⚙) get dim style, structure lines get cyan
+                    let style = if text_line.contains('⚙') {
+                        activity_style
+                    } else {
+                        branch_style
+                    };
+                    lines.push(Line::from(Span::styled(
+                        text_line.to_string(),
+                        style,
+                    )));
+                }
+            }
             "system" => {
                 let wrapped = textwrap::wrap(&msg.content, content_width);
                 for (i, line) in wrapped.iter().enumerate() {

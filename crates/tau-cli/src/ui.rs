@@ -46,6 +46,7 @@ struct PendingInteraction {
 
 /// Per-agent progress tracking for richer subagent display.
 struct AgentProgress {
+    description: String,
     tool_count: u32,
     input_tokens: u32,
     output_tokens: u32,
@@ -54,8 +55,9 @@ struct AgentProgress {
 }
 
 impl AgentProgress {
-    fn new() -> Self {
+    fn new(description: String) -> Self {
         Self {
+            description,
             tool_count: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -63,7 +65,43 @@ impl AgentProgress {
             finished: false,
         }
     }
+}
 
+/// Build a tree diagram of active/completed subagents.
+fn build_agent_tree(
+    agent_order: &[String],
+    agent_progress: &std::collections::HashMap<String, AgentProgress>,
+) -> String {
+    let agents: Vec<&AgentProgress> = agent_order
+        .iter()
+        .filter_map(|id| agent_progress.get(id))
+        .collect();
+    let total = agents.len();
+    let mut lines = Vec::new();
+
+    for (i, agent) in agents.iter().enumerate() {
+        // Single agent: no tree chrome. Multiple: use box drawing.
+        let (branch, cont) = if total == 1 {
+            ("◇", " ")
+        } else {
+            let is_last = i == total - 1;
+            if is_last { ("└─", "  ") } else { ("├─", "│ ") }
+        };
+
+        if agent.finished {
+            let tokens = format_tokens(agent.input_tokens + agent.output_tokens);
+            let indicator = if agent.activity.starts_with("error:") { "✗" } else { "✓" };
+            lines.push(format!(
+                "{} {} {} ({} tools · {} tokens)",
+                branch, indicator, agent.description, agent.tool_count, tokens
+            ));
+        } else {
+            lines.push(format!("{} ◇ {}", branch, agent.description));
+            lines.push(format!("{}   ⚙ {}", cont, agent.activity));
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// Build a human-readable description of what a tool is doing.
@@ -140,6 +178,18 @@ fn rainbow_tau_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Get the current git branch name, or None if not in a git repo.
+fn get_git_branch() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Format a token count compactly (e.g. 1234 → "1.2k", 56 → "56")
 fn format_tokens(n: u32) -> String {
     if n >= 1000 {
@@ -174,6 +224,8 @@ pub struct TuiState {
     messages: Vec<ChatMessage>,
     /// Per-agent progress state keyed by agent_id.
     agent_progress: std::collections::HashMap<String, AgentProgress>,
+    /// Insertion order of agent IDs for tree rendering.
+    agent_order: Vec<String>,
     /// Input box
     input: InputBox,
     /// Current scroll position
@@ -182,6 +234,10 @@ pub struct TuiState {
     follow_bottom: bool,
     /// Whether agent is currently processing
     is_processing: bool,
+    /// Cached git branch name (refreshed periodically)
+    git_branch: Option<String>,
+    /// When the git branch was last checked
+    git_branch_checked: Instant,
     /// Current status message
     status: String,
     /// Theme
@@ -238,10 +294,13 @@ impl TuiState {
         Self {
             messages: vec![],
             agent_progress: std::collections::HashMap::new(),
+            agent_order: Vec::new(),
             input,
             scroll: 0,
             follow_bottom: true,
             is_processing: false,
+            git_branch: get_git_branch(),
+            git_branch_checked: Instant::now(),
             status: "Ready".to_string(),
             theme: Theme::dark(),
             total_input_tokens: 0,
@@ -299,27 +358,48 @@ impl TuiState {
                 self.scroll_to_bottom();
             }
             AgentEvent::ToolExecutionStart {
+                tool_call_id,
                 tool_name,
-                ..
+                arguments,
             } => {
-                self.status = format!("Running {}...", tool_name);
+                let activity = describe_tool_activity(&tool_name, &arguments);
+                self.messages.push(ChatMessage {
+                    role: format!("tool:{}", tool_name),
+                    content: activity,
+                    is_error: false,
+                    is_streaming: true,
+                    id: Some(tool_call_id),
+                });
+                self.scroll_to_bottom();
             }
             AgentEvent::ToolExecutionUpdate {
-                tool_name,
+                tool_call_id,
                 content,
                 ..
             } => {
-                self.status = format!("{}: {}", tool_name, content);
+                if let Some(msg) = self.messages.iter_mut().rev()
+                    .find(|m| m.id.as_deref() == Some(&tool_call_id))
+                {
+                    msg.content = content;
+                }
             }
             AgentEvent::ToolExecutionEnd {
+                tool_call_id,
                 tool_name,
                 result,
                 is_error,
                 ..
             } => {
                 let preview = crate::utils::truncate_chars(&result, 200);
-                self.messages
-                    .push(ChatMessage::tool(&tool_name, preview, is_error));
+                if let Some(msg) = self.messages.iter_mut().rev()
+                    .find(|m| m.id.as_deref() == Some(&tool_call_id))
+                {
+                    msg.content = preview.to_string();
+                    msg.is_streaming = false;
+                    msg.is_error = is_error;
+                } else {
+                    self.messages.push(ChatMessage::tool(&tool_name, preview, is_error));
+                }
                 self.scroll_to_bottom();
             }
             AgentEvent::TurnEnd { usage, .. } => {
@@ -332,11 +412,9 @@ impl TuiState {
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_processing = false;
-                self.status = "Ready".to_string();
             }
             AgentEvent::Error { message } => {
                 self.is_processing = false;
-                self.status = format!("Error: {}", message);
                 self.messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: format!("Error: {}", message),
@@ -345,12 +423,7 @@ impl TuiState {
                     id: None,
                 });
             }
-            AgentEvent::CompactionStart { reason } => {
-                self.status = format!(
-                    "Compacting context ({})...",
-                    crate::utils::compaction_reason_str(reason)
-                );
-            }
+            AgentEvent::CompactionStart { .. } => {}
             AgentEvent::CompactionEnd {
                 tokens_before,
                 tokens_after,
@@ -361,7 +434,7 @@ impl TuiState {
                 )));
                 self.scroll_to_bottom();
             }
-            // Subagent events — track in status bar, show summary on completion
+            // Subagent events — render as tree in conversation
             AgentEvent::Subagent {
                 agent_id,
                 description,
@@ -369,9 +442,10 @@ impl TuiState {
             } => {
                 match *event {
                     AgentEvent::AgentStart => {
-                        let progress = AgentProgress::new();
-                        self.agent_progress.insert(agent_id, progress);
-                        self.status = format!("Agent: {}...", description);
+                        let progress = AgentProgress::new(description);
+                        self.agent_progress.insert(agent_id.clone(), progress);
+                        self.agent_order.push(agent_id);
+                        self.update_agent_tree();
                     }
                     AgentEvent::ToolExecutionStart {
                         ref tool_name,
@@ -383,7 +457,7 @@ impl TuiState {
                             progress.activity =
                                 describe_tool_activity(tool_name, arguments);
                         }
-                        self.status = format!("Agent: {} [{}]", description, tool_name);
+                        self.update_agent_tree();
                     }
                     AgentEvent::TurnEnd { ref usage, .. } => {
                         if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
@@ -400,37 +474,35 @@ impl TuiState {
                     AgentEvent::AgentEnd { .. } => {
                         if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
                             progress.finished = true;
-                            let tokens =
-                                format_tokens(progress.input_tokens + progress.output_tokens);
-                            let msg = ChatMessage {
-                                role: format!("agent:{}", description),
-                                content: format!(
-                                    "{} tools · {} tokens",
-                                    progress.tool_count, tokens
-                                ),
-                                is_error: false,
-                                is_streaming: false,
-                                id: Some(agent_id),
-                            };
-                            self.messages.push(msg);
-                            self.scroll_to_bottom();
                         }
-                        self.status = "Ready".to_string();
+                        self.update_agent_tree();
+                        // If all agents done, finalize the tree message
+                        if self.agent_progress.values().all(|p| p.finished) {
+                            if let Some(msg) = self.messages.iter_mut().rev()
+                                .find(|m| m.role == "agents")
+                            {
+                                msg.is_streaming = false;
+                            }
+                            self.agent_progress.clear();
+                            self.agent_order.clear();
+                        }
                     }
                     AgentEvent::Error { ref message } => {
                         if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
                             progress.finished = true;
+                            progress.activity = format!("error: {}", message);
                         }
-                        let msg = ChatMessage {
-                            role: format!("agent:{}", description),
-                            content: message.clone(),
-                            is_error: true,
-                            is_streaming: false,
-                            id: Some(agent_id),
-                        };
-                        self.messages.push(msg);
-                        self.scroll_to_bottom();
-                        self.status = "Ready".to_string();
+                        self.update_agent_tree();
+                        if self.agent_progress.values().all(|p| p.finished) {
+                            if let Some(msg) = self.messages.iter_mut().rev()
+                                .find(|m| m.role == "agents")
+                            {
+                                msg.is_streaming = false;
+                                msg.is_error = true;
+                            }
+                            self.agent_progress.clear();
+                            self.agent_order.clear();
+                        }
                     }
                     _ => {}
                 }
@@ -438,6 +510,25 @@ impl TuiState {
             // Ignore turn/message start events (we handle updates/ends)
             AgentEvent::TurnStart { .. } | AgentEvent::MessageStart { .. } => {}
         }
+    }
+
+    /// Update or insert the agent tree message in the conversation.
+    fn update_agent_tree(&mut self) {
+        let tree = build_agent_tree(&self.agent_order, &self.agent_progress);
+        if let Some(msg) = self.messages.iter_mut().rev()
+            .find(|m| m.role == "agents" && m.is_streaming)
+        {
+            msg.content = tree;
+        } else {
+            self.messages.push(ChatMessage {
+                role: "agents".to_string(),
+                content: tree,
+                is_error: false,
+                is_streaming: true,
+                id: None,
+            });
+        }
+        self.scroll_to_bottom();
     }
 
     /// Handle mouse scroll events.
@@ -578,6 +669,7 @@ impl TuiState {
                 let _ = self.ui_tx.send(UiMessage::Clear).await;
                 self.messages.clear();
                 self.agent_progress.clear();
+                self.agent_order.clear();
                 self.total_input_tokens = 0;
                 self.total_output_tokens = 0;
                 self.total_cache_read = 0;
@@ -810,7 +902,7 @@ impl TuiState {
         }
     }
 
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
         let cwd = std::env::current_dir()
             .ok()
             .and_then(|p| {
@@ -823,7 +915,16 @@ impl TuiState {
             })
             .unwrap_or_default();
 
-        let info_content = format!("{{ {} }}", cwd);
+        // Refresh git branch every 5 seconds
+        if self.git_branch_checked.elapsed() > std::time::Duration::from_secs(5) {
+            self.git_branch = get_git_branch();
+            self.git_branch_checked = Instant::now();
+        }
+
+        let info_content = match &self.git_branch {
+            Some(b) => format!("{{ {} · {} }}", cwd, b),
+            None => format!("{{ {} }}", cwd),
+        };
 
         // τ glyph — rainbow cycle when processing, dim green when idle
         let tau_style = if self.is_processing {
@@ -898,11 +999,8 @@ impl TuiState {
             parts.push(Span::styled(t, dim));
         }
 
-        // Token stats / processing status
-        if self.is_processing {
-            parts.push(Span::styled(" · ", dim));
-            parts.push(Span::styled(&self.status, dim));
-        } else if self.total_input_tokens > 0 || self.total_output_tokens > 0 {
+        // Token stats
+        if self.total_input_tokens > 0 || self.total_output_tokens > 0 {
             parts.push(Span::styled(" · ", dim));
             parts.push(Span::styled(
                 format!("{} in, {} out", format_tokens(self.total_input_tokens), format_tokens(self.total_output_tokens)),
@@ -1182,6 +1280,7 @@ pub async fn run_tui(
                                     state.total_cache_write = 0;
                                     state.total_cost = 0.0;
                                     state.agent_progress.clear();
+                                    state.agent_order.clear();
                                     state.status = "Cleared".to_string();
                                 }
                                 CommandResult::ChangeModel(new_model) => {
@@ -1249,6 +1348,7 @@ pub async fn run_tui(
                                             state.total_cache_write = 0;
                                             state.total_cost = 0.0;
                                             state.agent_progress.clear();
+                                    state.agent_order.clear();
                                         }
                                         Err(e) => {
                                             state.show_system_message(&format!("Failed to create branch: {}", e));
@@ -1275,6 +1375,7 @@ pub async fn run_tui(
                         state.total_cache_write = 0;
                         state.total_cost = 0.0;
                         state.agent_progress.clear();
+                        state.agent_order.clear();
                         state.status = "Cleared".to_string();
                     }
                     Some(UiMessage::Abort) => {
