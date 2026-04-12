@@ -689,6 +689,115 @@ impl TuiState {
         }
     }
 
+    /// Handle a terminal event while a prompt is executing.
+    /// Returns `false` if the TUI should exit immediately.
+    pub fn handle_event_while_processing(
+        &mut self,
+        event: Event,
+        area_width: u16,
+        agent_handle: &tau_agent::AgentHandle,
+    ) -> bool {
+        match event {
+            Event::Key(key) if self.pending_interaction.is_some() => {
+                let action = tau_tui::input::key_to_action(key);
+                match action {
+                    Action::Up => {
+                        if let Some(pi) = self.pending_interaction.as_mut() {
+                            pi.selector.up(pi.options.len());
+                        }
+                    }
+                    Action::Down => {
+                        if let Some(pi) = self.pending_interaction.as_mut() {
+                            pi.selector.down(pi.options.len());
+                        }
+                    }
+                    Action::Submit => {
+                        if let Some(pi) = self.pending_interaction.take() {
+                            let label = pi.options[pi.selector.selected].label.clone();
+                            let _ = pi.response_tx.send(
+                                tau_agent::InteractionResponse::Answer(label),
+                            );
+                            self.status = "Thinking...".to_string();
+                        }
+                    }
+                    Action::Escape | Action::Interrupt => {
+                        if let Some(pi) = self.pending_interaction.take() {
+                            let _ = pi.response_tx.send(
+                                tau_agent::InteractionResponse::Cancelled,
+                            );
+                            self.status = "Thinking...".to_string();
+                        }
+                    }
+                    _ => {} // consume all other input while modal is open
+                }
+                true
+            }
+            Event::Key(key) => {
+                let action = tau_tui::input::key_to_action(key);
+                match action {
+                    Action::Interrupt | Action::Escape => {
+                        agent_handle.abort();
+                        self.status = "Cancelling...".to_string();
+                    }
+                    Action::Quit => return false,
+                    Action::Submit => {
+                        let content = self.input.content().to_string();
+                        if !content.is_empty() {
+                            self.input.clear();
+                            self.messages.push(ChatMessage {
+                                role: "steer".to_string(),
+                                content: content.clone(),
+                                is_error: false,
+                                is_streaming: false,
+                                id: None,
+                            });
+                            self.scroll_to_bottom();
+                            agent_handle.steer(tau_ai::Message::user(&content));
+                        }
+                    }
+                    _ => {
+                        self.input.handle_action(&action, area_width);
+                    }
+                }
+                true
+            }
+            Event::Paste(text) => {
+                self.input.handle_action(&Action::Paste(text), area_width);
+                true
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse_scroll(mouse.kind);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => true,
+        }
+    }
+
+    /// Handle a terminal event while idle (no prompt executing).
+    /// Returns `false` if the TUI should exit.
+    pub async fn handle_event_while_idle(
+        &mut self,
+        event: Event,
+        area_width: u16,
+    ) -> bool {
+        match event {
+            Event::Key(key) => {
+                let action = tau_tui::input::key_to_action(key);
+                self.handle_action(action, area_width).await
+            }
+            Event::Paste(text) => {
+                self.handle_action(Action::Paste(text), area_width).await
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse_scroll(mouse.kind);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => true,
+        }
+    }
+
     /// Render the UI
     pub fn render(&mut self, frame: &mut Frame) {
         let size = frame.area();
@@ -1069,7 +1178,7 @@ pub async fn run_tui(
     // This is stored as a String so it lives long enough for the future
     let mut pending_prompt: Option<String> = None;
 
-    let result = loop {
+    let result = 'outer: loop {
         // If there's a pending prompt, start processing it
         // We create the future here where `content` is still in scope
         if let Some(content) = pending_prompt.take() {
@@ -1079,10 +1188,7 @@ pub async fn run_tui(
             state.messages.push(ChatMessage::assistant_streaming(""));
             state.scroll_to_bottom();
 
-            // Get handles before creating the future (so we can use them without borrowing agent)
-            let cancel_handle = agent.cancel_handle();
             let agent_handle = agent.handle();
-
             let mut prompt_future = std::pin::pin!(agent.prompt(&content));
 
             loop {
@@ -1096,9 +1202,8 @@ pub async fn run_tui(
                         if let Err(e) = result {
                             state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
                         }
-                        // Drop any pending interaction (tool future is gone)
                         state.pending_interaction = None;
-                        break; // Exit inner loop, prompt is done
+                        break;
                     }
 
                     event = agent_rx.recv() => {
@@ -1109,88 +1214,14 @@ pub async fn run_tui(
 
                     event = event_stream.next() => {
                         match event {
-                            Some(Ok(Event::Key(key))) if state.pending_interaction.is_some() => {
-                                let action = tau_tui::input::key_to_action(key);
-                                match action {
-                                    Action::Up => {
-                                        if let Some(pi) = state.pending_interaction.as_mut() {
-                                            pi.selector.up(pi.options.len());
-                                        }
-                                    }
-                                    Action::Down => {
-                                        if let Some(pi) = state.pending_interaction.as_mut() {
-                                            pi.selector.down(pi.options.len());
-                                        }
-                                    }
-                                    Action::Submit => {
-                                        if let Some(pi) = state.pending_interaction.take() {
-                                            let label = pi.options[pi.selector.selected].label.clone();
-                                            let _ = pi.response_tx.send(
-                                                tau_agent::InteractionResponse::Answer(label),
-                                            );
-                                            state.status = "Thinking...".to_string();
-                                        }
-                                    }
-                                    Action::Escape | Action::Interrupt => {
-                                        if let Some(pi) = state.pending_interaction.take() {
-                                            let _ = pi.response_tx.send(
-                                                tau_agent::InteractionResponse::Cancelled,
-                                            );
-                                            state.status = "Thinking...".to_string();
-                                        }
-                                    }
-                                    _ => {} // consume all other input while modal is open
+                            Some(Ok(ev)) => {
+                                if !state.handle_event_while_processing(ev, area_width, &agent_handle) {
+                                    break 'outer Ok(());
                                 }
                             }
-                            Some(Ok(Event::Key(key))) => {
-                                let action = tau_tui::input::key_to_action(key);
-                                match action {
-                                    Action::Interrupt | Action::Escape => {
-                                        cancel_handle.lock().cancel();
-                                        state.status = "Cancelling...".to_string();
-                                    }
-                                    Action::Quit => {
-                                        disable_raw_mode()?;
-                                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                        terminal.show_cursor()?;
-                                        return Ok(());
-                                    }
-                                    Action::Submit => {
-                                        let content = state.input.content().to_string();
-                                        if !content.is_empty() {
-                                            state.input.clear();
-                                            // Use "steer" role to visually distinguish from
-                                            // normal prompts (▷ dim italic vs ▶ bold accent)
-                                            state.messages.push(ChatMessage {
-                                                role: "steer".to_string(),
-                                                content: content.clone(),
-                                                is_error: false,
-                                                is_streaming: false,
-                                                id: None,
-                                            });
-                                            state.scroll_to_bottom();
-                                            agent_handle.steer(tau_ai::Message::user(&content));
-                                        }
-                                    }
-                                    _ => {
-                                        state.input.handle_action(&action, area_width);
-                                    }
-                                }
-                            }
-                            Some(Ok(Event::Paste(text))) => {
-                                state.input.handle_action(&Action::Paste(text), area_width);
-                            }
-                            Some(Ok(Event::Mouse(mouse))) => {
-                                state.handle_mouse_scroll(mouse.kind);
-                            }
-                            Some(Ok(Event::Resize(_, _))) => {}
                             Some(Err(_)) | None => {
-                                disable_raw_mode()?;
-                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                terminal.show_cursor()?;
-                                return Ok(());
+                                break 'outer Ok(());
                             }
-                            _ => {}
                         }
                     }
 
@@ -1239,26 +1270,17 @@ pub async fn run_tui(
 
             event = event_stream.next() => {
                 match event {
-                    Some(Ok(Event::Key(key))) => {
-                        let action = tau_tui::input::key_to_action(key);
-                        if !state.handle_action(action, area_width).await {
+                    Some(Ok(ev)) => {
+                        if !state.handle_event_while_idle(ev, area_width).await {
                             break Ok(());
                         }
                     }
-                    Some(Ok(Event::Paste(text))) => {
-                        state.handle_action(Action::Paste(text), area_width).await;
-                    }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        state.handle_mouse_scroll(mouse.kind);
-                    }
-                    Some(Ok(Event::Resize(_, _))) => {}
                     Some(Err(e)) => {
                         break Err(anyhow::anyhow!("Event error: {}", e));
                     }
                     None => {
                         break Ok(());
                     }
-                    _ => {}
                 }
             }
 
