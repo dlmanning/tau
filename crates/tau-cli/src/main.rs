@@ -189,8 +189,7 @@ async fn main() -> anyhow::Result<()> {
     // correct parent rather than always routing to the root agent.
     let mgr_for_factory = manager.clone();
     manager.set_agent_tool_factory(Arc::new(move |depth, handle| {
-        let tool = tools::AgentTool::new(mgr_for_factory.clone(), depth)
-            .with_handle(handle);
+        let tool = tools::AgentTool::new(mgr_for_factory.clone(), depth).with_handle(handle);
         Arc::new(tool)
     }));
 
@@ -267,10 +266,16 @@ async fn main() -> anyhow::Result<()> {
         let session = session::SessionManager::new(&model.id).ok();
         let mut model = model;
         let mut reasoning = reasoning;
-        interactive::run_interactive(&mut agent, &mut model, &mut reasoning, session, interaction_rx).await
+        interactive::run_interactive(
+            &mut agent,
+            &mut model,
+            &mut reasoning,
+            session,
+            interaction_rx,
+        )
+        .await
     };
 
     lsp_manager.shutdown_all().await;
     result
 }
-

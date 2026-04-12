@@ -95,9 +95,7 @@ impl Tool for AskTool {
             Ok(InteractionResponse::Answer(answer)) => {
                 ToolResult::text(format!("User selected: {}", answer))
             }
-            Ok(InteractionResponse::Cancelled) => {
-                ToolResult::error("User cancelled the question")
-            }
+            Ok(InteractionResponse::Cancelled) => ToolResult::error("User cancelled the question"),
             Err(_) => ToolResult::error("Interaction channel closed"),
         }
     }

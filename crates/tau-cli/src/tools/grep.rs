@@ -72,11 +72,7 @@ impl Tool for GrepTool {
         cached_schema!(GrepArgs)
     }
 
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
         let args: GrepArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),

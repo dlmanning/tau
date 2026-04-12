@@ -20,9 +20,9 @@ mod render;
 mod state;
 mod types;
 
-pub use types::UiMessage;
 use state::TuiState;
 use types::PendingInteraction;
+pub use types::UiMessage;
 
 use crossterm::event::EventStream;
 use futures::StreamExt;
@@ -38,11 +38,7 @@ fn apply_branch(
     model_id: &str,
     branch_index: Option<usize>,
 ) {
-    match crate::session::SessionManager::branch_from(
-        agent.messages(),
-        branch_index,
-        model_id,
-    ) {
+    match crate::session::SessionManager::branch_from(agent.messages(), branch_index, model_id) {
         Ok(new_session) => {
             let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
             state.show_system_message(&format!(
@@ -84,7 +80,8 @@ async fn dispatch_ui_message(
             *pending_prompt = Some(content);
         }
         UiMessage::Command(cmd) => {
-            if let Some(result) = execute_command(&cmd, agent, model, *reasoning, available_models) {
+            if let Some(result) = execute_command(&cmd, agent, model, *reasoning, available_models)
+            {
                 match result {
                     CommandResult::Message(msg) => {
                         state.show_system_message(&msg);
@@ -110,7 +107,8 @@ async fn dispatch_ui_message(
                     CommandResult::Exit => return false,
                     CommandResult::Unknown(cmd) => {
                         state.show_system_message(&format!(
-                            "Unknown command: /{}\nType /help for available commands.", cmd
+                            "Unknown command: /{}\nType /help for available commands.",
+                            cmd
                         ));
                     }
                     CommandResult::OpenModelSelector => {
@@ -121,7 +119,10 @@ async fn dispatch_ui_message(
                     }
                     CommandResult::Compact => {
                         state.show_system_message("Compacting context...");
-                        match agent.run_compaction(tau_agent::CompactionReason::Manual).await {
+                        match agent
+                            .run_compaction(tau_agent::CompactionReason::Manual)
+                            .await
+                        {
                             Ok(()) => {
                                 state.show_system_message(&format!(
                                     "Context compacted. {} messages remaining.",
@@ -175,15 +176,22 @@ pub async fn run_tui(
     use std::io;
 
     use crossterm::{
+        event::{
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        },
         execute,
-        event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture},
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
     use ratatui::{Terminal, backend::CrosstermBackend};
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -201,7 +209,9 @@ pub async fn run_tui(
     let mut event_stream = EventStream::new();
 
     // Tick interval for animations (80ms for smooth spinner)
-    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(constants::TICK_INTERVAL_MS));
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(
+        constants::TICK_INTERVAL_MS,
+    ));
 
     // Pending prompt content - we'll process this at the start of the next loop iteration
     // This is stored as a String so it lives long enough for the future
@@ -338,7 +348,12 @@ pub async fn run_tui(
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
 
     result

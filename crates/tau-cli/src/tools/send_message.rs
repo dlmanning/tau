@@ -76,20 +76,18 @@ impl Tool for SendMessageTool {
                     description, agent_id
                 ))
             }
-            AgentStatus::Idle => {
-                match self.manager.send(&agent_id, &wrapped, ctx.cancel).await {
-                    Ok(result) => ToolResult::text(format!(
-                        "{}\n[Agent {} resumed | {} in + {} out tokens | {} tool calls | {}ms]",
-                        result.text,
-                        result.agent_id,
-                        result.input_tokens,
-                        result.output_tokens,
-                        result.tool_use_count,
-                        result.duration_ms,
-                    )),
-                    Err(e) => ToolResult::error(format!("Failed to resume agent: {}", e)),
-                }
-            }
+            AgentStatus::Idle => match self.manager.send(&agent_id, &wrapped, ctx.cancel).await {
+                Ok(result) => ToolResult::text(format!(
+                    "{}\n[Agent {} resumed | {} in + {} out tokens | {} tool calls | {}ms]",
+                    result.text,
+                    result.agent_id,
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.tool_use_count,
+                    result.duration_ms,
+                )),
+                Err(e) => ToolResult::error(format!("Failed to resume agent: {}", e)),
+            },
         }
     }
 }

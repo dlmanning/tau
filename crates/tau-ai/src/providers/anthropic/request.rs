@@ -2,8 +2,8 @@
 
 use serde::Serialize;
 
-use super::convert::CacheControl;
 use super::ToolChoice;
+use super::convert::CacheControl;
 
 #[derive(Debug, Serialize)]
 pub(super) struct AnthropicRequest {

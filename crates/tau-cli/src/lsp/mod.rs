@@ -121,8 +121,7 @@ impl LspManager {
         }
 
         tracing::info!("Starting LSP server: {} for .{}", config.command, ext);
-        let client =
-            LspClient::spawn(&config.command, &config.args, &self.workspace_root).await?;
+        let client = LspClient::spawn(&config.command, &config.args, &self.workspace_root).await?;
 
         #[allow(deprecated)] // root_uri still needed by many servers
         let init_params = InitializeParams {
@@ -331,12 +330,7 @@ impl LspManager {
     }
 
     /// Get hover information at the given position.
-    pub async fn hover(
-        &self,
-        path: &Path,
-        line: u32,
-        character: u32,
-    ) -> anyhow::Result<String> {
+    pub async fn hover(&self, path: &Path, line: u32, character: u32) -> anyhow::Result<String> {
         let (client, uri) = self.prepare(path).await?;
         let result: Option<Hover> = client
             .request(
@@ -371,12 +365,10 @@ impl LspManager {
         }
         for client in &unique {
             if client.is_alive().await {
-                if let Err(e) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    client.shutdown(),
-                )
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("shutdown timed out")))
+                if let Err(e) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("shutdown timed out")))
                 {
                     tracing::debug!("LSP shutdown error: {}", e);
                 }

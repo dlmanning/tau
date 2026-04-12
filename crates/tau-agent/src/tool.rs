@@ -50,7 +50,9 @@ impl FileAccessTracker {
             if let Message::Assistant { content, .. } = msg {
                 for c in content {
                     if let Content::ToolCall {
-                        name, arguments, id,
+                        name,
+                        arguments,
+                        id,
                     } = c
                     {
                         if name == "read" {
@@ -235,11 +237,7 @@ impl ExecutionContext {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
         } else {
             let p = PathBuf::from(path_str);
-            if p.is_absolute() {
-                p
-            } else {
-                self.cwd.join(p)
-            }
+            if p.is_absolute() { p } else { self.cwd.join(p) }
         }
     }
 
@@ -452,13 +450,19 @@ mod tests {
     #[test]
     fn test_resolve_path_absolute() {
         let ctx = make_ctx("/work");
-        assert_eq!(ctx.resolve_path("/usr/bin/ls"), PathBuf::from("/usr/bin/ls"));
+        assert_eq!(
+            ctx.resolve_path("/usr/bin/ls"),
+            PathBuf::from("/usr/bin/ls")
+        );
     }
 
     #[test]
     fn test_resolve_path_relative() {
         let ctx = make_ctx("/work");
-        assert_eq!(ctx.resolve_path("src/main.rs"), PathBuf::from("/work/src/main.rs"));
+        assert_eq!(
+            ctx.resolve_path("src/main.rs"),
+            PathBuf::from("/work/src/main.rs")
+        );
     }
 
     #[test]

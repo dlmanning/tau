@@ -24,12 +24,20 @@ fn build_agent_tree(
             ("◇", " ")
         } else {
             let is_last = i == total - 1;
-            if is_last { ("└─", "  ") } else { ("├─", "│ ") }
+            if is_last {
+                ("└─", "  ")
+            } else {
+                ("├─", "│ ")
+            }
         };
 
         if agent.finished {
             let tokens = format_tokens(agent.input_tokens + agent.output_tokens);
-            let indicator = if agent.activity.starts_with("error:") { "✗" } else { "✓" };
+            let indicator = if agent.activity.starts_with("error:") {
+                "✗"
+            } else {
+                "✓"
+            };
             lines.push(format!(
                 "{} {} {} ({} tools · {} tokens)",
                 branch, indicator, agent.description, agent.tool_count, tokens
@@ -93,7 +101,10 @@ impl TuiState {
                 content,
                 ..
             } => {
-                if let Some(msg) = self.messages.iter_mut().rev()
+                if let Some(msg) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
                     .find(|m| m.id.as_deref() == Some(&tool_call_id))
                 {
                     msg.content = content;
@@ -106,15 +117,20 @@ impl TuiState {
                 is_error,
                 ..
             } => {
-                let preview = crate::utils::truncate_chars(&result, constants::TOOL_RESULT_PREVIEW_CHARS);
-                if let Some(msg) = self.messages.iter_mut().rev()
+                let preview =
+                    crate::utils::truncate_chars(&result, constants::TOOL_RESULT_PREVIEW_CHARS);
+                if let Some(msg) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
                     .find(|m| m.id.as_deref() == Some(&tool_call_id))
                 {
                     msg.content = preview.to_string();
                     msg.is_streaming = false;
                     msg.is_error = is_error;
                 } else {
-                    self.messages.push(ChatMessage::tool(&tool_name, preview, is_error));
+                    self.messages
+                        .push(ChatMessage::tool(&tool_name, preview, is_error));
                 }
                 self.scroll_to_bottom();
             }
@@ -153,53 +169,48 @@ impl TuiState {
                 agent_id,
                 description,
                 event,
-            } => {
-                match *event {
-                    AgentEvent::AgentStart => {
-                        let progress = AgentProgress::new(description);
-                        self.agent_progress.insert(agent_id.clone(), progress);
-                        self.agent_order.push(agent_id);
-                        self.update_agent_tree();
-                    }
-                    AgentEvent::ToolExecutionStart {
-                        ref activity,
-                        ..
-                    } => {
-                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
-                            progress.tool_count += 1;
-                            progress.activity = activity.clone();
-                        }
-                        self.update_agent_tree();
-                    }
-                    AgentEvent::TurnEnd { ref usage, .. } => {
-                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
-                            progress.input_tokens += usage.input;
-                            progress.output_tokens += usage.output;
-                        }
-                        self.usage.accumulate(usage, &self.model);
-                    }
-                    AgentEvent::AgentEnd { .. } => {
-                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
-                            progress.finished = true;
-                        }
-                        self.update_agent_tree();
-                        if self.agent_progress.values().all(|p| p.finished) {
-                            self.finalize_agent_progress(false);
-                        }
-                    }
-                    AgentEvent::Error { ref message } => {
-                        if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
-                            progress.finished = true;
-                            progress.activity = format!("error: {}", message);
-                        }
-                        self.update_agent_tree();
-                        if self.agent_progress.values().all(|p| p.finished) {
-                            self.finalize_agent_progress(true);
-                        }
-                    }
-                    _ => {}
+            } => match *event {
+                AgentEvent::AgentStart => {
+                    let progress = AgentProgress::new(description);
+                    self.agent_progress.insert(agent_id.clone(), progress);
+                    self.agent_order.push(agent_id);
+                    self.update_agent_tree();
                 }
-            }
+                AgentEvent::ToolExecutionStart { ref activity, .. } => {
+                    if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                        progress.tool_count += 1;
+                        progress.activity = activity.clone();
+                    }
+                    self.update_agent_tree();
+                }
+                AgentEvent::TurnEnd { ref usage, .. } => {
+                    if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                        progress.input_tokens += usage.input;
+                        progress.output_tokens += usage.output;
+                    }
+                    self.usage.accumulate(usage, &self.model);
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                        progress.finished = true;
+                    }
+                    self.update_agent_tree();
+                    if self.agent_progress.values().all(|p| p.finished) {
+                        self.finalize_agent_progress(false);
+                    }
+                }
+                AgentEvent::Error { ref message } => {
+                    if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                        progress.finished = true;
+                        progress.activity = format!("error: {}", message);
+                    }
+                    self.update_agent_tree();
+                    if self.agent_progress.values().all(|p| p.finished) {
+                        self.finalize_agent_progress(true);
+                    }
+                }
+                _ => {}
+            },
             AgentEvent::TurnStart { .. } | AgentEvent::MessageStart { .. } => {}
         }
     }
@@ -207,9 +218,7 @@ impl TuiState {
     /// Finalize the agent tree message and clear tracking state.
     fn finalize_agent_progress(&mut self, is_error: bool) {
         if !self.agent_progress.is_empty() {
-            if let Some(msg) = self.messages.iter_mut().rev()
-                .find(|m| m.role == "agents")
-            {
+            if let Some(msg) = self.messages.iter_mut().rev().find(|m| m.role == "agents") {
                 msg.is_streaming = false;
                 if is_error {
                     msg.is_error = true;
@@ -223,7 +232,10 @@ impl TuiState {
     /// Update or insert the agent tree message in the conversation.
     fn update_agent_tree(&mut self) {
         let tree = build_agent_tree(&self.agent_order, &self.agent_progress);
-        if let Some(msg) = self.messages.iter_mut().rev()
+        if let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rev()
             .find(|m| m.role == "agents" && m.is_streaming)
         {
             msg.content = tree;

@@ -53,11 +53,7 @@ impl Tool for ReadTool {
         cached_schema!(ReadArgs)
     }
 
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
         let args: ReadArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
@@ -84,10 +80,7 @@ impl Tool for ReadTool {
             .map(|o| (o as usize).saturating_sub(1)) // 1-indexed to 0-indexed
             .unwrap_or(0);
 
-        let limit = args
-            .limit
-            .map(|l| l as usize)
-            .unwrap_or(MAX_LINES);
+        let limit = args.limit.map(|l| l as usize).unwrap_or(MAX_LINES);
 
         if offset >= total_lines {
             return ToolResult::error(format!(

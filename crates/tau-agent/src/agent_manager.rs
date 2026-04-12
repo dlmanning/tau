@@ -13,7 +13,7 @@ use crate::handle::AgentHandle;
 use crate::tool::BoxedTool;
 use crate::transcript::record_transcript;
 use crate::transport::Transport;
-use crate::worktree::{WorktreeInfo, create_worktree, cleanup_worktree};
+use crate::worktree::{WorktreeInfo, cleanup_worktree, create_worktree};
 
 /// Maximum recursion depth for nested agent spawning.
 pub const MAX_AGENT_DEPTH: u32 = 3;
@@ -167,7 +167,8 @@ impl AgentManager {
         // removes after, but if the future is dropped mid-execution it leaks).
         self.running_handles.lock().await.remove(&agent_id);
         let (result, agent) = result?;
-        self.store(result.agent_id.clone(), agent, description).await;
+        self.store(result.agent_id.clone(), agent, description)
+            .await;
         Ok(result)
     }
 
@@ -232,7 +233,6 @@ impl AgentManager {
                     ));
                 }
             }
-
         });
 
         agent_id
@@ -263,11 +263,8 @@ impl AgentManager {
         // Use the stored snapshot (not current total_usage) for correct delta
         let usage_before = entry.usage_at_pause.clone();
 
-        let event_task = self.spawn_event_forwarder(
-            entry.agent.subscribe(),
-            id,
-            &entry.description,
-        );
+        let event_task =
+            self.spawn_event_forwarder(entry.agent.subscribe(), id, &entry.description);
 
         let agent_handle = entry.agent.handle();
         let bridge = tokio::spawn({
@@ -303,10 +300,7 @@ impl AgentManager {
         record_transcript(id, entry.agent.messages()).await;
         entry.usage_at_pause = current_usage;
         entry.messages_at_pause = entry.agent.messages().len();
-        self.agents
-            .lock()
-            .await
-            .push_back((id.to_string(), entry));
+        self.agents.lock().await.push_back((id.to_string(), entry));
 
         prompt_result?;
 
@@ -430,10 +424,7 @@ impl AgentManager {
         let (wt_path, wt_branch) = if let Some(wt) = &worktree {
             match cleanup_worktree(wt).await {
                 Ok(true) => (None, None),
-                _ => (
-                    Some(wt.path.display().to_string()),
-                    Some(wt.branch.clone()),
-                ),
+                _ => (Some(wt.path.display().to_string()), Some(wt.branch.clone())),
             }
         } else {
             (None, None)
@@ -503,11 +494,7 @@ impl AgentManager {
         );
         agent.set_system_prompt(system_prompt);
 
-        let event_task = self.spawn_event_forwarder(
-            agent.subscribe(),
-            agent_id,
-            &req.description,
-        );
+        let event_task = self.spawn_event_forwarder(agent.subscribe(), agent_id, &req.description);
 
         // Wire the parent's cancel token to the subagent so that
         // cancelling the parent also cancels this subagent.
@@ -639,11 +626,7 @@ fn extract_final_text(messages: &[Message]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(text)
-                }
+                if text.is_empty() { None } else { Some(text) }
             }
             _ => None,
         })
@@ -780,7 +763,8 @@ mod tests {
     fn test_general_purpose_gets_agent_tool_from_factory() {
         let all = mock_tools();
         let handle = test_handle();
-        let factory: TestAgentToolFactory = Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
+        let factory: TestAgentToolFactory =
+            Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
         let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory), &handle);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"agent")); // added by factory
@@ -790,7 +774,8 @@ mod tests {
     fn test_depth_limit_excludes_agent_tool() {
         let all = mock_tools();
         let handle = test_handle();
-        let factory: TestAgentToolFactory = Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
+        let factory: TestAgentToolFactory =
+            Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
         // At MAX_AGENT_DEPTH - 1, the next level would be MAX_AGENT_DEPTH -> excluded
         let filtered = build_tool_set(
             &AgentType::GeneralPurpose,
@@ -874,11 +859,7 @@ mod tests {
         let mut parent_rx = manager.parent_event_tx.subscribe();
 
         // Spawn the forwarder
-        let task = manager.spawn_event_forwarder(
-            child_tx.subscribe(),
-            "agent-123",
-            "test task",
-        );
+        let task = manager.spawn_event_forwarder(child_tx.subscribe(), "agent-123", "test task");
 
         // Emit events on the child channel
         child_tx

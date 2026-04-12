@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -54,11 +54,7 @@ struct JsonRpcError {
 
 impl LspClient {
     /// Spawn an LSP server process and return a client connected to it.
-    pub async fn spawn(
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> anyhow::Result<Self> {
+    pub async fn spawn(command: &str, args: &[String], cwd: &Path) -> anyhow::Result<Self> {
         let mut child = Command::new(command)
             .args(args)
             .current_dir(cwd)
@@ -68,8 +64,14 @@ impl LspClient {
             .kill_on_drop(true)
             .spawn()?;
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
@@ -139,7 +141,8 @@ impl LspClient {
             method: method.to_string(),
             params,
         };
-        self.send_message(&serde_json::to_string(&notification)?).await
+        self.send_message(&serde_json::to_string(&notification)?)
+            .await
     }
 
     /// Send an LSP shutdown request and exit notification.

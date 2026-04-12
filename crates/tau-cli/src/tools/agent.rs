@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::handle::AgentHandle;
 use tau_agent::agent_manager::{AgentManager, AgentType, SpawnRequest};
+use tau_agent::handle::AgentHandle;
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
@@ -136,7 +136,10 @@ fn format_result(result: &tau_agent::agent_manager::SubagentResult) -> String {
     let mut output = result.text.clone();
     let mut meta = format!(
         "\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms",
-        result.agent_id, result.input_tokens, result.output_tokens, result.tool_use_count,
+        result.agent_id,
+        result.input_tokens,
+        result.output_tokens,
+        result.tool_use_count,
         result.duration_ms,
     );
     if let Some(ref p) = result.worktree_path {

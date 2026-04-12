@@ -285,7 +285,11 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 /// Find where to cut messages for compaction.
 /// Walks backwards from the end, keeping at least `keep_recent_tokens` tokens.
 /// Never cuts at a ToolResult — finds the nearest User or Assistant boundary.
-fn find_cut_point(messages: &[Message], keep_recent_tokens: u64, cancel: &CancellationToken) -> Option<CutPointResult> {
+fn find_cut_point(
+    messages: &[Message],
+    keep_recent_tokens: u64,
+    cancel: &CancellationToken,
+) -> Option<CutPointResult> {
     if messages.len() < 2 {
         return None;
     }
@@ -463,14 +467,13 @@ pub async fn compact(
     if cancel.is_cancelled() {
         return Err("Compaction cancelled".to_string());
     }
-    let cut = find_cut_point(messages, config.keep_recent_tokens, cancel)
-        .ok_or_else(|| {
-            if cancel.is_cancelled() {
-                "Compaction cancelled".to_string()
-            } else {
-                "Not enough messages to compact".to_string()
-            }
-        })?;
+    let cut = find_cut_point(messages, config.keep_recent_tokens, cancel).ok_or_else(|| {
+        if cancel.is_cancelled() {
+            "Compaction cancelled".to_string()
+        } else {
+            "Not enough messages to compact".to_string()
+        }
+    })?;
 
     let messages_to_summarize = &messages[..cut.first_kept_index];
 

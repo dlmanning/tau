@@ -22,11 +22,7 @@ fn visual_line_count(line: &Line, width: usize) -> usize {
         return 1;
     }
     let w = line_width(line);
-    if w == 0 {
-        1
-    } else {
-        (w + width - 1) / width
-    }
+    if w == 0 { 1 } else { (w + width - 1) / width }
 }
 
 /// Split a Line that exceeds `width` into multiple Lines.
@@ -275,10 +271,7 @@ impl<'a> MessageList<'a> {
                     } else {
                         branch_style
                     };
-                    lines.push(Line::from(Span::styled(
-                        text_line.to_string(),
-                        style,
-                    )));
+                    lines.push(Line::from(Span::styled(text_line.to_string(), style)));
                 }
             }
             "system" => {
@@ -314,10 +307,7 @@ impl<'a> MessageList<'a> {
                 };
                 let wrapped = textwrap::wrap(&msg.content, content_width);
                 for line in wrapped.iter() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", line),
-                        style,
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {}", line), style)));
                 }
             }
         }

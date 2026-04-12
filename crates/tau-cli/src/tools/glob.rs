@@ -55,11 +55,7 @@ impl Tool for GlobTool {
         cached_schema!(GlobArgs)
     }
 
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
         let args: GlobArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),

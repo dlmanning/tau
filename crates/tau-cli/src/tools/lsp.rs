@@ -55,11 +55,7 @@ impl Tool for LspTool {
         cached_schema!(LspArgs)
     }
 
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        _ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, _ctx: ExecutionContext) -> ToolResult {
         let args: LspArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
@@ -77,14 +73,18 @@ impl Tool for LspTool {
             "goToDefinition" => {
                 let (line, character) = match (args.line, args.character) {
                     (Some(l), Some(c)) => (l, c),
-                    _ => return ToolResult::error("goToDefinition requires 'line' and 'character'"),
+                    _ => {
+                        return ToolResult::error("goToDefinition requires 'line' and 'character'");
+                    }
                 };
                 self.manager.go_to_definition(&path, line, character).await
             }
             "findReferences" => {
                 let (line, character) = match (args.line, args.character) {
                     (Some(l), Some(c)) => (l, c),
-                    _ => return ToolResult::error("findReferences requires 'line' and 'character'"),
+                    _ => {
+                        return ToolResult::error("findReferences requires 'line' and 'character'");
+                    }
                 };
                 self.manager.find_references(&path, line, character).await
             }
@@ -100,7 +100,7 @@ impl Tool for LspTool {
                 return ToolResult::error(format!(
                     "Unknown operation '{}'. Valid: goToDefinition, findReferences, hover, documentSymbol",
                     args.operation
-                ))
+                ));
             }
         };
 

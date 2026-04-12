@@ -2,8 +2,8 @@
 
 use serde::Serialize;
 
-use super::request::{AnthropicMessage, AnthropicTool, SystemBlock};
 use super::CacheScope;
+use super::request::{AnthropicMessage, AnthropicTool, SystemBlock};
 use crate::messages::ensure_tool_result_pairing;
 use crate::types::{Content, Message, StopReason, Tool};
 
@@ -214,7 +214,8 @@ pub(super) fn convert_messages(
                     .filter_map(|c| c.as_text())
                     .collect::<Vec<_>>()
                     .join("\n");
-                let block = serde_json::json!({ "type": "text", "text": format!("{}{}", prefix, text) });
+                let block =
+                    serde_json::json!({ "type": "text", "text": format!("{}{}", prefix, text) });
                 result.push(AnthropicMessage {
                     role: "user".to_string(),
                     content: serde_json::Value::Array(vec![block]),
@@ -250,8 +251,8 @@ pub(super) fn convert_messages(
                 {
                     let mut cc = serde_json::json!({"type": "ephemeral"});
                     if let Some(scope) = cache_scope {
-                        cc["scope"] = serde_json::to_value(scope)
-                            .expect("CacheScope serializes to JSON");
+                        cc["scope"] =
+                            serde_json::to_value(scope).expect("CacheScope serializes to JSON");
                     }
                     if let Some(ttl) = cache_ttl {
                         cc["ttl"] = serde_json::json!(ttl);

@@ -149,7 +149,7 @@ impl SessionManager {
         Ok((
             Self {
                 id: id.to_string(),
-                    writer: Some(writer),
+                writer: Some(writer),
             },
             messages,
             previous_summary,

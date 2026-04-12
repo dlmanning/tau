@@ -4,6 +4,7 @@
 //! with LLMs, including tool execution and state management.
 
 pub mod agent;
+pub mod agent_manager;
 pub mod compaction;
 pub mod context;
 pub mod conversation;
@@ -14,7 +15,6 @@ pub mod interaction;
 pub mod loop_state;
 pub(crate) mod overflow;
 pub mod prompts;
-pub mod agent_manager;
 pub mod stream;
 pub mod tool;
 pub(crate) mod tool_executor;

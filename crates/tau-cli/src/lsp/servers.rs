@@ -101,7 +101,10 @@ pub async fn discover_servers() -> Vec<ServerConfig> {
 }
 
 /// Find the server config for a given file extension.
-pub fn server_for_extension<'a>(configs: &'a [ServerConfig], ext: &str) -> Option<&'a ServerConfig> {
+pub fn server_for_extension<'a>(
+    configs: &'a [ServerConfig],
+    ext: &str,
+) -> Option<&'a ServerConfig> {
     configs
         .iter()
         .find(|c| c.extensions.iter().any(|(e, _)| e == ext))

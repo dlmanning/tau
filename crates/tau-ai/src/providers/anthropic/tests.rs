@@ -1,6 +1,6 @@
-use super::convert::{split_system_prompt, CacheControl};
-use super::request::ThinkingConfig;
 use super::CacheScope;
+use super::convert::{CacheControl, split_system_prompt};
+use super::request::ThinkingConfig;
 
 #[test]
 fn test_cache_scope_serialization() {
@@ -117,15 +117,13 @@ fn test_split_system_prompt_respects_caller_scope() {
 #[test]
 fn test_split_system_prompt_boundary_at_edges() {
     let prompt = "<!-- B -->Dynamic only";
-    let blocks =
-        split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
+    let blocks = split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].text, "Dynamic only");
     assert!(blocks[0].cache_control.is_none());
 
     let prompt = "Static only<!-- B -->";
-    let blocks =
-        split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
+    let blocks = split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].text, "Static only");
     assert!(blocks[0].cache_control.is_some());
@@ -134,8 +132,7 @@ fn test_split_system_prompt_boundary_at_edges() {
 #[test]
 fn test_split_system_prompt_boundary_is_entire_prompt() {
     let prompt = "<!-- B -->";
-    let blocks =
-        split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
+    let blocks = split_system_prompt(prompt, Some("<!-- B -->"), &Some(CacheScope::Global), &None);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].text, "<!-- B -->");
     assert!(blocks[0].cache_control.is_some());

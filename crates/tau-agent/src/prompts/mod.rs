@@ -90,9 +90,7 @@ fn using_tools_section(tool_names: &[&str]) -> String {
             s.push_str("   - To search for files use Glob instead of find or ls\n");
         }
         if has_grep {
-            s.push_str(
-                "   - To search the content of files, use Grep instead of grep or rg\n",
-            );
+            s.push_str("   - To search the content of files, use Grep instead of grep or rg\n");
         }
         s.push_str("   - Reserve using the Bash exclusively for system commands and terminal operations that require shell execution.\n");
     }

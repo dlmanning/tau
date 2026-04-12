@@ -203,7 +203,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             || v4.is_link_local()        // 169.254.0.0/16 (includes cloud metadata)
             || v4.is_unspecified()       // 0.0.0.0
             || v4.is_broadcast()         // 255.255.255.255
-            || (o[0] == 100 && (o[1] & 0xC0) == 64)  // 100.64.0.0/10 shared/CGN
+            || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64.0.0/10 shared/CGN
         }
         IpAddr::V6(v6) => {
             // Check IPv4-mapped addresses (::ffff:x.x.x.x) against IPv4 rules
@@ -213,7 +213,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             v6.is_loopback()             // ::1
             || v6.is_unspecified()       // ::
             || (v6.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 link-local
-            || (v6.segments()[0] & 0xfe00) == 0xfc00   // fc00::/7 unique-local
+            || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
         }
     }
 }
@@ -230,7 +230,10 @@ async fn check_host_safety(url_str: &str) -> Result<(), String> {
     // If the host is already an IP literal, check it directly
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_blocked_ip(ip) {
-            return Err(format!("Blocked request to private/internal address: {}", ip));
+            return Err(format!(
+                "Blocked request to private/internal address: {}",
+                ip
+            ));
         }
         return Ok(());
     }
@@ -264,8 +267,12 @@ fn is_same_domain(a: &str, b: &str) -> bool {
     fn strip_www(host: &str) -> &str {
         host.strip_prefix("www.").unwrap_or(host)
     }
-    let host_a = url::Url::parse(a).ok().and_then(|u| u.host_str().map(|h| h.to_string()));
-    let host_b = url::Url::parse(b).ok().and_then(|u| u.host_str().map(|h| h.to_string()));
+    let host_a = url::Url::parse(a)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()));
+    let host_b = url::Url::parse(b)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()));
     match (host_a, host_b) {
         (Some(a), Some(b)) => strip_www(&a) == strip_www(&b),
         _ => false,

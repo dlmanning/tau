@@ -166,7 +166,8 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                         }
                     }
                     // Clamp total width
-                    let total: usize = col_widths.iter().sum::<usize>() + num_cols.saturating_sub(1) * 3;
+                    let total: usize =
+                        col_widths.iter().sum::<usize>() + num_cols.saturating_sub(1) * 3;
                     if total > width {
                         let scale = width as f64 / total as f64;
                         for w in &mut col_widths {

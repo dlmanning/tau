@@ -1,8 +1,5 @@
 use crossterm::event::{Event, MouseEventKind};
-use tau_tui::{
-    input::Action,
-    widgets::message_list::ChatMessage,
-};
+use tau_tui::{input::Action, widgets::message_list::ChatMessage};
 
 use super::constants;
 use super::state::TuiState;
@@ -162,17 +159,17 @@ impl TuiState {
                         if let Some(pi) = self.pending_interaction.take() {
                             let label = pi.options[pi.selector.selected].label.clone();
                             // Oneshot: Err only if receiver dropped, which is fine
-                            let _ = pi.response_tx.send(
-                                tau_agent::InteractionResponse::Answer(label),
-                            );
+                            let _ = pi
+                                .response_tx
+                                .send(tau_agent::InteractionResponse::Answer(label));
                             self.status = "Thinking...".to_string();
                         }
                     }
                     Action::Escape | Action::Interrupt => {
                         if let Some(pi) = self.pending_interaction.take() {
-                            let _ = pi.response_tx.send(
-                                tau_agent::InteractionResponse::Cancelled,
-                            );
+                            let _ = pi
+                                .response_tx
+                                .send(tau_agent::InteractionResponse::Cancelled);
                             self.status = "Thinking...".to_string();
                         }
                     }
@@ -224,19 +221,13 @@ impl TuiState {
 
     /// Handle a terminal event while idle (no prompt executing).
     /// Returns `false` if the TUI should exit.
-    pub async fn handle_event_while_idle(
-        &mut self,
-        event: Event,
-        area_width: u16,
-    ) -> bool {
+    pub async fn handle_event_while_idle(&mut self, event: Event, area_width: u16) -> bool {
         match event {
             Event::Key(key) => {
                 let action = tau_tui::input::key_to_action(key);
                 self.handle_action(action, area_width).await
             }
-            Event::Paste(text) => {
-                self.handle_action(Action::Paste(text), area_width).await
-            }
+            Event::Paste(text) => self.handle_action(Action::Paste(text), area_width).await,
             Event::Mouse(mouse) => {
                 self.handle_mouse_scroll(mouse.kind);
                 true

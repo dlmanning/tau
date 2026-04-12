@@ -151,11 +151,7 @@ impl Tool for BashTool {
         cached_schema!(BashArgs)
     }
 
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
         let args: BashArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
@@ -176,8 +172,7 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(&ctx.cwd);
-        let mut child = match cmd.spawn()
-        {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
         };

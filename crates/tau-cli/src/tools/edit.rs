@@ -58,11 +58,7 @@ impl Tool for EditTool {
         cached_schema!(EditArgs)
     }
 
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
         let args: EditArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
@@ -128,7 +124,10 @@ impl Tool for EditTool {
                 } else {
                     format!(
                         "Successfully replaced text in {}. Changed {} characters to {} characters.\n\nDiff:\n{}",
-                        args.path, args.old_text.len(), args.new_text.len(), diff
+                        args.path,
+                        args.old_text.len(),
+                        args.new_text.len(),
+                        diff
                     )
                 };
                 ToolResult::text(result).with_details(json!({ "diff": diff }))

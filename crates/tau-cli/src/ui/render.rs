@@ -5,9 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
-use tau_tui::widgets::{
-    MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem,
-};
+use tau_tui::widgets::{MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem};
 
 use super::constants;
 use super::state::TuiState;
@@ -97,7 +95,8 @@ impl TuiState {
             .iter()
             .enumerate()
             .map(|(i, msg)| {
-                let preview = crate::utils::truncate_chars(&msg.content, constants::BRANCH_PREVIEW_CHARS);
+                let preview =
+                    crate::utils::truncate_chars(&msg.content, constants::BRANCH_PREVIEW_CHARS);
                 let preview = preview.replace('\n', " ");
                 OwnedSelectorItem {
                     label: format!("{}: [{}] {}", i, msg.role, preview),
@@ -304,14 +303,22 @@ impl TuiState {
         if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
             parts.push(Span::styled(" · ", dim));
             parts.push(Span::styled(
-                format!("{} in, {} out", format_tokens(self.usage.input_tokens), format_tokens(self.usage.output_tokens)),
+                format!(
+                    "{} in, {} out",
+                    format_tokens(self.usage.input_tokens),
+                    format_tokens(self.usage.output_tokens)
+                ),
                 dim,
             ));
 
             if self.usage.cache_read > 0 || self.usage.cache_write > 0 {
                 parts.push(Span::styled(" · ", dim));
                 parts.push(Span::styled(
-                    format!("cache: {}r {}w", format_tokens(self.usage.cache_read), format_tokens(self.usage.cache_write)),
+                    format!(
+                        "cache: {}r {}w",
+                        format_tokens(self.usage.cache_read),
+                        format_tokens(self.usage.cache_write)
+                    ),
                     dim,
                 ));
             }

@@ -48,10 +48,7 @@ mod write;
 
 /// Recursively resolve `$ref` pointers against `$defs` and inline them.
 fn inline_refs(value: &mut serde_json::Value) {
-    let defs = value
-        .as_object()
-        .and_then(|obj| obj.get("$defs"))
-        .cloned();
+    let defs = value.as_object().and_then(|obj| obj.get("$defs")).cloned();
 
     if let Some(defs) = &defs {
         resolve_refs(value, defs);

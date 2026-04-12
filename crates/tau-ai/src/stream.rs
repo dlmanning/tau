@@ -432,10 +432,7 @@ impl StreamAccumulator {
 
     /// Explicitly end a text block.
     pub fn text_end(&mut self, index: usize) -> Vec<MessageEvent> {
-        if let Some(AccBlock::Text {
-            text, ended, ..
-        }) = self.blocks.get_mut(index)
-        {
+        if let Some(AccBlock::Text { text, ended, .. }) = self.blocks.get_mut(index) {
             *ended = true;
             vec![MessageEvent::TextEnd {
                 content_index: index,
@@ -462,10 +459,7 @@ impl StreamAccumulator {
 
     /// Append a thinking delta.
     pub fn thinking_delta(&mut self, index: usize, delta: &str) -> Vec<MessageEvent> {
-        if let Some(AccBlock::Thinking {
-            thinking, ..
-        }) = self.blocks.get_mut(index)
-        {
+        if let Some(AccBlock::Thinking { thinking, .. }) = self.blocks.get_mut(index) {
             thinking.push_str(delta);
             vec![MessageEvent::ThinkingDelta {
                 content_index: index,
@@ -478,10 +472,7 @@ impl StreamAccumulator {
 
     /// Accumulate a signature delta (no events emitted).
     pub fn thinking_signature_delta(&mut self, index: usize, sig_delta: &str) {
-        if let Some(AccBlock::Thinking {
-            signature, ..
-        }) = self.blocks.get_mut(index)
-        {
+        if let Some(AccBlock::Thinking { signature, .. }) = self.blocks.get_mut(index) {
             match signature {
                 Some(s) => s.push_str(sig_delta),
                 None => *signature = Some(sig_delta.to_string()),
@@ -542,10 +533,7 @@ impl StreamAccumulator {
 
     /// Append a tool call arguments delta.
     pub fn tool_call_delta(&mut self, index: usize, delta: &str) -> Vec<MessageEvent> {
-        if let Some(AccBlock::ToolCall {
-            args_json, ..
-        }) = self.blocks.get_mut(index)
-        {
+        if let Some(AccBlock::ToolCall { args_json, .. }) = self.blocks.get_mut(index) {
             args_json.push_str(delta);
             vec![MessageEvent::ToolCallDelta {
                 content_index: index,
@@ -567,8 +555,7 @@ impl StreamAccumulator {
         }) = self.blocks.get_mut(index)
         {
             *ended = true;
-            let arguments =
-                serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+            let arguments = serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
             vec![MessageEvent::ToolCallEnd {
                 content_index: index,
                 id: id.clone(),
@@ -692,9 +679,7 @@ impl StreamAccumulator {
         let mut events = Vec::new();
 
         if let Some(error_msg) = error {
-            events.push(MessageEvent::Error {
-                message: error_msg,
-            });
+            events.push(MessageEvent::Error { message: error_msg });
             return events;
         }
 
@@ -743,8 +728,8 @@ impl StreamAccumulator {
                     started,
                     ended,
                 } => {
-                    let arguments = serde_json::from_str(&args_json)
-                        .unwrap_or(serde_json::Value::Null);
+                    let arguments =
+                        serde_json::from_str(&args_json).unwrap_or(serde_json::Value::Null);
                     if started && !ended {
                         events.push(MessageEvent::ToolCallEnd {
                             content_index: index,

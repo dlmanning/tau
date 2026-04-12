@@ -111,7 +111,9 @@ impl Agent {
             transform_context: None,
             schema_cache: HashMap::new(),
             cwd: None,
-            file_access: Arc::new(parking_lot::Mutex::new(crate::tool::FileAccessTracker::default())),
+            file_access: Arc::new(parking_lot::Mutex::new(
+                crate::tool::FileAccessTracker::default(),
+            )),
             interaction_tx: None,
         }
     }
@@ -392,12 +394,13 @@ impl Agent {
     }
 
     /// Skip remaining tool calls by emitting start/end events and producing error results.
-    fn skip_remaining_tools(
-        &self,
-        tool_calls: &[ToolCall],
-        tool_results: &mut Vec<Message>,
-    ) {
-        for ToolCall { id: skip_id, name: skip_name, .. } in tool_calls {
+    fn skip_remaining_tools(&self, tool_calls: &[ToolCall], tool_results: &mut Vec<Message>) {
+        for ToolCall {
+            id: skip_id,
+            name: skip_name,
+            ..
+        } in tool_calls
+        {
             send_event(
                 &self.event_tx,
                 AgentEvent::ToolExecutionStart {
@@ -517,11 +520,7 @@ impl Agent {
 
     /// Drain steering queue. If non-empty, skip all remaining tool calls
     /// and append the steering messages. Returns true if steered.
-    fn apply_steering(
-        &self,
-        remaining: &[ToolCall],
-        tool_results: &mut Vec<Message>,
-    ) -> bool {
+    fn apply_steering(&self, remaining: &[ToolCall], tool_results: &mut Vec<Message>) -> bool {
         let steering_msgs =
             self.drain_queue(&self.handle.steering_queue, self.config.steering_mode);
         if steering_msgs.is_empty() {
@@ -537,10 +536,7 @@ impl Agent {
     /// Groups consecutive `Parallel` tools together and runs them concurrently
     /// via JoinSet. Sequential tools run one at a time. Steering queue is checked
     /// between groups. Read-before-write guard is applied uniformly.
-    async fn execute_tool_calls(
-        &mut self,
-        tool_calls: Vec<ToolCall>,
-    ) -> Vec<Message> {
+    async fn execute_tool_calls(&mut self, tool_calls: Vec<ToolCall>) -> Vec<Message> {
         use crate::tool::Concurrency;
 
         // Build groups: consecutive Parallel tools form a group, Sequential is singleton.
@@ -586,7 +582,11 @@ impl Agent {
                 // --- Sequential: single tool ---
                 let idx = group[0];
                 let tc = &tool_calls[idx];
-                let tool = self.tools.iter().find(|t| t.name() == tc.name.as_str()).cloned();
+                let tool = self
+                    .tools
+                    .iter()
+                    .find(|t| t.name() == tc.name.as_str())
+                    .cloned();
                 let validator = self.schema_cache.get(tc.name.as_str()).cloned();
 
                 let cancel = self.handle.cancel.lock().clone();
@@ -612,7 +612,10 @@ impl Agent {
                 .await;
 
                 tool_results.push(Message::tool_result(
-                    &tc.id, &tc.name, result.content, result.is_error,
+                    &tc.id,
+                    &tc.name,
+                    result.content,
+                    result.is_error,
                 ));
 
                 if self.apply_steering(&tool_calls[idx + 1..], &mut tool_results) {
@@ -625,7 +628,11 @@ impl Agent {
 
                 for &idx in group {
                     let tc = &tool_calls[idx];
-                    let tool = self.tools.iter().find(|t| t.name() == tc.name.as_str()).cloned();
+                    let tool = self
+                        .tools
+                        .iter()
+                        .find(|t| t.name() == tc.name.as_str())
+                        .cloned();
                     let validator = self.schema_cache.get(tc.name.as_str()).cloned();
                     let event_tx = self.event_tx.clone();
                     let id = tc.id.clone();
@@ -669,7 +676,10 @@ impl Agent {
                         ToolResult::error("Task failed (panicked or cancelled)")
                     });
                     tool_results.push(Message::tool_result(
-                        &tc.id, &tc.name, result.content, result.is_error,
+                        &tc.id,
+                        &tc.name,
+                        result.content,
+                        result.is_error,
                     ));
                 }
 
@@ -745,41 +755,38 @@ impl Agent {
                 let context = self.build_context(&messages);
                 let cancel_token = self.handle.cancel.lock().clone();
 
-                let mut event_stream = match self
-                    .transport
-                    .run(context, run_config, cancel_token)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        let overflow =
-                            e.is_context_overflow() || is_context_overflow(&error_msg);
-                        if overflow
-                            && self
-                                .try_overflow_recovery(
-                                    &error_msg,
-                                    &mut messages,
-                                    &first_user_message,
-                                )
-                                .await
-                        {
-                            *completed_turns = 0;
-                            return StartTurn {
-                                messages,
-                                first_user_message,
-                            };
+                let mut event_stream =
+                    match self.transport.run(context, run_config, cancel_token).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            let overflow =
+                                e.is_context_overflow() || is_context_overflow(&error_msg);
+                            if overflow
+                                && self
+                                    .try_overflow_recovery(
+                                        &error_msg,
+                                        &mut messages,
+                                        &first_user_message,
+                                    )
+                                    .await
+                            {
+                                *completed_turns = 0;
+                                return StartTurn {
+                                    messages,
+                                    first_user_message,
+                                };
+                            }
+                            self.conversation.error = Some(error_msg.clone());
+                            send_event(
+                                &self.event_tx,
+                                AgentEvent::Error {
+                                    message: error_msg.clone(),
+                                },
+                            );
+                            return Done(Err(crate::error::Error::Other(error_msg)));
                         }
-                        self.conversation.error = Some(error_msg.clone());
-                        send_event(
-                            &self.event_tx,
-                            AgentEvent::Error {
-                                message: error_msg.clone(),
-                            },
-                        );
-                        return Done(Err(crate::error::Error::Other(error_msg)));
-                    }
-                };
+                    };
 
                 let outcome = self.process_stream(&mut event_stream).await;
 
@@ -792,11 +799,7 @@ impl Agent {
                         }
                     }
                     if self
-                        .try_overflow_recovery(
-                            &error_message,
-                            &mut messages,
-                            &first_user_message,
-                        )
+                        .try_overflow_recovery(&error_message, &mut messages, &first_user_message)
                         .await
                     {
                         *completed_turns = 0;
@@ -914,11 +917,7 @@ impl Agent {
 
     /// Run a final summary turn with tools disabled (used when max_turns is reached
     /// and the last message has pending tool results).
-    async fn run_final_summary(
-        &mut self,
-        messages: &[Message],
-        run_config: &AgentRunConfig,
-    ) {
+    async fn run_final_summary(&mut self, messages: &[Message], run_config: &AgentRunConfig) {
         let last_has_tool_calls = self
             .conversation
             .messages
@@ -1485,7 +1484,9 @@ mod tests {
         let mut agent = Agent::new(config, transport);
 
         // Queue a follow-up so the agent would normally do 2 turns
-        agent.handle().follow_up(Message::user("follow up question"));
+        agent
+            .handle()
+            .follow_up(Message::user("follow up question"));
 
         agent.prompt("hello").await.unwrap();
 

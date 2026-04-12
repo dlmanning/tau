@@ -84,9 +84,7 @@ pub(crate) async fn cleanup_worktree(info: &WorktreeInfo) -> Result<bool, String
         .await
         .map_err(|e| format!("git ls-files failed: {}", e))?;
 
-    let has_untracked = !String::from_utf8_lossy(&untracked.stdout)
-        .trim()
-        .is_empty();
+    let has_untracked = !String::from_utf8_lossy(&untracked.stdout).trim().is_empty();
 
     if diff.success() && !has_untracked {
         let _ = tokio::process::Command::new("git")

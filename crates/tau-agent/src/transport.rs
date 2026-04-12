@@ -148,10 +148,7 @@ fn format_server_tool_result(api_type: &str, content: &serde_json::Value) -> Str
             return format!("{} results:\n{}", entries.len(), entries.join("\n"));
         }
         // Error response
-        if let Some(error_code) = content
-            .get("error_code")
-            .and_then(|e| e.as_str())
-        {
+        if let Some(error_code) = content.get("error_code").and_then(|e| e.as_str()) {
             return format!("Search error: {}", error_code);
         }
     }
@@ -452,4 +449,3 @@ impl Transport for ProviderTransport {
         Ok(event_stream)
     }
 }
-
