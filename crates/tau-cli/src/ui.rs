@@ -856,9 +856,8 @@ impl TuiState {
             .available_models
             .iter()
             .map(|m| {
-                let label = m.id.split('/').next_back().unwrap_or(&m.id);
                 SelectorItem {
-                    label,
+                    label: &m.name,
                     description: Some(m.provider.name()),
                     is_current: m.id == self.model.id,
                 }
@@ -903,12 +902,7 @@ impl TuiState {
         frame.render_widget(block, area);
 
         if inner.height == 0 || self.messages.is_empty() {
-            let model_name = self
-                .model
-                .id
-                .split('/')
-                .next_back()
-                .unwrap_or(&self.model.id);
+            let model_name = &self.model.name;
             let welcome = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(vec![
@@ -1083,13 +1077,7 @@ impl TuiState {
         parts.push(Span::styled(" · ", dim));
 
         // Model name
-        let model_name = self
-            .model
-            .id
-            .split('/')
-            .next_back()
-            .unwrap_or(&self.model.id);
-        parts.push(Span::styled(model_name, dim));
+        parts.push(Span::styled(&self.model.name, dim));
 
         // Thinking level
         let thinking_str = match self.reasoning {
