@@ -2,15 +2,12 @@
 
 use std::io::{self, Write};
 
-use tau_agent::{Agent, AgentEvent};
-use tau_ai::{Model, ReasoningLevel};
+use tau_agent::{AgentEvent, AgentHandle};
 
 use crate::{cli::get_available_models, commands, run_command::handle_interaction_stdin, session};
 
 pub(crate) async fn run_interactive(
-    agent: &mut Agent,
-    model: &mut Model,
-    reasoning: &mut ReasoningLevel,
+    handle: &AgentHandle,
     mut session: Option<session::SessionManager>,
     interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
 ) -> anyhow::Result<()> {
@@ -18,7 +15,9 @@ pub(crate) async fn run_interactive(
     let _interaction_handle = tokio::spawn(handle_interaction_stdin(interaction_rx));
 
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        let model_short = model.id.split('/').next_back().unwrap_or(&model.id);
+        let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+        let model_id = &config.model.id;
+        let model_short = model_id.split('/').next_back().unwrap_or(model_id);
         if let Some(ref s) = session {
             eprintln!("tau ({}) session: {}", model_short, &s.id()[..8]);
         } else {
@@ -42,12 +41,20 @@ pub(crate) async fn run_interactive(
         }
 
         if input.starts_with('/') {
-            if let Some(result) =
-                commands::execute_command(input, agent, model, *reasoning, &available_models)
-            {
+            let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let messages = handle.messages().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let state = handle.state().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let ctx = commands::CommandContext {
+                args: "",
+                config: &config,
+                messages: &messages,
+                usage: &state.total_usage,
+                available_models: &available_models,
+            };
+            if let Some(result) = commands::execute_command(input, &ctx) {
                 match result {
                     commands::CommandResult::Clear => {
-                        agent.clear_messages();
+                        handle.clear_messages();
                         println!("Cleared conversation.");
                     }
                     commands::CommandResult::Exit => {
@@ -62,13 +69,11 @@ pub(crate) async fn run_interactive(
                             new_model.id,
                             new_model.provider.name()
                         );
-                        *model = new_model.clone();
-                        agent.set_model(new_model);
+                        handle.set_model(new_model);
                     }
                     commands::CommandResult::ChangeReasoning(level) => {
                         println!("Reasoning level set to: {:?}", level);
-                        *reasoning = level;
-                        agent.set_reasoning(level);
+                        handle.set_reasoning(level);
                     }
                     commands::CommandResult::Unknown(cmd) => {
                         println!("Unknown command: /{}", cmd);
@@ -77,11 +82,10 @@ pub(crate) async fn run_interactive(
                     commands::CommandResult::OpenModelSelector => {
                         println!(
                             "{}",
-                            commands::ModelCommand::list_models_text(model, &available_models)
+                            commands::ModelCommand::list_models_text(&config.model, &available_models)
                         );
                     }
                     commands::CommandResult::OpenBranchSelector => {
-                        let messages = agent.messages();
                         if messages.is_empty() {
                             println!("No messages to branch from.");
                         } else {
@@ -103,26 +107,25 @@ pub(crate) async fn run_interactive(
                     }
                     commands::CommandResult::Compact => {
                         println!("Compacting context...");
-                        match agent
-                            .run_compaction(tau_agent::CompactionReason::Manual)
+                        match handle
+                            .compact(tau_agent::CompactionReason::Manual)
                             .await
                         {
-                            Ok(()) => {
-                                println!(
-                                    "Context compacted. {} messages remaining.",
-                                    agent.messages().len()
-                                );
-                            }
-                            Err(e) => {
-                                println!("Compaction failed: {}", e);
-                            }
+                            Ok(rx) => match rx.await {
+                                Ok(r) if r.result.is_ok() => {
+                                    let msg_count = handle.messages().await.map(|m| m.len()).unwrap_or(0);
+                                    println!("Context compacted. {} messages remaining.", msg_count);
+                                }
+                                _ => println!("Compaction failed."),
+                            },
+                            Err(e) => println!("Compaction failed: {}", e),
                         }
                     }
                     commands::CommandResult::BranchFrom(branch_index) => {
                         match session::SessionManager::branch_from(
-                            agent.messages(),
+                            &messages,
                             branch_index,
-                            &model.id,
+                            &config.model.id,
                         ) {
                             Ok(new_session) => {
                                 let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
@@ -132,11 +135,11 @@ pub(crate) async fn run_interactive(
                                     msg_count
                                 );
                                 if let Some(idx) = branch_index {
-                                    let messages: Vec<_> =
-                                        agent.messages().iter().take(idx + 1).cloned().collect();
-                                    agent.set_messages(messages);
+                                    let truncated: Vec<_> =
+                                        messages.iter().take(idx + 1).cloned().collect();
+                                    handle.set_messages(truncated);
                                 } else {
-                                    agent.clear_messages();
+                                    handle.clear_messages();
                                 }
                                 session = Some(new_session);
                                 println!("Continue from this point with a fresh context.");
@@ -154,11 +157,11 @@ pub(crate) async fn run_interactive(
 
         println!();
 
-        let mut receiver = agent.subscribe();
-        let model_for_cost = model.clone();
+        let mut receiver = handle.subscribe();
+        let model_for_cost = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?.model.clone();
 
         let is_tty = std::io::IsTerminal::is_terminal(&io::stdout());
-        let handle = tokio::spawn(async move {
+        let event_handle = tokio::spawn(async move {
             let mut last_text_len = 0;
             while let Ok(event) = receiver.recv().await {
                 match event {
@@ -241,22 +244,22 @@ pub(crate) async fn run_interactive(
             }
         });
 
-        // Track message count before prompt to save new messages after
-        let msgs_before = agent.messages().len();
+        let msgs_before = handle.messages().await.map(|m| m.len()).unwrap_or(0);
 
-        if let Err(e) = agent.prompt(input).await {
+        if let Err(e) = handle.prompt_and_wait(input).await {
             eprintln!("Error: {}", e);
         }
 
         if let Some(ref mut s) = session {
-            let all_msgs = agent.messages();
+            let all_msgs = handle.messages().await.unwrap_or_default();
             for msg in all_msgs.iter().skip(msgs_before) {
                 let _ = s.append_message(msg);
             }
-            let _ = s.append_usage(&agent.state().total_usage);
+            let state = handle.state().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let _ = s.append_usage(&state.total_usage);
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), event_handle).await {
             Ok(_) => {}
             Err(_) => tracing::debug!("Event handler did not finish in time"),
         }

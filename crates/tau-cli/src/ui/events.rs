@@ -1,5 +1,5 @@
 use crossterm::event::{Event, MouseEventKind};
-use tau_tui::{input::Action, widgets::message_list::ChatMessage};
+use super::{input::Action, widgets::message_list::ChatMessage};
 
 use super::constants;
 use super::state::TuiState;
@@ -143,7 +143,7 @@ impl TuiState {
     ) -> bool {
         match event {
             Event::Key(key) if self.pending_interaction.is_some() => {
-                let action = tau_tui::input::key_to_action(key);
+                let action = super::input::key_to_action(key);
                 match action {
                     Action::Up => {
                         if let Some(pi) = self.pending_interaction.as_mut() {
@@ -178,7 +178,7 @@ impl TuiState {
                 true
             }
             Event::Key(key) => {
-                let action = tau_tui::input::key_to_action(key);
+                let action = super::input::key_to_action(key);
                 match action {
                     Action::Interrupt | Action::Escape => {
                         agent_handle.abort();
@@ -224,7 +224,7 @@ impl TuiState {
     pub async fn handle_event_while_idle(&mut self, event: Event, area_width: u16) -> bool {
         match event {
             Event::Key(key) => {
-                let action = tau_tui::input::key_to_action(key);
+                let action = super::input::key_to_action(key);
                 self.handle_action(action, area_width).await
             }
             Event::Paste(text) => self.handle_action(Action::Paste(text), area_width).await,

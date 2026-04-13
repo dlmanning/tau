@@ -1,0 +1,31 @@
+[package]
+name = "tau-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Built-in tools for the tau coding agent"
+
+[dependencies]
+tau-ai = { workspace = true }
+tau-agent = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+regex = { workspace = true }
+similar = { workspace = true }
+ignore = { workspace = true }
+glob = { workspace = true }
+htmd = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }

@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/tau-ai",
     "crates/tau-agent",
-    "crates/tau-tui",
+    "crates/tau-tools",
     "crates/tau-cli",
     "xtask",
 ]
@@ -64,4 +64,4 @@ parking_lot = "0.12"
 # Internal crates
 tau-ai = { path = "crates/tau-ai" }
 tau-agent = { path = "crates/tau-agent" }
-tau-tui = { path = "crates/tau-tui" }
+tau-tools = { path = "crates/tau-tools" }

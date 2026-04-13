@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 tau-ai = { workspace = true }
 tau-agent = { workspace = true }
-tau-tui = { workspace = true }
+tau-tools = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -49,3 +49,6 @@ getrandom = "0.4"
 urlencoding = "2.1"
 htmd = { workspace = true }
 url = { workspace = true }
+unicode-width = "0.2"
+textwrap = "0.16"
+pulldown-cmark = { version = "0.13.3", default-features = false }

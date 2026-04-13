@@ -7,8 +7,8 @@ read PLAN.md to understand the project status, then ask what they'd like to work
 ## Project Structure
 - `crates/tau-ai/` - Core AI types and provider implementations (Anthropic, OpenAI, Google)
 - `crates/tau-agent/` - Agent loop, tool execution, events
-- `crates/tau-cli/` - CLI application with all tools
-- `crates/tau-tui/` - TUI widgets (ratatui-based)
+- `crates/tau-tools/` - Built-in tool implementations (bash, read, write, grep, etc.)
+- `crates/tau-cli/` - CLI application with TUI and LSP integration
 
 ## Code Quality
 - Use idiomatic Rust - prefer `Result` and `Option` over panics

@@ -1,92 +1,138 @@
-//! A cloneable handle for poking the agent from external code.
+//! Channel-based handle for interacting with a running agent.
+//!
+//! `AgentHandle` is `Clone + Send + Sync`. All methods take `&self`.
+//! Fire-and-forget methods use `try_send`. Abort cancels the shared
+//! `CancellationToken` inside `Arc<Mutex<>>`.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tau_ai::Message;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// A cloneable handle for poking the agent from external code.
-///
-/// All fields are `Arc`-wrapped, so cloning is cheap.
+use crate::command::{Command, PromptResult};
+use crate::compaction::{CompactionConfig, CompactionReason};
+use crate::config::AgentConfig;
+use crate::conversation::Conversation;
+use crate::events::AgentEvent;
+
+/// Cloneable handle to a running agent. All methods take `&self`.
+/// This is the only way external code interacts with the agent.
 #[derive(Clone)]
 pub struct AgentHandle {
+    pub(crate) cmd_tx: mpsc::Sender<Command>,
+    pub(crate) event_tx: broadcast::Sender<AgentEvent>,
+    /// Shared with actor. The actor replaces the inner token at each prompt start.
+    /// `abort()` cancels the current token. `Arc<Mutex<>>` ensures the handle
+    /// always cancels whichever token the actor is currently using.
     pub(crate) cancel: Arc<Mutex<CancellationToken>>,
-    pub(crate) steering_queue: Arc<Mutex<Vec<Message>>>,
-    pub(crate) follow_up_queue: Arc<Mutex<Vec<Message>>>,
-    pub(crate) follow_up_notify: Arc<tokio::sync::Notify>,
-    pub(crate) idle_notify: Arc<tokio::sync::Notify>,
     pub(crate) is_running: Arc<AtomicBool>,
-    /// Number of background agents that have been spawned but haven't
-    /// posted their follow-up yet.
     pub(crate) pending_follow_ups: Arc<AtomicU32>,
 }
 
 impl AgentHandle {
-    pub(crate) fn new() -> Self {
-        Self {
-            cancel: Arc::new(Mutex::new(CancellationToken::new())),
-            steering_queue: Arc::new(Mutex::new(Vec::new())),
-            follow_up_queue: Arc::new(Mutex::new(Vec::new())),
-            follow_up_notify: Arc::new(tokio::sync::Notify::new()),
-            idle_notify: Arc::new(tokio::sync::Notify::new()),
-            is_running: Arc::new(AtomicBool::new(false)),
-            pending_follow_ups: Arc::new(AtomicU32::new(0)),
+    /// Send a prompt. Returns a oneshot receiver for the completion result.
+    pub async fn prompt(&self, input: &str) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
+        let content = vec![tau_ai::Content::text(input)];
+        self.prompt_with_content(content).await
+    }
+
+    /// Send a prompt with structured content blocks.
+    pub async fn prompt_with_content(
+        &self,
+        content: Vec<tau_ai::Content>,
+    ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Prompt {
+                content,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| crate::error::Error::Other("Agent task has shut down".into()))?;
+        Ok(reply_rx)
+    }
+
+    /// Convenience: send prompt and block until completion.
+    pub async fn prompt_and_wait(&self, input: &str) -> crate::error::Result<()> {
+        let rx = self.prompt(input).await?;
+        match rx.await {
+            Ok(result) => result.result,
+            Err(_) => Err(crate::error::Error::Other(
+                "Agent task dropped without responding".into(),
+            )),
         }
     }
 
-    /// Abort the current operation.
+    /// Subscribe to the event stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Get the event sender (for AgentManager event forwarding).
+    pub fn event_sender(&self) -> broadcast::Sender<AgentEvent> {
+        self.event_tx.clone()
+    }
+
+    // === Fire-and-forget mutations ===
+
+    pub fn steer(&self, message: tau_ai::Message) {
+        let _ = self.cmd_tx.try_send(Command::Steer(message));
+    }
+
+    pub fn follow_up(&self, message: tau_ai::Message) {
+        let _ = self.cmd_tx.try_send(Command::FollowUp(message));
+    }
+
+    pub fn set_model(&self, model: tau_ai::Model) {
+        let _ = self.cmd_tx.try_send(Command::SetModel(model));
+    }
+
+    pub fn set_reasoning(&self, level: tau_ai::ReasoningLevel) {
+        let _ = self.cmd_tx.try_send(Command::SetReasoning(level));
+    }
+
+    pub fn set_system_prompt(&self, prompt: String) {
+        let _ = self.cmd_tx.try_send(Command::SetSystemPrompt(prompt));
+    }
+
+    pub fn set_compaction_config(&self, config: CompactionConfig) {
+        let _ = self.cmd_tx.try_send(Command::SetCompactionConfig(config));
+    }
+
+    pub fn clear_messages(&self) {
+        let _ = self.cmd_tx.try_send(Command::ClearMessages);
+    }
+
+    pub fn set_messages(&self, messages: Vec<tau_ai::Message>) {
+        let _ = self.cmd_tx.try_send(Command::SetMessages(messages));
+    }
+
+    pub fn set_previous_summary(&self, summary: Option<String>) {
+        let _ = self.cmd_tx.try_send(Command::SetPreviousSummary(summary));
+    }
+
+    // === Abort ===
+
+    /// Abort the current operation. Cancels the current token inside the
+    /// shared `Arc<Mutex<>>`. The actor replaces the token at each prompt start,
+    /// so this always targets the active prompt.
     pub fn abort(&self) {
         self.cancel.lock().cancel();
     }
 
-    /// Get the cancellation token (for external callers that need direct access).
+    /// Get a clone of the shared cancel token container.
     pub fn cancel_token(&self) -> Arc<Mutex<CancellationToken>> {
-        Arc::clone(&self.cancel)
+        self.cancel.clone()
     }
 
-    /// Maximum number of messages in each queue.
-    const MAX_QUEUE_SIZE: usize = 100;
+    // === Background follow-up tracking ===
 
-    /// Enqueue a steering message that interrupts after the current tool completes.
-    pub fn steer(&self, message: Message) {
-        let mut q = self.steering_queue.lock();
-        if q.len() >= Self::MAX_QUEUE_SIZE {
-            tracing::warn!(
-                "Steering queue full ({} messages), dropping oldest",
-                Self::MAX_QUEUE_SIZE
-            );
-            q.remove(0);
-        }
-        q.push(message);
-    }
-
-    /// Enqueue a follow-up message consumed after the loop finishes.
-    pub fn follow_up(&self, message: Message) {
-        let mut q = self.follow_up_queue.lock();
-        if q.len() >= Self::MAX_QUEUE_SIZE {
-            tracing::warn!(
-                "Follow-up queue full ({} messages), dropping oldest",
-                Self::MAX_QUEUE_SIZE
-            );
-            q.remove(0);
-        }
-        q.push(message);
-        drop(q);
-        self.follow_up_notify.notify_one();
-    }
-
-    /// Record that a background agent was spawned and its follow-up is expected.
     pub fn expect_follow_up(&self) {
         self.pending_follow_ups.fetch_add(1, Ordering::Release);
     }
 
-    /// Record that an expected follow-up was consumed.
-    /// Only decrements if the counter is positive (follow-ups posted
-    /// without a prior `expect_follow_up` are ignored).
     pub fn consume_follow_up(&self) {
         let _ = self
             .pending_follow_ups
@@ -95,38 +141,48 @@ impl AgentHandle {
             });
     }
 
-    /// Whether there are background agents that haven't posted their follow-up yet.
     pub fn has_pending_follow_ups(&self) -> bool {
         self.pending_follow_ups.load(Ordering::Acquire) > 0
     }
 
-    /// Wait until a follow-up message is posted.
-    pub async fn wait_for_follow_up(&self) {
-        self.follow_up_notify.notified().await;
+    // === Request-reply queries ===
+
+    pub async fn config(&self) -> Option<AgentConfig> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::GetConfig(tx)).await.ok()?;
+        rx.await.ok()
     }
 
-    /// Wait until the agent loop becomes idle (finishes running).
-    ///
-    /// The ordering here is intentional and not a TOCTOU race: `notified()` registers
-    /// the waiter *before* checking `is_running`, so if the agent finishes between
-    /// registration and the check, the notification is already captured by the future.
-    pub async fn wait_for_idle(&self) {
-        let notified = self.idle_notify.notified();
-        if !self.is_running.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
+    pub async fn messages(&self) -> Option<Vec<tau_ai::Message>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::GetMessages(tx)).await.ok()?;
+        rx.await.ok()
     }
 
-    /// Wait until the agent loop becomes idle, with a timeout.
-    /// Returns `true` if idle was reached, `false` on timeout.
-    pub async fn wait_for_idle_timeout(&self, timeout: std::time::Duration) -> bool {
-        tokio::time::timeout(timeout, self.wait_for_idle())
+    pub async fn state(&self) -> Option<Conversation> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::GetState(tx)).await.ok()?;
+        rx.await.ok()
+    }
+
+    // === Compaction ===
+
+    pub async fn compact(
+        &self,
+        reason: CompactionReason,
+    ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Compact {
+                reason,
+                reply: reply_tx,
+            })
             .await
-            .is_ok()
+            .map_err(|_| crate::error::Error::Other("Agent task has shut down".into()))?;
+        Ok(reply_rx)
     }
 
-    /// Whether the agent loop is currently running.
+    /// Whether the agent is currently executing a prompt.
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
     }

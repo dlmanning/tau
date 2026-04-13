@@ -5,12 +5,18 @@ mod model;
 mod session;
 mod thinking;
 
-pub use branch::BranchCommand;
 pub use model::ModelCommand;
-pub use session::SessionCommand;
-use tau_agent::Agent;
-use tau_ai::{Model, ReasoningLevel};
-pub use thinking::ThinkingCommand;
+use tau_agent::AgentConfig;
+use tau_ai::{Message, Model, ReasoningLevel};
+
+/// Context passed to every command — uses pre-fetched snapshots from the handle.
+pub struct CommandContext<'a> {
+    pub args: &'a str,
+    pub config: &'a AgentConfig,
+    pub messages: &'a [Message],
+    pub usage: &'a tau_ai::Usage,
+    pub available_models: &'a [Model],
+}
 
 /// Result of executing a slash command
 pub enum CommandResult {
@@ -36,14 +42,38 @@ pub enum CommandResult {
     Compact,
 }
 
+/// Trait for slash commands
+pub trait Command {
+    /// Primary name (e.g. "model")
+    fn name(&self) -> &str;
+
+    /// Aliases (e.g. &["m"]). Default: none.
+    fn aliases(&self) -> &[&str] {
+        &[]
+    }
+
+    /// One-line description for /help
+    fn description(&self) -> &str;
+
+    /// Execute the command
+    fn execute(&self, ctx: &CommandContext) -> CommandResult;
+}
+
+fn all_commands() -> Vec<Box<dyn Command>> {
+    vec![
+        Box::new(HelpCommand),
+        Box::new(ClearCommand),
+        Box::new(ExitCommand),
+        Box::new(model::ModelCommand),
+        Box::new(thinking::ThinkingCommand),
+        Box::new(session::SessionCommand),
+        Box::new(branch::BranchCommand),
+        Box::new(CompactCommand),
+    ]
+}
+
 /// Parse and execute a slash command
-pub fn execute_command(
-    input: &str,
-    agent: &Agent,
-    current_model: &Model,
-    current_reasoning: ReasoningLevel,
-    available_models: &[Model],
-) -> Option<CommandResult> {
+pub fn execute_command(input: &str, ctx: &CommandContext) -> Option<CommandResult> {
     let input = input.trim();
 
     if !input.starts_with('/') {
@@ -51,47 +81,100 @@ pub fn execute_command(
     }
 
     let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
-    let command = parts[0].to_lowercase();
+    let cmd_name = parts[0].to_lowercase();
     let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
-    Some(match command.as_str() {
-        "help" | "h" | "?" => CommandResult::Message(help_message()),
+    let ctx = CommandContext { args, ..*ctx };
 
-        "clear" | "c" => CommandResult::Clear,
+    let commands = all_commands();
+    let matched = commands
+        .iter()
+        .find(|c| c.name() == cmd_name || c.aliases().contains(&cmd_name.as_str()));
 
-        "quit" | "exit" | "q" => CommandResult::Exit,
-
-        "model" | "m" => ModelCommand::execute(args, current_model, available_models),
-
-        "thinking" | "t" => ThinkingCommand::execute(args, current_reasoning),
-
-        "session" | "s" => SessionCommand::execute(agent, current_model, current_reasoning),
-
-        "branch" | "b" => BranchCommand::execute(args, agent),
-
-        "compact" => CommandResult::Compact,
-
-        _ => CommandResult::Unknown(command),
+    Some(match matched {
+        Some(cmd) => cmd.execute(&ctx),
+        None => CommandResult::Unknown(cmd_name),
     })
 }
 
-fn help_message() -> String {
-    r#"Available commands:
-  /help, /h, /?        Show this help message
-  /model, /m [name]    List models or switch to a model
-  /thinking, /t [lvl]  Show or set reasoning level (off/minimal/low/medium/high)
-  /session, /s         Show session info and token usage
-  /branch, /b [index]  Branch conversation from a message (opens selector if no index)
-  /compact             Compact context by summarizing old messages
-  /clear, /c           Clear conversation history
-  /quit, /exit, /q     Exit tau
+// --- Simple commands inlined here ---
 
-Examples:
-  /model               List available models
-  /model sonnet        Switch to first model matching "sonnet"
-  /thinking medium     Set reasoning to medium
-  /branch              Open message selector to branch from
-  /branch 3            Branch from message at index 3
-  /clear               Start fresh conversation"#
-        .to_string()
+struct HelpCommand;
+
+impl Command for HelpCommand {
+    fn name(&self) -> &str {
+        "help"
+    }
+    fn aliases(&self) -> &[&str] {
+        &["h", "?"]
+    }
+    fn description(&self) -> &str {
+        "Show available commands"
+    }
+    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
+        let commands = all_commands();
+        let mut output = String::from("Available commands:\n");
+        for cmd in &commands {
+            let aliases = cmd.aliases();
+            let names = if aliases.is_empty() {
+                format!("/{}", cmd.name())
+            } else {
+                let all: Vec<String> = std::iter::once(cmd.name())
+                    .chain(aliases.iter().copied())
+                    .map(|n| format!("/{}", n))
+                    .collect();
+                all.join(", ")
+            };
+            output.push_str(&format!("  {:<24} {}\n", names, cmd.description()));
+        }
+        CommandResult::Message(output)
+    }
+}
+
+struct ClearCommand;
+
+impl Command for ClearCommand {
+    fn name(&self) -> &str {
+        "clear"
+    }
+    fn aliases(&self) -> &[&str] {
+        &["c"]
+    }
+    fn description(&self) -> &str {
+        "Clear conversation history"
+    }
+    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
+        CommandResult::Clear
+    }
+}
+
+struct ExitCommand;
+
+impl Command for ExitCommand {
+    fn name(&self) -> &str {
+        "quit"
+    }
+    fn aliases(&self) -> &[&str] {
+        &["exit", "q"]
+    }
+    fn description(&self) -> &str {
+        "Exit tau"
+    }
+    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
+        CommandResult::Exit
+    }
+}
+
+struct CompactCommand;
+
+impl Command for CompactCommand {
+    fn name(&self) -> &str {
+        "compact"
+    }
+    fn description(&self) -> &str {
+        "Compact context by summarizing old messages"
+    }
+    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
+        CommandResult::Compact
+    }
 }

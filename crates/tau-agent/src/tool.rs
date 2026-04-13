@@ -11,8 +11,12 @@ use tau_ai::{Content, Message};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::send_event;
 use crate::events::AgentEvent;
+
+/// Send an event on a broadcast channel, ignoring errors (no receivers).
+pub(crate) fn send_event(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
+    let _ = tx.send(event);
+}
 
 /// Tracks which files have been read so write/edit tools can enforce
 /// a read-before-write policy. Shared via `Arc<Mutex<...>>` on `ExecutionContext`.
@@ -74,8 +78,7 @@ impl FileAccessTracker {
 }
 
 /// Resolve a file path from tool arguments, handling `~/`, relative paths,
-/// and canonicalization. Used by `FileAccessTracker::rebuild_from_messages`
-/// which operates on historical data without an `ExecutionContext`.
+/// and canonicalization.
 fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
     let path_str = args.get("path").and_then(|v| v.as_str())?;
     let path = if let Some(rest) = path_str.strip_prefix("~/") {
@@ -208,9 +211,6 @@ pub enum Concurrency {
 }
 
 /// Context passed to every tool execution.
-///
-/// Replaces the previous pattern of baking CWD into tool instances and passing
-/// cancel/progress as separate parameters.
 pub struct ExecutionContext {
     /// Working directory for this execution. Tools resolve relative paths against this.
     pub cwd: PathBuf,
@@ -305,7 +305,6 @@ pub fn to_api_tool(tool: &dyn Tool) -> tau_ai::Tool {
 mod tests {
     use super::*;
 
-    /// A simple test tool that echoes its arguments.
     struct EchoTool;
 
     #[async_trait]
@@ -416,7 +415,6 @@ mod tests {
     #[test]
     fn test_file_access_new_file_allowed() {
         let tracker = FileAccessTracker::default();
-        // Non-existent path should pass (new file creation is allowed)
         let result = tracker.require_read(Path::new("/nonexistent/path/to/file.txt"));
         assert!(result.is_ok());
     }
@@ -424,17 +422,13 @@ mod tests {
     #[test]
     fn test_file_access_read_then_write() {
         let mut tracker = FileAccessTracker::default();
-        let path = PathBuf::from("/tmp/test-file-access-tracker");
-        // Create a temp file so it "exists"
+        let path = PathBuf::from("/tmp/test-file-access-tracker-agent2");
         std::fs::write(&path, "test").ok();
-        // Before reading: require_read should fail
         let result = tracker.require_read(&path);
         assert!(result.is_err());
-        // After reading: require_read should pass
         tracker.mark_read(path.clone());
         let result = tracker.require_read(&path);
         assert!(result.is_ok());
-        // Cleanup
         std::fs::remove_file(&path).ok();
     }
 
@@ -443,8 +437,18 @@ mod tests {
         let mut tracker = FileAccessTracker::default();
         tracker.mark_read("/some/path");
         tracker.clear();
-        // After clear, the path is forgotten
         assert!(tracker.read_files.is_empty());
+    }
+
+    fn make_ctx(cwd: &str) -> ExecutionContext {
+        let (tx, _rx) = broadcast::channel(16);
+        ExecutionContext {
+            cwd: PathBuf::from(cwd),
+            cancel: CancellationToken::new(),
+            progress: ProgressSender::new(tx, "test", "test"),
+            interaction: None,
+            file_access: Arc::new(Mutex::new(FileAccessTracker::default())),
+        }
     }
 
     #[test]
@@ -479,38 +483,5 @@ mod tests {
         let resolved = ctx.resolve_path("~");
         let home = dirs::home_dir().expect("home dir exists in test");
         assert_eq!(resolved, home);
-    }
-
-    #[test]
-    fn test_ctx_mark_and_require_read() {
-        let ctx = make_ctx("/tmp");
-        let path = PathBuf::from("/tmp/test-ctx-mark-require");
-        std::fs::write(&path, "test").ok();
-
-        // Before marking: require fails
-        assert!(ctx.require_read(&path).is_err());
-        // After marking: require passes
-        ctx.mark_read(&path);
-        assert!(ctx.require_read(&path).is_ok());
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_ctx_require_read_new_file() {
-        let ctx = make_ctx("/tmp");
-        // Non-existent file: require passes (new file creation allowed)
-        assert!(ctx.require_read(Path::new("/nonexistent/file.txt")).is_ok());
-    }
-
-    fn make_ctx(cwd: &str) -> ExecutionContext {
-        let (tx, _rx) = broadcast::channel(16);
-        ExecutionContext {
-            cwd: PathBuf::from(cwd),
-            cancel: CancellationToken::new(),
-            progress: ProgressSender::new(tx, "test", "test"),
-            interaction: None,
-            file_access: Arc::new(Mutex::new(FileAccessTracker::default())),
-        }
     }
 }

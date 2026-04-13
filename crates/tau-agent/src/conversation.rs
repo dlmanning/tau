@@ -3,7 +3,7 @@
 use tau_ai::{Message, Usage};
 
 /// Conversation state: messages, usage, streaming, and compaction history.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Conversation {
     /// Conversation messages
     pub messages: Vec<Message>,
@@ -16,6 +16,3 @@ pub struct Conversation {
     /// Previous compaction summary (for iterative compaction)
     pub previous_summary: Option<String>,
 }
-
-/// Backward-compatible alias.
-pub type AgentState = Conversation;

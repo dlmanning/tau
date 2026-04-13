@@ -161,8 +161,8 @@ tau/
 ├── crates/
 │   ├── tau-ai/        # AI provider implementations (Anthropic, OpenAI, Google)
 │   ├── tau-agent/     # Agent loop, tool execution, transport, compaction
-│   ├── tau-tui/       # TUI widgets (ratatui)
-│   └── tau-cli/       # CLI application, tools, LSP client, config
+│   ├── tau-tools/     # Built-in tool implementations
+│   └── tau-cli/       # CLI application, TUI, LSP client, config
 └── Cargo.toml         # Workspace configuration
 ```
 

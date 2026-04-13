@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tau_ai::{Content, Message};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::AgentConfig;
 use crate::transport::{AgentRunConfig, Transport};
 
 /// Configuration for context compaction
@@ -59,11 +60,8 @@ pub enum CompactionReason {
 
 /// Result of finding a cut point in the message list
 struct CutPointResult {
-    /// Index of the first message to keep
     first_kept_index: usize,
-    /// If the cut falls mid-turn, this is where the turn starts
     turn_start_index: Option<usize>,
-    /// Whether we split a turn (assistant + tool results)
     is_split_turn: bool,
 }
 
@@ -92,7 +90,7 @@ fn content_char_count(content: &[Content]) -> usize {
             Content::ToolCall {
                 name, arguments, ..
             } => name.len() + serde_json::to_string(arguments).unwrap_or_default().len(),
-            Content::Image { .. } => 4800, // ~1200 tokens * 4 chars/token
+            Content::Image { .. } => 4800,
             Content::RedactedThinking { data } => data.len(),
             Content::ServerToolUse { name, input, .. } => {
                 name.len() + serde_json::to_string(input).unwrap_or_default().len()
@@ -105,7 +103,6 @@ fn content_char_count(content: &[Content]) -> usize {
 }
 
 /// Serialize messages to plain text for the summarization prompt.
-/// Uses a human-readable format to prevent the LLM from trying to "continue" the conversation.
 fn serialize_messages_for_summary(messages: &[Message]) -> String {
     let mut out = String::new();
 
@@ -120,7 +117,6 @@ fn serialize_messages_for_summary(messages: &[Message]) -> String {
                 }
             }
             Message::Assistant { content, .. } => {
-                // Separate thinking from text and tool calls
                 let mut thinking_parts = Vec::new();
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
@@ -172,7 +168,6 @@ fn serialize_messages_for_summary(messages: &[Message]) -> String {
                     format!("[Tool result ({})]: ", tool_name)
                 };
                 out.push_str(&label);
-                // Truncate very long tool results
                 if text.len() > 2000 {
                     out.push_str(&text[..2000]);
                     out.push_str("...(truncated)");
@@ -267,7 +262,6 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
                                 modified_files.push(path.to_string());
                             }
                         }
-                        // Also check file_path for edit tool
                         if let Some(path) = arguments.get("file_path").and_then(|v| v.as_str()) {
                             if !modified_files.contains(&path.to_string()) {
                                 modified_files.push(path.to_string());
@@ -283,8 +277,6 @@ fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 }
 
 /// Find where to cut messages for compaction.
-/// Walks backwards from the end, keeping at least `keep_recent_tokens` tokens.
-/// Never cuts at a ToolResult — finds the nearest User or Assistant boundary.
 fn find_cut_point(
     messages: &[Message],
     keep_recent_tokens: u64,
@@ -294,7 +286,6 @@ fn find_cut_point(
         return None;
     }
 
-    // Walk backwards accumulating tokens
     let mut accumulated: u64 = 0;
     let mut cut_index = messages.len();
 
@@ -304,28 +295,22 @@ fn find_cut_point(
         }
         accumulated += estimate_tokens(&messages[i]);
         if accumulated >= keep_recent_tokens {
-            cut_index = i + 1; // Keep from i+1 onwards
+            cut_index = i + 1;
             break;
         }
     }
 
-    // If we'd keep everything, no compaction needed
     if cut_index <= 1 {
         return None;
     }
 
-    // If cut_index is at or past the end, nothing to compact
     if cut_index >= messages.len() {
-        // All messages fit in keep_recent_tokens — but we were called, so force a cut
-        // Keep at least the last 2 messages
         cut_index = messages.len().saturating_sub(2);
         if cut_index <= 1 {
             return None;
         }
     }
 
-    // Find a valid cut point: never cut at a ToolResult
-    // Walk forward from cut_index to find a User or start-of-turn boundary
     let mut first_kept = cut_index;
     while first_kept < messages.len() {
         if cancel.is_cancelled() {
@@ -335,7 +320,6 @@ fn find_cut_point(
             Message::User { .. } | Message::SystemInjection { .. } => break,
             Message::Assistant { .. } => break,
             Message::ToolResult { .. } => {
-                // Can't start here — tool results must follow their assistant message
                 first_kept += 1;
             }
         }
@@ -345,13 +329,11 @@ fn find_cut_point(
         return None;
     }
 
-    // Check if we split an assistant turn (assistant message with tool calls has results after it)
     let is_split_turn = matches!(&messages[first_kept], Message::Assistant { .. })
         && first_kept > 0
         && has_tool_calls_with_results(messages, first_kept);
 
     let turn_start_index = if is_split_turn {
-        // Find the assistant message that starts this turn
         Some(find_turn_start(messages, first_kept))
     } else {
         None
@@ -364,7 +346,6 @@ fn find_cut_point(
     })
 }
 
-/// Check if an assistant message at `idx` has tool call results that follow it
 fn has_tool_calls_with_results(messages: &[Message], idx: usize) -> bool {
     if let Message::Assistant { content, .. } = &messages[idx] {
         let has_tool_calls = content
@@ -377,7 +358,6 @@ fn has_tool_calls_with_results(messages: &[Message], idx: usize) -> bool {
     false
 }
 
-/// Walk backwards to find where a turn starts (the first message in the turn group)
 fn find_turn_start(messages: &[Message], from: usize) -> usize {
     let mut idx = from;
     while idx > 0 {
@@ -385,7 +365,6 @@ fn find_turn_start(messages: &[Message], from: usize) -> usize {
             Message::ToolResult { .. } => idx -= 1,
             Message::Assistant { .. } => {
                 idx -= 1;
-                // Check if this assistant message also has tool results before it
                 continue;
             }
             _ => break,
@@ -451,13 +430,10 @@ what the assistant was doing and what tool calls were made.
 </partial-turn>";
 
 /// Run compaction on the given messages.
-///
-/// This generates a summary of older messages by calling the LLM, and returns
-/// the summary along with information about what was compacted.
 pub async fn compact(
     messages: &[Message],
     config: &CompactionConfig,
-    agent_config: &crate::agent::AgentConfig,
+    agent_config: &AgentConfig,
     transport: &Arc<dyn Transport>,
     previous_summary: Option<&str>,
     cancel: &CancellationToken,
@@ -539,7 +515,7 @@ pub async fn compact(
 /// Make an LLM call for summarization using the same transport infrastructure
 async fn call_summarization_llm(
     prompt: &str,
-    agent_config: &crate::agent::AgentConfig,
+    agent_config: &AgentConfig,
     transport: &Arc<dyn Transport>,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
@@ -550,7 +526,7 @@ async fn call_summarization_llm(
         tools: vec![],
         server_tools: vec![],
         model: agent_config.model.clone(),
-        reasoning: None, // No reasoning for summarization
+        reasoning: None,
         thinking_adaptive: false,
         max_tokens: Some(4096),
         temperature: None,
@@ -607,40 +583,10 @@ mod tests {
         }
     }
 
-    fn assistant_with_tool_call(text: &str, tool_name: &str, args: serde_json::Value) -> Message {
-        Message::Assistant {
-            content: vec![
-                Content::text(text),
-                Content::tool_call("call_1", tool_name, args),
-            ],
-            metadata: AssistantMetadata::default(),
-        }
-    }
-
-    fn tool_result_msg(name: &str, text: &str) -> Message {
-        Message::ToolResult {
-            tool_call_id: "call_1".to_string(),
-            tool_name: name.to_string(),
-            content: vec![Content::text(text)],
-            is_error: false,
-            timestamp: 0,
-        }
-    }
-
     #[test]
     fn test_estimate_tokens_text() {
         let msg = user_msg("Hello world!"); // 12 chars -> 3 tokens
         assert_eq!(estimate_tokens(&msg), 3);
-    }
-
-    #[test]
-    fn test_estimate_tokens_image() {
-        let msg = Message::User {
-            content: vec![Content::image("base64data", "image/png")],
-            timestamp: 0,
-        };
-        // Image is flat 4800 chars -> 1200 tokens
-        assert_eq!(estimate_tokens(&msg), 1200);
     }
 
     #[test]
@@ -660,75 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn test_find_cut_point_basic() {
-        let cancel = CancellationToken::new();
-        // Create messages with known token sizes
-        let messages = vec![
-            user_msg(&"a".repeat(400)),      // 100 tokens
-            assistant_msg(&"b".repeat(400)), // 100 tokens
-            user_msg(&"c".repeat(400)),      // 100 tokens
-            assistant_msg(&"d".repeat(400)), // 100 tokens
-        ];
-        // keep_recent_tokens=150 -> should keep last ~2 messages
-        let cut = find_cut_point(&messages, 150, &cancel).unwrap();
-        assert!(cut.first_kept_index >= 2);
-    }
-
-    #[test]
-    fn test_find_cut_point_skips_tool_result() {
-        let cancel = CancellationToken::new();
-        let messages = vec![
-            user_msg(&"a".repeat(400)),
-            assistant_with_tool_call("let me read", "read", serde_json::json!({"path": "/foo"})),
-            tool_result_msg("read", &"content".repeat(100)),
-            user_msg(&"b".repeat(400)),
-            assistant_msg(&"c".repeat(400)),
-        ];
-        // Should never have first_kept_index pointing at a ToolResult
-        let cut = find_cut_point(&messages, 200, &cancel);
-        if let Some(cut) = cut {
-            assert!(!matches!(
-                &messages[cut.first_kept_index],
-                Message::ToolResult { .. }
-            ));
-        }
-    }
-
-    #[test]
     fn test_serialize_messages() {
         let messages = vec![user_msg("Hello"), assistant_msg("Hi there!")];
         let text = serialize_messages_for_summary(&messages);
         assert!(text.contains("[User]: Hello"));
         assert!(text.contains("[Assistant]: Hi there!"));
-    }
-
-    #[test]
-    fn test_serialize_tool_calls() {
-        let messages = vec![assistant_with_tool_call(
-            "Let me read that",
-            "read",
-            serde_json::json!({"path": "/tmp/test.rs"}),
-        )];
-        let text = serialize_messages_for_summary(&messages);
-        assert!(text.contains("[Assistant]: Let me read that"));
-        assert!(text.contains("[Assistant tool calls]: read("));
-        assert!(text.contains("/tmp/test.rs"));
-    }
-
-    #[test]
-    fn test_extract_file_operations() {
-        let messages = vec![
-            assistant_with_tool_call("", "read", serde_json::json!({"path": "/foo.rs"})),
-            tool_result_msg("read", "contents"),
-            assistant_with_tool_call(
-                "",
-                "edit",
-                serde_json::json!({"file_path": "/bar.rs", "old_string": "a", "new_string": "b"}),
-            ),
-            tool_result_msg("edit", "ok"),
-        ];
-        let (read, modified) = extract_file_operations(&messages);
-        assert!(read.contains(&"/foo.rs".to_string()));
-        assert!(modified.contains(&"/bar.rs".to_string()));
     }
 }

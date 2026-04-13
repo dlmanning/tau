@@ -5,25 +5,29 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Agent runtime with tool execution"
+description = "Actor-based agent runtime with tool execution"
 
 [dependencies]
 tau-ai = { workspace = true }
+
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { workspace = true }
+
+anyhow = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tokio-util = { workspace = true }
-parking_lot = { workspace = true }
 regex = { workspace = true }
-jsonschema = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]

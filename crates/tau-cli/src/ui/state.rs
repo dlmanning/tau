@@ -2,8 +2,10 @@ use std::collections::HashMap;
 
 use ratatui::layout::Rect;
 use tau_ai::Model;
-use tau_tui::{
-    Theme,
+use tau_agent::AgentConfig;
+
+use super::{
+    theme::Theme,
     widgets::{InputBox, SelectorState, message_list::ChatMessage},
 };
 use tokio::sync::mpsc;
@@ -103,9 +105,7 @@ pub(super) struct TuiState {
 
 impl TuiState {
     pub fn new(
-        model: Model,
-        reasoning: tau_ai::ReasoningLevel,
-        thinking_adaptive: bool,
+        config: &AgentConfig,
         available_models: Vec<Model>,
         ui_tx: mpsc::Sender<UiMessage>,
     ) -> Self {
@@ -114,7 +114,7 @@ impl TuiState {
 
         let current_index = available_models
             .iter()
-            .position(|m| m.id == model.id)
+            .position(|m| m.id == config.model.id)
             .unwrap_or(0);
 
         let model_selector = SelectorState {
@@ -134,9 +134,9 @@ impl TuiState {
             status: "Ready".to_string(),
             theme: Theme::dark(),
             usage: UsageStats::default(),
-            model,
-            reasoning,
-            thinking_adaptive,
+            model: config.model.clone(),
+            reasoning: config.reasoning,
+            thinking_adaptive: config.thinking_adaptive,
             available_models,
             ui_tx,
             model_selector,
@@ -170,9 +170,10 @@ impl TuiState {
         self.scroll_to_bottom();
     }
 
-    /// Update the model.
-    pub fn set_model(&mut self, model: Model) {
-        self.model = model;
+    /// Sync model/reasoning from agent config (call before rendering).
+    pub fn sync_from_config(&mut self, config: &AgentConfig) {
+        self.model = config.model.clone();
+        self.reasoning = config.reasoning;
     }
 
     /// Reset token/cost counters and agent progress.
@@ -185,7 +186,7 @@ impl TuiState {
     /// Recalculate scroll position based on content height.
     /// Call before rendering the conversation area.
     pub fn clamp_scroll(&mut self, conversation_inner: Rect) {
-        let content_height = tau_tui::widgets::message_list::calculate_message_height(
+        let content_height = super::widgets::message_list::calculate_message_height(
             &self.messages,
             conversation_inner.width as usize,
             &self.theme,

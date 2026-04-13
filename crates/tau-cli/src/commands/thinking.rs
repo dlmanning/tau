@@ -2,20 +2,29 @@
 
 use tau_ai::ReasoningLevel;
 
-use super::CommandResult;
+use super::{Command, CommandContext, CommandResult};
 
 pub struct ThinkingCommand;
 
-impl ThinkingCommand {
-    pub fn execute(args: &str, current: ReasoningLevel) -> CommandResult {
-        if args.is_empty() {
-            CommandResult::Message(show_levels(current))
+impl Command for ThinkingCommand {
+    fn name(&self) -> &str {
+        "thinking"
+    }
+    fn aliases(&self) -> &[&str] {
+        &["t"]
+    }
+    fn description(&self) -> &str {
+        "Show or set reasoning level (/thinking <off|minimal|low|medium|high>)"
+    }
+    fn execute(&self, ctx: &CommandContext) -> CommandResult {
+        if ctx.args.is_empty() {
+            CommandResult::Message(show_levels(ctx.config.reasoning))
         } else {
-            match parse_level(args) {
+            match parse_level(ctx.args) {
                 Some(level) => CommandResult::ChangeReasoning(level),
                 None => CommandResult::Message(format!(
                     "Unknown reasoning level: '{}'\nValid levels: off, minimal, low, medium, high",
-                    args
+                    ctx.args
                 )),
             }
         }
@@ -50,16 +59,5 @@ fn parse_level(s: &str) -> Option<ReasoningLevel> {
         "medium" | "med" | "3" => Some(ReasoningLevel::Medium),
         "high" | "4" => Some(ReasoningLevel::High),
         _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn level_name(level: ReasoningLevel) -> &'static str {
-    match level {
-        ReasoningLevel::Off => "off",
-        ReasoningLevel::Minimal => "minimal",
-        ReasoningLevel::Low => "low",
-        ReasoningLevel::Medium => "medium",
-        ReasoningLevel::High => "high",
     }
 }

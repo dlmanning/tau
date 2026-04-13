@@ -35,10 +35,10 @@ impl Default for RetryConfig {
 }
 
 /// Seconds of stream inactivity before logging a stall warning
-#[allow(dead_code)] // used inside stream! macro
+#[allow(dead_code)]
 const STREAM_STALL_WARN_SECS: u64 = 30;
 /// Seconds of stream inactivity before aborting the stream
-#[allow(dead_code)] // used inside stream! macro
+#[allow(dead_code)]
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
 
 impl RetryConfig {
@@ -130,7 +130,6 @@ async fn create_provider_and_stream(
 }
 
 /// Format a server tool result for display.
-/// Extracts titles and URLs from web_search_tool_result content.
 fn format_server_tool_result(api_type: &str, content: &serde_json::Value) -> String {
     if api_type.contains("web_search") {
         if let Some(results) = content.as_array() {
@@ -147,12 +146,10 @@ fn format_server_tool_result(api_type: &str, content: &serde_json::Value) -> Str
             }
             return format!("{} results:\n{}", entries.len(), entries.join("\n"));
         }
-        // Error response
         if let Some(error_code) = content.get("error_code").and_then(|e| e.as_str()) {
             return format!("Search error: {}", error_code);
         }
     }
-    // Fallback: truncated JSON
     let json = serde_json::to_string_pretty(content).unwrap_or_default();
     if json.len() > 500 {
         format!("{}...", &json[..500])
@@ -163,18 +160,15 @@ fn format_server_tool_result(api_type: &str, content: &serde_json::Value) -> Str
 
 /// Check if an error is retryable
 fn is_retryable_error(error: &str) -> bool {
-    // Rate limit errors
     if error.contains("429") || error.contains("rate limit") || error.contains("Rate limit") {
         return true;
     }
-    // Transient network errors
     if error.contains("timeout") || error.contains("Timeout") {
         return true;
     }
     if error.contains("connection") || error.contains("Connection") {
         return true;
     }
-    // Server errors (5xx)
     if error.contains("500")
         || error.contains("502")
         || error.contains("503")
@@ -182,7 +176,6 @@ fn is_retryable_error(error: &str) -> bool {
     {
         return true;
     }
-    // Overloaded
     if error.contains("overloaded") || error.contains("Overloaded") {
         return true;
     }
@@ -268,7 +261,7 @@ impl Default for ProviderTransport {
 }
 
 #[async_trait]
-#[allow(unused_assignments)] // stall_warned inside stream! macro
+#[allow(unused_assignments)]
 impl Transport for ProviderTransport {
     async fn run(
         &self,
@@ -306,13 +299,11 @@ impl Transport for ProviderTransport {
                         break;
                     }
                     Err(e) => {
-                        // Context overflow is never retryable
                         if e.is_context_overflow() {
                             yield AgentEvent::Error { message: e.to_string() };
                             return;
                         }
 
-                        // Check retryability: typed check + string fallback for wrapped errors
                         let error_msg = e.to_string();
                         let retryable = e.is_retryable() || is_retryable_error(&error_msg);
 
@@ -330,7 +321,6 @@ impl Transport for ProviderTransport {
                             continue;
                         }
 
-                        // Non-retryable or max retries exceeded
                         yield AgentEvent::Error { message: error_msg };
                         return;
                     }
@@ -351,7 +341,6 @@ impl Transport for ProviderTransport {
                     return;
                 }
 
-                // Try with stall-warn timeout first, then hard timeout
                 let stall_remaining = Duration::from_secs(STREAM_STALL_WARN_SECS)
                     .saturating_sub(last_event_at.elapsed());
                 let idle_remaining = Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)
@@ -399,7 +388,6 @@ impl Transport for ProviderTransport {
                     tau_ai::stream::MessageEvent::TextDelta { .. }
                     | tau_ai::stream::MessageEvent::ThinkingDelta { .. }
                     | tau_ai::stream::MessageEvent::ToolCallDelta { .. } => {
-                        // Build current partial message
                         let partial = tau_ai::Message::Assistant {
                             content: builder.current_content(),
                             metadata: tau_ai::AssistantMetadata::default(),
@@ -442,7 +430,6 @@ impl Transport for ProviderTransport {
                     message: msg,
                     usage: final_usage,
                 };
-                // Note: AgentEnd is sent by the Agent, not the transport
             }
         });
 

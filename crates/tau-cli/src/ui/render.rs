@@ -5,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
-use tau_tui::widgets::{MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem};
+use super::widgets::{MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem};
 
 use super::constants;
 use super::state::TuiState;
@@ -199,7 +199,7 @@ impl TuiState {
         let message_list = MessageList::new(&self.messages, &self.theme).scroll(self.scroll);
         frame.render_widget(message_list, inner);
 
-        let content_height = tau_tui::widgets::message_list::calculate_message_height(
+        let content_height = super::widgets::message_list::calculate_message_height(
             &self.messages,
             inner.width as usize,
             &self.theme,
@@ -222,13 +222,13 @@ impl TuiState {
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let cwd = std::env::current_dir()
             .ok()
-            .and_then(|p| {
+            .map(|p| {
                 if let Some(home) = dirs::home_dir() {
                     if let Ok(rest) = p.strip_prefix(&home) {
-                        return Some(format!("~/{}", rest.display()));
+                        return format!("~/{}", rest.display());
                     }
                 }
-                Some(p.display().to_string())
+                p.display().to_string()
             })
             .unwrap_or_default();
 

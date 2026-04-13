@@ -1,21 +1,20 @@
 //! Non-interactive single-command execution mode
 
-use tau_agent::{Agent, AgentEvent};
-use tau_ai::Model;
+use tau_agent::{AgentEvent, AgentHandle};
 
 pub(crate) async fn run_command(
-    agent: &mut Agent,
+    handle: &AgentHandle,
     command: &str,
-    model: &Model,
     interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
 ) -> anyhow::Result<()> {
     println!("tau> {}", command);
     println!();
 
-    let mut receiver = agent.subscribe();
-    let model_for_cost = model.clone();
+    let mut receiver = handle.subscribe();
+    let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+    let model_for_cost = config.model.clone();
 
-    let handle = tokio::spawn(async move {
+    let event_handle = tokio::spawn(async move {
         while let Ok(event) = receiver.recv().await {
             match event {
                 AgentEvent::MessageUpdate { message } => {
@@ -81,10 +80,10 @@ pub(crate) async fn run_command(
 
     let interaction_handle = tokio::spawn(handle_interaction_stdin(interaction_rx));
 
-    agent.prompt(command).await?;
+    handle.prompt_and_wait(command).await?;
 
     // Wait for event handler to finish (it breaks on AgentEnd)
-    match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), event_handle).await {
         Ok(_) => {}
         Err(_) => tracing::debug!("Event handler did not finish in time"),
     }

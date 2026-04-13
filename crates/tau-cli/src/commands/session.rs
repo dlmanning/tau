@@ -1,16 +1,23 @@
 //! /session command - show session info and stats
 
-use tau_agent::Agent;
-use tau_ai::{Model, ReasoningLevel};
-
-use super::CommandResult;
+use super::{Command, CommandContext, CommandResult};
+use crate::utils::format_tokens as format_number;
 
 pub struct SessionCommand;
 
-impl SessionCommand {
-    pub fn execute(agent: &Agent, model: &Model, reasoning: ReasoningLevel) -> CommandResult {
-        let state = agent.state();
-        let usage = &state.total_usage;
+impl Command for SessionCommand {
+    fn name(&self) -> &str {
+        "session"
+    }
+    fn aliases(&self) -> &[&str] {
+        &["s"]
+    }
+    fn description(&self) -> &str {
+        "Show session info and token usage"
+    }
+    fn execute(&self, ctx: &CommandContext) -> CommandResult {
+        let usage = ctx.usage;
+        let model = &ctx.config.model;
 
         let mut output = String::from("Session Info\n");
         output.push_str(&"-".repeat(40));
@@ -21,26 +28,23 @@ impl SessionCommand {
             model.id,
             model.provider.name()
         ));
-        output.push_str(&format!("Reasoning:  {:?}\n", reasoning));
+        output.push_str(&format!("Reasoning:  {:?}\n", ctx.config.reasoning));
         output.push('\n');
 
-        let user_msgs = state
-            .messages
+        let user_msgs = ctx.messages
             .iter()
             .filter(|m| matches!(m, tau_ai::Message::User { .. }))
             .count();
-        let assistant_msgs = state
-            .messages
+        let assistant_msgs = ctx.messages
             .iter()
             .filter(|m| matches!(m, tau_ai::Message::Assistant { .. }))
             .count();
-        let tool_results = state
-            .messages
+        let tool_results = ctx.messages
             .iter()
             .filter(|m| matches!(m, tau_ai::Message::ToolResult { .. }))
             .count();
 
-        output.push_str(&format!("Messages:   {} total\n", state.messages.len()));
+        output.push_str(&format!("Messages:   {} total\n", ctx.messages.len()));
         output.push_str(&format!(
             "            {} user, {} assistant, {} tool results\n",
             user_msgs, assistant_msgs, tool_results
@@ -84,5 +88,3 @@ impl SessionCommand {
         CommandResult::Message(output)
     }
 }
-
-use crate::utils::format_tokens as format_number;

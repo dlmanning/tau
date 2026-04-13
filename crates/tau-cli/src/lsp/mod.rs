@@ -11,6 +11,9 @@
 
 mod client;
 mod servers;
+mod tool;
+
+pub use tool::LspTool;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

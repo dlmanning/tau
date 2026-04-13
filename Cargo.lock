@@ -3098,6 +3098,7 @@ dependencies = [
 name = "tau-agent"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "chrono",
@@ -3152,6 +3153,7 @@ dependencies = [
  "htmd",
  "ignore",
  "lsp-types",
+ "pulldown-cmark",
  "ratatui",
  "regex",
  "reqwest 0.12.28",
@@ -3162,7 +3164,8 @@ dependencies = [
  "similar",
  "tau-agent",
  "tau-ai",
- "tau-tui",
+ "tau-tools",
+ "textwrap",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3170,22 +3173,34 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "url",
  "urlencoding",
  "uuid",
 ]
 
 [[package]]
-name = "tau-tui"
+name = "tau-tools"
 version = "0.1.0"
 dependencies = [
- "crossterm",
+ "async-trait",
+ "dirs",
  "futures",
- "pulldown-cmark",
- "ratatui",
- "textwrap",
+ "glob",
+ "htmd",
+ "ignore",
+ "regex",
+ "reqwest 0.12.28",
+ "schemars",
+ "serde",
+ "serde_json",
+ "similar",
+ "tau-agent",
+ "tau-ai",
  "tokio",
- "unicode-width",
+ "tokio-util",
+ "tracing",
+ "url",
 ]
 
 [[package]]

@@ -16,6 +16,10 @@ pub enum Error {
     #[error("Compaction error: {0}")]
     Compaction(String),
 
+    /// The agent is already processing a prompt
+    #[error("Agent is busy processing another prompt")]
+    Busy,
+
     /// A generic agent error
     #[error("{0}")]
     Other(String),

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use tau_agent::AgentEvent;
-use tau_tui::widgets::message_list::ChatMessage;
+use super::widgets::message_list::ChatMessage;
 
 use super::constants;
 use super::state::{AgentProgress, TuiState};

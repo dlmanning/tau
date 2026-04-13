@@ -2,33 +2,39 @@
 
 use tau_ai::Model;
 
-use super::CommandResult;
+use super::{Command, CommandContext, CommandResult};
 
 pub struct ModelCommand;
 
 impl ModelCommand {
-    /// Execute /model command - opens selector if no args, or switches to matching model
-    pub fn execute(
-        args: &str,
-        _current_model: &Model,
-        available_models: &[Model],
-    ) -> CommandResult {
-        if args.is_empty() {
-            CommandResult::OpenModelSelector
-        } else {
-            match find_model(args, available_models) {
-                Some(model) => CommandResult::ChangeModel(model),
-                None => CommandResult::Message(format!(
-                    "No model found matching '{}'\nUse /model to list available models",
-                    args
-                )),
-            }
-        }
-    }
-
     /// List models as text (for CLI mode)
     pub fn list_models_text(current_model: &Model, available_models: &[Model]) -> String {
         list_models(current_model, available_models)
+    }
+}
+
+impl Command for ModelCommand {
+    fn name(&self) -> &str {
+        "model"
+    }
+    fn aliases(&self) -> &[&str] {
+        &["m"]
+    }
+    fn description(&self) -> &str {
+        "List models or switch model (/model <name>)"
+    }
+    fn execute(&self, ctx: &CommandContext) -> CommandResult {
+        if ctx.args.is_empty() {
+            CommandResult::OpenModelSelector
+        } else {
+            match find_model(ctx.args, ctx.available_models) {
+                Some(model) => CommandResult::ChangeModel(model),
+                None => CommandResult::Message(format!(
+                    "No model found matching '{}'\nUse /model to list available models",
+                    ctx.args
+                )),
+            }
+        }
     }
 }
 

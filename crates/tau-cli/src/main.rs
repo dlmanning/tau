@@ -9,14 +9,13 @@ mod lsp;
 mod oauth;
 mod run_command;
 mod session;
-mod tools;
 mod ui;
 mod utils;
 
 use std::sync::Arc;
 
 use clap::Parser;
-use tau_agent::{Agent, AgentConfig};
+use tau_agent::AgentConfig;
 use tau_ai::ReasoningLevel;
 
 use cli::{Args, get_available_models, get_model, parse_reasoning_level};
@@ -136,8 +135,8 @@ async fn main() -> anyhow::Result<()> {
     let cache_ttl = cfg.cache.as_ref().and_then(|c| c.ttl.clone());
     let system_prompt_boundary = cfg.cache.as_ref().and_then(|c| c.prompt_boundary.clone());
 
-    // Create agent with initial config (no system prompt yet)
-    let config = AgentConfig {
+    // Create agent builder
+    let agent_config = AgentConfig {
         system_prompt: None,
         model: model.clone(),
         reasoning,
@@ -151,57 +150,55 @@ async fn main() -> anyhow::Result<()> {
         cache_ttl,
         system_prompt_boundary,
     };
-    let mut agent = Agent::new(config, transport.clone());
+    let mut builder = tau_agent::AgentBuilder::new(agent_config, transport.clone());
 
-    // Set up interaction channel for tools that need user input (e.g. ask_user)
+    // Set up interaction channel for tools that need user input
     let (interaction_tx, interaction_rx) =
         tokio::sync::mpsc::channel::<tau_agent::InteractionRequest>(8);
-    agent.set_interaction_sender(interaction_tx);
+    builder.set_interaction_sender(interaction_tx);
 
-    agent.add_tool(Arc::new(tools::AskTool::new()));
-    agent.add_tool(Arc::new(tools::BashTool::new()));
-    agent.add_tool(Arc::new(tools::ReadTool::new()));
-    agent.add_tool(Arc::new(tools::WriteTool::new()));
-    agent.add_tool(Arc::new(tools::EditTool::new()));
-    agent.add_tool(Arc::new(tools::GlobTool::new()));
-    agent.add_tool(Arc::new(tools::GrepTool::new()));
-    agent.add_tool(Arc::new(tools::ListTool::new()));
-    agent.add_tool(Arc::new(tools::WebFetchTool::new()));
+    builder.add_tool(Arc::new(tau_tools::AskTool::new()));
+    builder.add_tool(Arc::new(tau_tools::BashTool::new()));
+    builder.add_tool(Arc::new(tau_tools::ReadTool::new()));
+    builder.add_tool(Arc::new(tau_tools::WriteTool::new()));
+    builder.add_tool(Arc::new(tau_tools::EditTool::new()));
+    builder.add_tool(Arc::new(tau_tools::GlobTool::new()));
+    builder.add_tool(Arc::new(tau_tools::GrepTool::new()));
+    builder.add_tool(Arc::new(tau_tools::ListTool::new()));
+    builder.add_tool(Arc::new(tau_tools::WebFetchTool::new()));
 
     let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
     if lsp_manager.is_available() {
-        agent.add_tool(Arc::new(tools::LspTool::new(lsp_manager.clone())));
+        builder.add_tool(Arc::new(lsp::LspTool::new(lsp_manager.clone())));
     }
 
     // Add agent tool (subagent spawning)
-    let parent_tools: Vec<Arc<dyn tau_agent::tool::Tool>> = agent.tools().to_vec();
-    let agent_handle = agent.handle();
-    let manager = Arc::new(tau_agent::agent_manager::AgentManager::new(
-        agent.event_sender(),
+    let parent_tools: Vec<Arc<dyn tau_agent::tool::Tool>> = builder.tools().to_vec();
+    let agent_handle = builder.pre_handle();
+    let manager = Arc::new(tau_agent::manager::AgentManager::new(
+        builder.event_sender(),
         parent_tools,
-        agent.config().clone(),
+        builder.config().clone(),
         transport.clone(),
         20,
     ));
 
     // Create factory that makes AgentTools referencing this manager.
-    // The handle parameter ensures background sub-subagents report to the
-    // correct parent rather than always routing to the root agent.
     let mgr_for_factory = manager.clone();
     manager.set_agent_tool_factory(Arc::new(move |depth, handle| {
-        let tool = tools::AgentTool::new(mgr_for_factory.clone(), depth).with_handle(handle);
+        let tool = tau_tools::AgentTool::new(mgr_for_factory.clone(), depth).with_handle(handle);
         Arc::new(tool)
     }));
 
     let mgr_for_send = manager.clone();
-    agent.add_tool(Arc::new(
-        tools::AgentTool::new(manager, 0).with_handle(agent_handle),
+    builder.add_tool(Arc::new(
+        tau_tools::AgentTool::new(manager, 0).with_handle(agent_handle),
     ));
-    agent.add_tool(Arc::new(tools::SendMessageTool::new(mgr_for_send)));
+    builder.add_tool(Arc::new(tau_tools::SendMessageTool::new(mgr_for_send)));
 
     // Enable web search for Anthropic models
     if model.provider == tau_ai::Provider::Anthropic {
-        agent.add_server_tool(tau_ai::ServerTool::WebSearch {
+        builder.add_server_tool(tau_ai::ServerTool::WebSearch {
             name: "web_search".to_string(),
             max_uses: Some(8),
             allowed_domains: None,
@@ -210,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build dynamic system prompt based on registered tools
-    let tool_names = agent.tool_names();
+    let tool_names = builder.tool_names();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -220,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         cwd: &cwd,
         acolyte_mode,
     };
-    agent.set_system_prompt(tau_agent::prompts::build_system_prompt(&prompt_opts));
+    builder.set_system_prompt(tau_agent::prompts::build_system_prompt(&prompt_opts));
 
     if let Some(ref session_id) = args.resume {
         match session::SessionManager::load(session_id) {
@@ -235,8 +232,8 @@ async fn main() -> anyhow::Result<()> {
                         ""
                     }
                 );
-                agent.set_messages(messages);
-                agent.set_previous_summary(previous_summary);
+                builder.set_messages(messages);
+                builder.set_previous_summary(previous_summary);
             }
             Err(e) => {
                 eprintln!("Error loading session: {}", e);
@@ -245,35 +242,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Spawn the agent actor — from here on we use the handle
+    let handle = builder.spawn();
+
     // Non-interactive mode
     let result = if let Some(command) = args.command {
-        run_command::run_command(&mut agent, &command, &model, interaction_rx).await
+        run_command::run_command(&handle, &command, interaction_rx).await
     } else if use_tui {
         // TUI mode
-        let mut model = model;
-        let mut reasoning = reasoning;
         let available_models = get_available_models();
-        ui::run_tui(
-            &mut agent,
-            &mut model,
-            &mut reasoning,
-            &available_models,
-            interaction_rx,
-        )
-        .await
+        ui::run_tui(&handle, &available_models, interaction_rx).await
     } else {
         // Interactive mode (simple stdin/stdout)
         let session = session::SessionManager::new(&model.id).ok();
-        let mut model = model;
-        let mut reasoning = reasoning;
-        interactive::run_interactive(
-            &mut agent,
-            &mut model,
-            &mut reasoning,
-            session,
-            interaction_rx,
-        )
-        .await
+        interactive::run_interactive(&handle, session, interaction_rx).await
     };
 
     lsp_manager.shutdown_all().await;

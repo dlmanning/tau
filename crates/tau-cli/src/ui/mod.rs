@@ -16,9 +16,12 @@
 mod agents;
 mod constants;
 mod events;
+mod input;
 mod render;
 mod state;
+mod theme;
 mod types;
+mod widgets;
 
 use state::TuiState;
 use types::PendingInteraction;
@@ -26,19 +29,20 @@ pub use types::UiMessage;
 
 use crossterm::event::EventStream;
 use futures::StreamExt;
-use tau_agent::{Agent, AgentEvent};
+use tau_agent::{AgentEvent, AgentHandle};
 use tau_ai::Model;
-use tau_tui::widgets::{SelectorState, message_list::ChatMessage};
+use widgets::{SelectorState, message_list::ChatMessage};
 use tokio::sync::mpsc;
 
 /// Apply a branch operation: create a branch session and truncate conversation state.
-fn apply_branch(
+async fn apply_branch(
     state: &mut TuiState,
-    agent: &mut Agent,
-    model_id: &str,
+    handle: &AgentHandle,
     branch_index: Option<usize>,
 ) {
-    match crate::session::SessionManager::branch_from(agent.messages(), branch_index, model_id) {
+    let Some(config) = handle.config().await else { return };
+    let Some(messages) = handle.messages().await else { return };
+    match crate::session::SessionManager::branch_from(&messages, branch_index, &config.model.id) {
         Ok(new_session) => {
             let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
             state.show_system_message(&format!(
@@ -47,11 +51,11 @@ fn apply_branch(
                 msg_count
             ));
             if let Some(idx) = branch_index {
-                let messages: Vec<_> = agent.messages().iter().take(idx + 1).cloned().collect();
-                agent.set_messages(messages);
+                let truncated: Vec<_> = messages.iter().take(idx + 1).cloned().collect();
+                handle.set_messages(truncated);
                 state.messages.truncate(idx + 1);
             } else {
-                agent.clear_messages();
+                handle.clear_messages();
                 state.messages.clear();
             }
             state.reset_stats();
@@ -67,42 +71,45 @@ fn apply_branch(
 async fn dispatch_ui_message(
     msg: UiMessage,
     state: &mut TuiState,
-    agent: &mut Agent,
-    model: &mut Model,
-    reasoning: &mut tau_ai::ReasoningLevel,
+    handle: &AgentHandle,
     available_models: &[Model],
     pending_prompt: &mut Option<String>,
 ) -> bool {
-    use crate::commands::{CommandResult, execute_command};
+    use crate::commands::{CommandContext, CommandResult, execute_command};
 
     match msg {
         UiMessage::Submit(content) => {
             *pending_prompt = Some(content);
         }
         UiMessage::Command(cmd) => {
-            if let Some(result) = execute_command(&cmd, agent, model, *reasoning, available_models)
-            {
+            let Some(config) = handle.config().await else { return true };
+            let Some(messages) = handle.messages().await else { return true };
+            let Some(conv_state) = handle.state().await else { return true };
+            let ctx = CommandContext {
+                args: "",
+                config: &config,
+                messages: &messages,
+                usage: &conv_state.total_usage,
+                available_models,
+            };
+            if let Some(result) = execute_command(&cmd, &ctx) {
                 match result {
                     CommandResult::Message(msg) => {
                         state.show_system_message(&msg);
                     }
                     CommandResult::Clear => {
-                        agent.clear_messages();
+                        handle.clear_messages();
                         state.messages.clear();
                         state.reset_stats();
                         state.status = "Cleared".to_string();
                     }
                     CommandResult::ChangeModel(new_model) => {
                         state.show_system_message(&format!("Switched to: {}", new_model.id));
-                        *model = new_model.clone();
-                        state.set_model(new_model.clone());
-                        agent.set_model(new_model);
+                        handle.set_model(new_model);
                     }
                     CommandResult::ChangeReasoning(level) => {
                         state.show_system_message(&format!("Reasoning: {:?}", level));
-                        *reasoning = level;
-                        state.reasoning = level;
-                        agent.set_reasoning(level);
+                        handle.set_reasoning(level);
                     }
                     CommandResult::Exit => return false,
                     CommandResult::Unknown(cmd) => {
@@ -119,23 +126,29 @@ async fn dispatch_ui_message(
                     }
                     CommandResult::Compact => {
                         state.show_system_message("Compacting context...");
-                        match agent
-                            .run_compaction(tau_agent::CompactionReason::Manual)
+                        match handle
+                            .compact(tau_agent::CompactionReason::Manual)
                             .await
                         {
-                            Ok(()) => {
-                                state.show_system_message(&format!(
-                                    "Context compacted. {} messages remaining.",
-                                    agent.messages().len()
-                                ));
-                            }
+                            Ok(rx) => match rx.await {
+                                Ok(r) if r.result.is_ok() => {
+                                    let msg_count = handle.messages().await.map(|m| m.len()).unwrap_or(0);
+                                    state.show_system_message(&format!(
+                                        "Context compacted. {} messages remaining.",
+                                        msg_count,
+                                    ));
+                                }
+                                _ => {
+                                    state.show_system_message("Compaction failed.");
+                                }
+                            },
                             Err(e) => {
                                 state.show_system_message(&format!("Compaction failed: {}", e));
                             }
                         }
                     }
                     CommandResult::BranchFrom(branch_index) => {
-                        apply_branch(state, agent, &model.id, branch_index);
+                        apply_branch(state, handle, branch_index).await;
                     }
                 }
             }
@@ -143,22 +156,20 @@ async fn dispatch_ui_message(
         UiMessage::ChangeModel(index) => {
             if let Some(new_model) = available_models.get(index) {
                 state.show_system_message(&format!("Switched to: {}", new_model.id));
-                *model = new_model.clone();
-                state.set_model(new_model.clone());
-                agent.set_model(new_model.clone());
+                handle.set_model(new_model.clone());
             }
         }
         UiMessage::Clear => {
-            agent.clear_messages();
+            handle.clear_messages();
             state.messages.clear();
             state.reset_stats();
             state.status = "Cleared".to_string();
         }
         UiMessage::Abort => {
-            agent.abort();
+            handle.abort();
         }
         UiMessage::Branch(branch_index) => {
-            apply_branch(state, agent, &model.id, branch_index);
+            apply_branch(state, handle, branch_index).await;
         }
         UiMessage::Quit => return false,
     }
@@ -167,9 +178,7 @@ async fn dispatch_ui_message(
 
 /// Run the TUI application
 pub async fn run_tui(
-    agent: &mut Agent,
-    model: &mut Model,
-    reasoning: &mut tau_ai::ReasoningLevel,
+    handle: &AgentHandle,
     available_models: &[Model],
     mut interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
 ) -> anyhow::Result<()> {
@@ -197,38 +206,45 @@ pub async fn run_tui(
 
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(constants::UI_CHANNEL_CAPACITY);
 
+    let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
     let mut state = TuiState::new(
-        model.clone(),
-        *reasoning,
-        agent.config().thinking_adaptive,
+        &config,
         available_models.to_vec(),
         ui_tx,
     );
 
-    let mut agent_rx = agent.subscribe();
+    let mut agent_rx = handle.subscribe();
     let mut event_stream = EventStream::new();
 
-    // Tick interval for animations (80ms for smooth spinner)
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(
         constants::TICK_INTERVAL_MS,
     ));
 
-    // Pending prompt content - we'll process this at the start of the next loop iteration
-    // This is stored as a String so it lives long enough for the future
     let mut pending_prompt: Option<String> = None;
 
-    // Captures Ok/Err from various break points in the nested event loops.
     let result = 'outer: loop {
-        // If there's a pending prompt, start processing it
-        // We create the future here where `content` is still in scope
         if let Some(content) = pending_prompt.take() {
             state.is_processing = true;
             state.status = "Thinking...".to_string();
             state.messages.push(ChatMessage::assistant_streaming(""));
             state.scroll_to_bottom();
 
-            let agent_handle = agent.handle();
-            let mut prompt_future = std::pin::pin!(agent.prompt(&content));
+            if let Some(cfg) = handle.config().await {
+                state.sync_from_config(&cfg);
+            }
+
+            // Start the prompt — returns a receiver for the completion result.
+            // This is the key difference from the old &mut Agent pattern:
+            // the handle is &self, so we can keep using it freely.
+            let prompt_rx = match handle.prompt(&content).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
+                    state.is_processing = false;
+                    continue;
+                }
+            };
+            let mut prompt_rx = prompt_rx;
 
             loop {
                 terminal.draw(|frame| state.render(frame))?;
@@ -237,9 +253,16 @@ pub async fn run_tui(
                 tokio::select! {
                     biased;
 
-                    result = &mut prompt_future => {
-                        if let Err(e) = result {
-                            state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
+                    result = &mut prompt_rx => {
+                        match result {
+                            Ok(r) => {
+                                if let Err(e) = r.result {
+                                    state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
+                                }
+                            }
+                            Err(_) => {
+                                state.handle_agent_event(AgentEvent::Error { message: "Agent task dropped".into() });
+                            }
                         }
                         state.pending_interaction = None;
                         break;
@@ -254,7 +277,7 @@ pub async fn run_tui(
                     event = event_stream.next() => {
                         match event {
                             Some(Ok(ev)) => {
-                                if !state.handle_event_while_processing(ev, area_width, &agent_handle) {
+                                if !state.handle_event_while_processing(ev, area_width, handle) {
                                     break 'outer Ok(());
                                 }
                             }
@@ -284,7 +307,7 @@ pub async fn run_tui(
                     _ = tick_interval.tick() => {
                         state.git_branch.poll();
                         state.git_branch.maybe_refresh();
-                }
+                    }
                 }
             }
 
@@ -294,9 +317,12 @@ pub async fn run_tui(
 
             terminal.draw(|frame| state.render(frame))?;
 
-            continue; // Continue outer loop after prompt completes
+            continue;
         }
 
+        if let Some(cfg) = handle.config().await {
+            state.sync_from_config(&cfg);
+        }
         terminal.draw(|frame| state.render(frame))?;
 
         let area_width = terminal.size()?.width;
@@ -327,15 +353,15 @@ pub async fn run_tui(
             }
 
             _ = tick_interval.tick() => {
-                        state.git_branch.poll();
-                        state.git_branch.maybe_refresh();
-                }
+                state.git_branch.poll();
+                state.git_branch.maybe_refresh();
+            }
 
             msg = ui_rx.recv() => {
                 match msg {
                     Some(msg) => {
                         if !dispatch_ui_message(
-                            msg, &mut state, agent, model, reasoning,
+                            msg, &mut state, handle,
                             available_models, &mut pending_prompt,
                         ).await {
                             break Ok(());

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use futures::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
-use tau_tui::widgets::SelectorState;
+use super::widgets::SelectorState;
 
 use super::constants;
 

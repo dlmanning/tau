@@ -5,8 +5,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Record a subagent's conversation to disk for debugging.
 /// Writes JSONL to `~/.local/share/tau/agent-transcripts/{agent_id}.jsonl`.
-/// Overwrites any previous transcript for this agent (e.g. after resumption,
-/// the new snapshot includes the full conversation).
+/// Overwrites any previous transcript for this agent.
 /// Failures are logged and silently ignored.
 pub async fn record_transcript(agent_id: &str, messages: &[Message]) {
     let dir = match dirs::data_dir() {

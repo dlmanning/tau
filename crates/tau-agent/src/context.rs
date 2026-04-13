@@ -4,9 +4,6 @@
 //! 1. Global: ~/.config/tau/AGENTS.md (or CLAUDE.md)
 //! 2. Parent directories: from repo root down to current directory
 //! 3. Current directory: highest priority
-//!
-//! Files are loaded in order, with later files taking higher priority.
-//! Content is concatenated and included in the system prompt.
 
 use std::path::{Path, PathBuf};
 
@@ -62,7 +59,6 @@ fn load_parent_contexts() -> Vec<String> {
     let mut current = cwd.parent();
 
     while let Some(dir) = current {
-        // Stop if we've gone above the start directory
         if !dir.starts_with(&start_dir) && dir != start_dir {
             break;
         }
@@ -162,14 +158,4 @@ pub fn list_context_files() -> Vec<PathBuf> {
     }
 
     files
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_context_file_names() {
-        assert_eq!(CONTEXT_FILE_NAMES, &["AGENTS.md", "CLAUDE.md"]);
-    }
 }

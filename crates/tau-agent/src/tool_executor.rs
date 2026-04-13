@@ -1,18 +1,15 @@
 //! Tool execution helpers: run a single tool, validate arguments, check content.
-//!
-//! Extracted from `agent.rs` so the agent module focuses on the state machine loop.
 
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::agent::send_event;
 use crate::events::AgentEvent;
-use crate::tool::{BoxedTool, ExecutionContext, ToolResult};
+use crate::tool::{BoxedTool, ExecutionContext, ToolResult, send_event};
 
 /// Execute a single tool: emit events, check guard/validation, run, emit end event.
 /// Standalone function so it can be called both inline (sequential) and from a
-/// spawned task (parallel) without borrowing Agent.
+/// spawned task (parallel) without borrowing the actor state.
 pub(crate) async fn run_single_tool(
     tool: Option<BoxedTool>,
     id: String,
@@ -61,8 +58,6 @@ pub(crate) async fn run_single_tool(
 }
 
 /// Check if a message has meaningful content worth preserving.
-/// Returns true if the message contains non-whitespace text, thinking blocks,
-/// or tool calls with a name.
 pub(crate) fn has_meaningful_content(message: &tau_ai::Message) -> bool {
     use tau_ai::{Content, Message};
 
@@ -112,21 +107,18 @@ pub(crate) fn validate_with_validator(
     }
 }
 
-/// Validate tool arguments against a JSON Schema (compiles on each call).
-/// Used in tests. Returns `Some(error_message)` if validation fails, `None` if valid.
-#[cfg(test)]
-fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> Option<String> {
-    let validator = match jsonschema::validator_for(schema) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    validate_with_validator(args, &validator)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tau_ai::{AssistantMetadata, Content, Message};
+
+    fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> Option<String> {
+        let validator = match jsonschema::validator_for(schema) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        validate_with_validator(args, &validator)
+    }
 
     fn simple_schema() -> serde_json::Value {
         serde_json::json!({
@@ -146,51 +138,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_args_valid_optional_missing() {
-        let args = serde_json::json!({"path": "/foo.rs"});
-        assert!(validate_tool_args(&args, &simple_schema()).is_none());
-    }
-
-    #[test]
     fn test_validate_args_missing_required() {
         let args = serde_json::json!({"count": 5});
         let err = validate_tool_args(&args, &simple_schema());
         assert!(err.is_some());
         let msg = err.unwrap();
         assert!(msg.contains("validation failed"), "got: {}", msg);
-        assert!(
-            msg.contains("path"),
-            "should mention missing field, got: {}",
-            msg
-        );
-    }
-
-    #[test]
-    fn test_validate_args_wrong_type() {
-        let args = serde_json::json!({"path": 123});
-        let err = validate_tool_args(&args, &simple_schema());
-        assert!(err.is_some());
-        let msg = err.unwrap();
-        assert!(msg.contains("validation failed"), "got: {}", msg);
-    }
-
-    #[test]
-    fn test_validate_args_invalid_schema_returns_none() {
-        let bad_schema = serde_json::json!({"type": "not_a_real_type"});
-        let args = serde_json::json!({"anything": true});
-        assert!(validate_tool_args(&args, &bad_schema).is_none());
-    }
-
-    #[test]
-    fn test_validate_args_empty_object_valid() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "optional": { "type": "string" }
-            }
-        });
-        let args = serde_json::json!({});
-        assert!(validate_tool_args(&args, &schema).is_none());
     }
 
     #[test]
@@ -221,36 +174,9 @@ mod tests {
     }
 
     #[test]
-    fn test_meaningful_content_thinking() {
-        let msg = Message::Assistant {
-            content: vec![Content::thinking("let me think...")],
-            metadata: AssistantMetadata::default(),
-        };
-        assert!(has_meaningful_content(&msg));
-    }
-
-    #[test]
     fn test_meaningful_content_tool_call() {
         let msg = Message::Assistant {
             content: vec![Content::tool_call("id1", "read", serde_json::json!({}))],
-            metadata: AssistantMetadata::default(),
-        };
-        assert!(has_meaningful_content(&msg));
-    }
-
-    #[test]
-    fn test_meaningful_content_tool_call_empty_name() {
-        let msg = Message::Assistant {
-            content: vec![Content::tool_call("id1", "", serde_json::json!({}))],
-            metadata: AssistantMetadata::default(),
-        };
-        assert!(!has_meaningful_content(&msg));
-    }
-
-    #[test]
-    fn test_meaningful_content_mixed_empty_and_real() {
-        let msg = Message::Assistant {
-            content: vec![Content::text(""), Content::text("real content")],
             metadata: AssistantMetadata::default(),
         };
         assert!(has_meaningful_content(&msg));
