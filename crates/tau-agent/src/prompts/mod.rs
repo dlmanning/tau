@@ -100,6 +100,15 @@ fn using_tools_section(tool_names: &[&str]) -> String {
     s
 }
 
+/// Build a lightweight system prompt for subagents.
+/// Uses only the agent-type-specific instructions + environment + tool hints.
+/// No parent boilerplate, no CLAUDE.md, no project context.
+pub fn build_subagent_prompt(agent_prompt: &str, tool_names: &[&str], cwd: &str) -> String {
+    let tools = using_tools_section(tool_names);
+    let env = env_section(cwd);
+    format!("{}\n\n{}\n\n{}", agent_prompt, tools, env)
+}
+
 fn env_section(cwd: &str) -> String {
     let platform = std::env::consts::OS;
     let arch = std::env::consts::ARCH;

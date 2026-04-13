@@ -20,7 +20,7 @@ use crate::worktree::{WorktreeInfo, cleanup_worktree, create_worktree};
 pub const MAX_AGENT_DEPTH: u32 = 3;
 
 /// Maximum turns a subagent can execute before being stopped.
-pub const MAX_SUBAGENT_TURNS: u32 = 30;
+pub const MAX_SUBAGENT_TURNS: u32 = 200;
 
 /// Agent type determines tool set and system prompt.
 #[derive(Debug, Clone)]
@@ -49,8 +49,8 @@ impl AgentType {
     fn max_turns(&self) -> u32 {
         match self {
             Self::GeneralPurpose => MAX_SUBAGENT_TURNS,
-            Self::Explore => 10,
-            Self::Plan => 15,
+            Self::Explore => MAX_SUBAGENT_TURNS,
+            Self::Plan => MAX_SUBAGENT_TURNS,
         }
     }
 }
@@ -426,6 +426,7 @@ impl AgentManager {
         let mut agent_cfg = self.parent_config.clone();
         agent_cfg.system_prompt = None;
         agent_cfg.max_turns = Some(req.agent_type.max_turns());
+        agent_cfg.max_tokens = None;
         if let Some(ref model) = req.model {
             agent_cfg.model = model.clone();
         }
@@ -450,15 +451,10 @@ impl AgentManager {
         }
 
         let tool_names = builder.tool_names();
-        let prompt_opts = crate::prompts::PromptOptions {
-            tool_names: &tool_names,
-            cwd: &cwd,
-            acolyte_mode: false,
-        };
-        let system_prompt = format!(
-            "{}\n\n{}",
-            crate::prompts::build_system_prompt(&prompt_opts),
+        let system_prompt = crate::prompts::build_subagent_prompt(
             agent_type_suffix(&req.agent_type),
+            &tool_names,
+            &cwd,
         );
         builder.set_system_prompt(system_prompt);
 
@@ -676,9 +672,9 @@ mod tests {
 
     #[test]
     fn test_max_turns() {
-        assert_eq!(AgentType::GeneralPurpose.max_turns(), 30);
-        assert_eq!(AgentType::Explore.max_turns(), 10);
-        assert_eq!(AgentType::Plan.max_turns(), 15);
+        assert_eq!(AgentType::GeneralPurpose.max_turns(), 200);
+        assert_eq!(AgentType::Explore.max_turns(), 200);
+        assert_eq!(AgentType::Plan.max_turns(), 200);
     }
 
     fn test_handle() -> AgentHandle {
