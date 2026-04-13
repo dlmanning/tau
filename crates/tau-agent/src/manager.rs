@@ -427,6 +427,10 @@ impl AgentManager {
         agent_cfg.system_prompt = None;
         agent_cfg.max_turns = Some(req.agent_type.max_turns());
         agent_cfg.max_tokens = None;
+        // Disable prompt caching for subagents — they're short-lived so
+        // cache writes are wasted (the cache is never read back).
+        agent_cfg.cache_scope = None;
+        agent_cfg.cache_ttl = None;
         if let Some(ref model) = req.model {
             agent_cfg.model = model.clone();
         }
