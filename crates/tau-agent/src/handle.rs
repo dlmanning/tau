@@ -4,8 +4,8 @@
 //! Fire-and-forget methods use `try_send`. Abort cancels the shared
 //! `CancellationToken` inside `Arc<Mutex<>>`.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -40,7 +40,10 @@ pub struct AgentHandle {
 
 impl AgentHandle {
     /// Send a prompt. Returns a oneshot receiver for the completion result.
-    pub async fn prompt(&self, input: &str) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
+    pub async fn prompt(
+        &self,
+        input: &str,
+    ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
         let content = vec![tau_ai::Content::text(input)];
         self.prompt_with_content(content).await
     }

@@ -2,9 +2,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
+use parking_lot::Mutex as ParkingMutex;
 use tau_ai::{Content, Message, Model, Usage};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::AgentBuilder;
@@ -101,15 +103,15 @@ pub enum AgentStatus {
 
 /// Manages subagent lifecycle: spawn, resume, evict.
 pub struct AgentManager {
-    agents: tokio::sync::Mutex<VecDeque<(String, ManagedAgent)>>,
+    agents: Mutex<VecDeque<(String, ManagedAgent)>>,
     max_agents: usize,
     transport: Arc<dyn Transport>,
     tools: Vec<BoxedTool>,
     parent_config: AgentConfig,
     parent_event_tx: broadcast::Sender<AgentEvent>,
-    agent_tool_factory: parking_lot::Mutex<Option<AgentToolFactory>>,
+    agent_tool_factory: ParkingMutex<Option<AgentToolFactory>>,
     /// Handles for agents that are currently executing (keyed by agent_id).
-    running_handles: tokio::sync::Mutex<HashMap<String, (AgentHandle, String)>>,
+    running_handles: Mutex<HashMap<String, (AgentHandle, String)>>,
 }
 
 struct ManagedAgent {
@@ -128,14 +130,14 @@ impl AgentManager {
         max_agents: usize,
     ) -> Self {
         Self {
-            agents: tokio::sync::Mutex::new(VecDeque::new()),
+            agents: Mutex::new(VecDeque::new()),
             max_agents,
             transport,
             tools,
             parent_config,
             parent_event_tx,
-            agent_tool_factory: parking_lot::Mutex::new(None),
-            running_handles: tokio::sync::Mutex::new(HashMap::new()),
+            agent_tool_factory: ParkingMutex::new(None),
+            running_handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -158,7 +160,8 @@ impl AgentManager {
         let result = self.run_subagent(&request, cancel, &agent_id).await;
         self.running_handles.lock().await.remove(&agent_id);
         let (result, handle) = result?;
-        self.store(result.agent_id.clone(), handle, description).await;
+        self.store(result.agent_id.clone(), handle, description)
+            .await;
         Ok(result)
     }
 
@@ -231,7 +234,7 @@ impl AgentManager {
         message: &str,
         parent_cancel: CancellationToken,
     ) -> crate::error::Result<SubagentResult> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         let mut entry = {
             let mut agents = self.agents.lock().await;
@@ -302,7 +305,6 @@ impl AgentManager {
         })
     }
 
-
     /// Find an agent by name or ID.
     pub async fn find_agent(&self, name_or_id: &str) -> Option<(String, String, AgentStatus)> {
         // Check running agents first
@@ -343,7 +345,6 @@ impl AgentManager {
         }
     }
 
-
     fn spawn_event_forwarder(
         &self,
         mut events: broadcast::Receiver<AgentEvent>,
@@ -370,7 +371,7 @@ impl AgentManager {
         cancel: CancellationToken,
         agent_id: &str,
     ) -> crate::error::Result<(SubagentResult, AgentHandle)> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         let worktree = if req.isolation.as_deref() == Some("worktree") {
             match create_worktree(agent_id).await {
@@ -604,8 +605,8 @@ fn extract_final_text(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::Tool;
     use crate::config::DequeueMode;
+    use crate::tool::Tool;
     use async_trait::async_trait;
     use tau_ai::{AssistantMetadata, Content, Message};
 

@@ -7,8 +7,6 @@
 pub(crate) mod actor;
 pub mod builder;
 pub(crate) mod command;
-pub(crate) mod logic;
-pub(crate) mod state;
 pub mod compaction;
 pub mod config;
 pub mod context;
@@ -17,9 +15,11 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod interaction;
+pub(crate) mod logic;
 pub mod manager;
 pub(crate) mod overflow;
 pub mod prompts;
+pub(crate) mod state;
 pub mod stream;
 pub mod tool;
 pub(crate) mod tool_executor;
@@ -27,8 +27,9 @@ pub mod transcript;
 pub mod transport;
 pub(crate) mod worktree;
 
-pub use compaction::{CompactionConfig, CompactionReason};
+pub use builder::AgentBuilder;
 pub use command::PromptResult;
+pub use compaction::{CompactionConfig, CompactionReason};
 pub use config::{AgentConfig, DequeueMode};
 pub use conversation::Conversation;
 pub use error::Error;
@@ -38,7 +39,6 @@ pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, 
 pub use tool::{
     BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
 };
-pub use builder::AgentBuilder;
 pub use transport::Transport;
 
 #[cfg(any(test, feature = "test-utils"))]

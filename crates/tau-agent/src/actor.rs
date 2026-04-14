@@ -15,14 +15,11 @@ use tokio_util::sync::CancellationToken;
 use crate::command::{Command, PromptResult};
 use crate::compaction::{self, CompactionReason};
 use crate::events::AgentEvent;
-use crate::logic::{self, ResponseAction, FollowUpAction};
+use crate::logic::{self, FollowUpAction, ResponseAction};
 use crate::overflow::is_context_overflow;
 use crate::state::{AgentState, ToolCall};
 use crate::stream::{StreamOutcome, StreamReducer};
-use crate::tool::{
-    ExecutionContext, ProgressSender, ToolResult,
-    send_event,
-};
+use crate::tool::{ExecutionContext, ProgressSender, ToolResult, send_event};
 use crate::tool_executor::run_single_tool;
 use crate::transport::AgentEventStream;
 
@@ -129,10 +126,24 @@ pub(crate) async fn run_actor(
                         run_final_summary(&mut state, &pending, &prompt_cancel).await;
                         StepPhase::Done(Ok(()))
                     } else {
-                        prepare_turn(&mut state, pending, first_user_message, &mut turn_number, &prompt_cancel).await
+                        prepare_turn(
+                            &mut state,
+                            pending,
+                            first_user_message,
+                            &mut turn_number,
+                            &prompt_cancel,
+                        )
+                        .await
                     }
                 } else {
-                    prepare_turn(&mut state, pending, first_user_message, &mut turn_number, &prompt_cancel).await
+                    prepare_turn(
+                        &mut state,
+                        pending,
+                        first_user_message,
+                        &mut turn_number,
+                        &prompt_cancel,
+                    )
+                    .await
                 }
             }
 
@@ -180,7 +191,11 @@ pub(crate) async fn run_actor(
                     run_proactive_compaction(&mut state, &prompt_cancel).await;
                 }
                 match decision.action {
-                    ResponseAction::RunTools { tool_calls, groups, first_user_message } => {
+                    ResponseAction::RunTools {
+                        tool_calls,
+                        groups,
+                        first_user_message,
+                    } => {
                         let mut remaining = groups;
                         let first = remaining.remove(0);
                         let join_set = spawn_group(&state, &tool_calls, &first, &prompt_cancel);
@@ -192,16 +207,22 @@ pub(crate) async fn run_actor(
                             first_user_message,
                         }
                     }
-                    ResponseAction::Compact { reason, resume_pending } => {
-                        StepPhase::RunCompaction {
-                            reason,
-                            reply: None,
-                            resume_after: resume_pending,
-                        }
-                    }
+                    ResponseAction::Compact {
+                        reason,
+                        resume_pending,
+                    } => StepPhase::RunCompaction {
+                        reason,
+                        reply: None,
+                        resume_after: resume_pending,
+                    },
                     ResponseAction::Done => StepPhase::DrainFollowUps,
                     ResponseAction::Error(e) => {
-                        send_event(&state.event_tx, AgentEvent::Error { message: e.to_string() });
+                        send_event(
+                            &state.event_tx,
+                            AgentEvent::Error {
+                                message: e.to_string(),
+                            },
+                        );
                         StepPhase::Done(Err(e))
                     }
                 }
@@ -307,7 +328,10 @@ pub(crate) async fn run_actor(
                 first_user_message,
             } => {
                 let tool_results = logic::collect_ordered_results(&tool_calls, results_map);
-                state.conversation.messages.extend(tool_results.iter().cloned());
+                state
+                    .conversation
+                    .messages
+                    .extend(tool_results.iter().cloned());
 
                 // Tool results are now committed to conversation.messages.
                 // Next turn's pending is empty — build_context reads from conversation.
@@ -317,16 +341,14 @@ pub(crate) async fn run_actor(
                 }
             }
 
-            StepPhase::DrainFollowUps => {
-                match state.drain_follow_ups() {
-                    FollowUpAction::Continue(msgs) => StepPhase::PrepareTurn {
-                        pending: msgs,
-                        first_user_message: None,
-                    },
-                    FollowUpAction::WaitForFollowUps => StepPhase::WaitingForFollowUps,
-                    FollowUpAction::Done => StepPhase::Done(Ok(())),
-                }
-            }
+            StepPhase::DrainFollowUps => match state.drain_follow_ups() {
+                FollowUpAction::Continue(msgs) => StepPhase::PrepareTurn {
+                    pending: msgs,
+                    first_user_message: None,
+                },
+                FollowUpAction::WaitForFollowUps => StepPhase::WaitingForFollowUps,
+                FollowUpAction::Done => StepPhase::Done(Ok(())),
+            },
 
             StepPhase::WaitingForFollowUps => {
                 // Block waiting for FollowUp commands from background agents.
@@ -358,7 +380,15 @@ pub(crate) async fn run_actor(
                 reply,
                 resume_after,
             } => {
-                run_compaction_phase(&mut state, reason, reply, resume_after, &prompt_cancel, &mut turn_number).await
+                run_compaction_phase(
+                    &mut state,
+                    reason,
+                    reply,
+                    resume_after,
+                    &prompt_cancel,
+                    &mut turn_number,
+                )
+                .await
             }
 
             StepPhase::Done(result) => {
@@ -471,7 +501,10 @@ fn handle_busy_command(state: &mut AgentState, cmd: Command) {
             state.file_access.lock().clear();
         }
         Command::SetMessages(msgs) => {
-            state.file_access.lock().rebuild_from_messages(&msgs, &state.cwd);
+            state
+                .file_access
+                .lock()
+                .rebuild_from_messages(&msgs, &state.cwd);
             state.conversation.messages = msgs;
         }
         Command::SetPreviousSummary(s) => state.conversation.previous_summary = s,
@@ -481,7 +514,6 @@ fn handle_busy_command(state: &mut AgentState, cmd: Command) {
                 result: Err(crate::error::Error::Busy),
             });
         }
-
     }
 }
 
@@ -499,7 +531,11 @@ async fn prepare_turn(
     let context = state.build_context(&pending);
     let run_config = state.build_run_config();
 
-    match state.transport.run(context, &run_config, cancel.clone()).await {
+    match state
+        .transport
+        .run(context, &run_config, cancel.clone())
+        .await
+    {
         Ok(stream) => StepPhase::AwaitingModel {
             stream,
             first_user_message,
@@ -523,7 +559,9 @@ async fn prepare_turn(
                 state.conversation.error = Some(error_msg.clone());
                 send_event(
                     &state.event_tx,
-                    AgentEvent::Error { message: error_msg.clone() },
+                    AgentEvent::Error {
+                        message: error_msg.clone(),
+                    },
                 );
                 StepPhase::Done(Err(crate::error::Error::Ai(e)))
             }
@@ -572,7 +610,16 @@ fn spawn_group(
         };
 
         join_set.spawn(async move {
-            let result = run_single_tool(tool, id.clone(), name.clone(), args, validator, event_tx, ctx).await;
+            let result = run_single_tool(
+                tool,
+                id.clone(),
+                name.clone(),
+                args,
+                validator,
+                event_tx,
+                ctx,
+            )
+            .await;
             (idx, id, name, result)
         });
     }
@@ -632,10 +679,7 @@ async fn run_compaction_phase(
     cancel: &CancellationToken,
     turn_number: &mut u32,
 ) -> StepPhase {
-    send_event(
-        &state.event_tx,
-        AgentEvent::CompactionStart { reason },
-    );
+    send_event(&state.event_tx, AgentEvent::CompactionStart { reason });
 
     let result = compaction::compact(
         &state.conversation.messages,
@@ -729,7 +773,11 @@ async fn run_final_summary(
     let mut final_config = state.build_run_config();
     final_config.tools.clear();
 
-    if let Ok(mut stream) = state.transport.run(context, &final_config, cancel.clone()).await {
+    if let Ok(mut stream) = state
+        .transport
+        .run(context, &final_config, cancel.clone())
+        .await
+    {
         let mut reducer = StreamReducer::default();
         while let Some(event) = stream.next().await {
             send_event(&state.event_tx, event.clone());

@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use futures::stream;
-use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tau_agent::test_utils::*;
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
@@ -248,7 +248,9 @@ async fn steering_during_tools_does_not_duplicate_tool_results() {
             };
             let events = vec![
                 AgentEvent::TurnStart { turn_number: 1 },
-                AgentEvent::MessageEnd { message: msg.clone() },
+                AgentEvent::MessageEnd {
+                    message: msg.clone(),
+                },
                 AgentEvent::TurnEnd {
                     turn_number: 1,
                     message: msg,
@@ -277,7 +279,11 @@ async fn steering_during_tools_does_not_duplicate_tool_results() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
 
     let calls = transport.captured.lock().unwrap().clone();
-    assert!(calls.len() >= 2, "should have at least 2 transport calls, got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "should have at least 2 transport calls, got {}",
+        calls.len()
+    );
 
     // The second call's context should NOT have duplicate ToolResult messages.
     // Before the fix, tool results appeared twice (once committed, once as pending).
@@ -298,5 +304,8 @@ async fn steering_during_tools_does_not_duplicate_tool_results() {
         .iter()
         .filter(|m| m.text().contains("redirect"))
         .count();
-    assert_eq!(steer_count, 1, "steering message should appear exactly once");
+    assert_eq!(
+        steer_count, 1,
+        "steering message should appear exactly once"
+    );
 }

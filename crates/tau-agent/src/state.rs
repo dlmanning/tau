@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use parking_lot::Mutex;
 use tau_ai::Message;

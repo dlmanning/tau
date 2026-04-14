@@ -2,22 +2,25 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::run_actor;
-use crate::state::AgentState;
 use crate::config::AgentConfig;
 use crate::events::AgentEvent;
 use crate::handle::AgentHandle;
+use crate::state::AgentState;
 use crate::tool::BoxedTool;
 use crate::transport::Transport;
 
+use parking_lot::Mutex as ParkingMutex;
+use tau_ai::{Message, ServerTool};
+
 /// Type alias for the transform context callback.
-pub(crate) type TransformContextFn = dyn Fn(Vec<tau_ai::Message>) -> Vec<tau_ai::Message> + Send + Sync;
+pub(crate) type TransformContextFn = dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync;
 
 /// Setup phase. Configure the agent, then call spawn() to start the actor.
 ///
@@ -29,11 +32,11 @@ pub struct AgentBuilder {
     config: AgentConfig,
     transport: Arc<dyn Transport>,
     tools: Vec<BoxedTool>,
-    server_tools: Vec<tau_ai::ServerTool>,
+    server_tools: Vec<ServerTool>,
     interaction_tx: Option<mpsc::Sender<crate::interaction::InteractionRequest>>,
     cwd: Option<PathBuf>,
     transform_context: Option<Arc<TransformContextFn>>,
-    initial_messages: Vec<tau_ai::Message>,
+    initial_messages: Vec<Message>,
     previous_summary: Option<String>,
 
     // Pre-created shared primitives (created in new(), used by pre_handle() and spawn())
@@ -42,7 +45,7 @@ pub struct AgentBuilder {
     urgent_rx: Option<mpsc::Receiver<crate::command::Command>>,
     normal_tx: mpsc::Sender<crate::command::Command>,
     normal_rx: Option<mpsc::Receiver<crate::command::Command>>,
-    cancel: Arc<parking_lot::Mutex<CancellationToken>>,
+    cancel: Arc<ParkingMutex<CancellationToken>>,
     is_running: Arc<AtomicBool>,
     pending_follow_ups: Arc<AtomicU32>,
 }
@@ -52,7 +55,7 @@ impl AgentBuilder {
         let (event_tx, _) = broadcast::channel(256);
         let (urgent_tx, urgent_rx) = mpsc::channel(64);
         let (normal_tx, normal_rx) = mpsc::channel(32);
-        let cancel = Arc::new(parking_lot::Mutex::new(CancellationToken::new()));
+        let cancel = Arc::new(ParkingMutex::new(CancellationToken::new()));
         let is_running = Arc::new(AtomicBool::new(false));
         let pending_follow_ups = Arc::new(AtomicU32::new(0));
 
@@ -89,7 +92,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn add_server_tool(&mut self, tool: tau_ai::ServerTool) -> &mut Self {
+    pub fn add_server_tool(&mut self, tool: ServerTool) -> &mut Self {
         self.server_tools.push(tool);
         self
     }
@@ -112,7 +115,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn set_messages(&mut self, messages: Vec<tau_ai::Message>) -> &mut Self {
+    pub fn set_messages(&mut self, messages: Vec<Message>) -> &mut Self {
         self.initial_messages = messages;
         self
     }
@@ -122,10 +125,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn set_transform_context(
-        &mut self,
-        f: Arc<TransformContextFn>,
-    ) -> &mut Self {
+    pub fn set_transform_context(&mut self, f: Arc<TransformContextFn>) -> &mut Self {
         self.transform_context = Some(f);
         self
     }
@@ -211,9 +211,7 @@ impl AgentBuilder {
             server_tools: self.server_tools,
             schema_cache,
             cwd: self.cwd,
-            file_access: Arc::new(parking_lot::Mutex::new(
-                crate::tool::FileAccessTracker::default(),
-            )),
+            file_access: Arc::new(ParkingMutex::new(crate::tool::FileAccessTracker::default())),
             interaction_tx: self.interaction_tx,
             transform_context: self.transform_context,
             steering_queue: Vec::new(),

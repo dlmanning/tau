@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use futures::stream;
-use tau_agent::test_utils::*;
 use tau_agent::manager::{AgentManager, AgentStatus, AgentType, SpawnRequest};
+use tau_agent::test_utils::*;
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
@@ -720,7 +720,11 @@ async fn abort_root_agent_cancels_all_subagents() {
 
     // Wait for subagents to start their transports
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(cancel_count.load(Ordering::SeqCst), 0, "no cancellations yet");
+    assert_eq!(
+        cancel_count.load(Ordering::SeqCst),
+        0,
+        "no cancellations yet"
+    );
 
     // User aborts the root agent
     root_handle.abort();

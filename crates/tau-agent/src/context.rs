@@ -5,6 +5,7 @@
 //! 2. Parent directories: from repo root down to current directory
 //! 3. Current directory: highest priority
 
+use std::env;
 use std::path::{Path, PathBuf};
 
 /// Names of context files to look for (in order of preference)
@@ -40,7 +41,7 @@ fn load_global_context() -> Option<String> {
 
 /// Load context from current directory
 fn load_current_context() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
+    let cwd = env::current_dir().ok()?;
     load_context_from_dir(&cwd)
 }
 
@@ -48,7 +49,7 @@ fn load_current_context() -> Option<String> {
 fn load_parent_contexts() -> Vec<String> {
     let mut contexts = Vec::new();
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match env::current_dir() {
         Ok(p) => p,
         Err(_) => return contexts,
     };
@@ -122,7 +123,7 @@ pub fn list_context_files() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = env::current_dir() {
         let repo_root = find_repo_root(&cwd);
         let start_dir = repo_root.unwrap_or_else(|| PathBuf::from("/"));
 

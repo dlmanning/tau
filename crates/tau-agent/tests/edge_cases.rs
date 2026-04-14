@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use futures::stream;
-use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tau_agent::test_utils::*;
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};

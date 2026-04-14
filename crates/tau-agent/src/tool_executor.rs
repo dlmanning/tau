@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::events::AgentEvent;
@@ -14,7 +15,7 @@ pub(crate) async fn run_single_tool(
     tool: Option<BoxedTool>,
     id: String,
     name: String,
-    args: serde_json::Value,
+    args: Value,
     validator: Option<Arc<jsonschema::Validator>>,
     event_tx: broadcast::Sender<AgentEvent>,
     ctx: ExecutionContext,
@@ -82,7 +83,7 @@ pub(crate) fn has_meaningful_content(message: &tau_ai::Message) -> bool {
 /// Validate tool arguments using a pre-compiled validator.
 /// Returns `Some(error_message)` if validation fails, `None` if valid.
 pub(crate) fn validate_with_validator(
-    args: &serde_json::Value,
+    args: &Value,
     validator: &jsonschema::Validator,
 ) -> Option<String> {
     let errors: Vec<String> = validator

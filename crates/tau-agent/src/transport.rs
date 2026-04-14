@@ -5,7 +5,13 @@ use std::{pin::Pin, time::Duration};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::StreamExt;
-use tau_ai::{Context, Model, Result, stream::MessageBuilder};
+use serde_json::Value;
+use tau_ai::{
+    Api, AssistantMetadata, Context, Message, Model, Provider, ReasoningLevel, Result, ServerTool,
+    Tool as AiTool, Usage,
+    stream::{MessageBuilder, MessageEvent},
+};
+use tokio::time;
 use tokio_stream::Stream;
 
 use crate::events::AgentEvent;
@@ -35,11 +41,17 @@ impl Default for RetryConfig {
 }
 
 /// Seconds of stream inactivity before logging a stall warning
-#[allow(dead_code)]
 const STREAM_STALL_WARN_SECS: u64 = 30;
 /// Seconds of stream inactivity before aborting the stream
-#[allow(dead_code)]
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// Longer timeouts for local model providers where time-to-first-token can be slow
+const LOCAL_STREAM_STALL_WARN_SECS: u64 = 120;
+const LOCAL_STREAM_IDLE_TIMEOUT_SECS: u64 = 600;
+
+fn is_local_provider(provider: Provider) -> bool {
+    matches!(provider, Provider::Ollama | Provider::Custom)
+}
 
 impl RetryConfig {
     /// Calculate delay for a given attempt (0-indexed)
@@ -58,7 +70,7 @@ async fn create_provider_and_stream(
     api_key: Option<&str>,
 ) -> Result<tau_ai::stream::MessageEventStream> {
     match model.api {
-        tau_ai::Api::AnthropicMessages => {
+        Api::AnthropicMessages => {
             use tau_ai::providers::anthropic::{AnthropicOptions, AnthropicProvider, CacheScope};
 
             let provider = if let Some(key) = api_key {
@@ -68,14 +80,14 @@ async fn create_provider_and_stream(
             };
 
             let reasoning = config.reasoning.unwrap_or_default();
-            let thinking_enabled = reasoning != tau_ai::ReasoningLevel::Off;
+            let thinking_enabled = reasoning != ReasoningLevel::Off;
 
             let budget = match reasoning {
-                tau_ai::ReasoningLevel::Off => None,
-                tau_ai::ReasoningLevel::Minimal => Some(1024),
-                tau_ai::ReasoningLevel::Low => Some(4096),
-                tau_ai::ReasoningLevel::Medium => Some(10000),
-                tau_ai::ReasoningLevel::High => Some(32000),
+                ReasoningLevel::Off => None,
+                ReasoningLevel::Minimal => Some(1024),
+                ReasoningLevel::Low => Some(4096),
+                ReasoningLevel::Medium => Some(10000),
+                ReasoningLevel::High => Some(32000),
             };
 
             let cache_scope = config.cache_scope.as_deref().and_then(|s| match s {
@@ -110,15 +122,17 @@ async fn create_provider_and_stream(
 
             provider.stream(model, context, Some(&options)).await
         }
-        tau_ai::Api::OpenAICompletions | tau_ai::Api::OpenAIResponses => {
+        Api::OpenAICompletions | Api::OpenAIResponses => {
             let provider = if let Some(key) = api_key {
                 tau_ai::providers::openai::OpenAIProvider::new(key.to_string())
-            } else {
+            } else if model.provider.api_key_env_var().is_some() {
                 tau_ai::providers::openai::OpenAIProvider::from_env()?
+            } else {
+                tau_ai::providers::openai::OpenAIProvider::without_key()
             };
             provider.stream(model, context).await
         }
-        tau_ai::Api::GoogleGenerativeAI => {
+        Api::GoogleGenerativeAI => {
             let provider = if let Some(key) = api_key {
                 tau_ai::providers::google::GoogleProvider::new(key.to_string())
             } else {
@@ -130,7 +144,7 @@ async fn create_provider_and_stream(
 }
 
 /// Format a server tool result for display.
-fn format_server_tool_result(api_type: &str, content: &serde_json::Value) -> String {
+fn format_server_tool_result(api_type: &str, content: &Value) -> String {
     if api_type.contains("web_search") {
         if let Some(results) = content.as_array() {
             let entries: Vec<String> = results
@@ -188,13 +202,13 @@ pub struct AgentRunConfig {
     /// System prompt
     pub system_prompt: Option<String>,
     /// Available tools (as API definitions)
-    pub tools: Vec<tau_ai::Tool>,
+    pub tools: Vec<AiTool>,
     /// Server-controlled tools (e.g. web search)
-    pub server_tools: Vec<tau_ai::ServerTool>,
+    pub server_tools: Vec<ServerTool>,
     /// Model to use
     pub model: Model,
     /// Reasoning/thinking level
-    pub reasoning: Option<tau_ai::ReasoningLevel>,
+    pub reasoning: Option<ReasoningLevel>,
     /// Use adaptive thinking (model decides when to think)
     pub thinking_adaptive: bool,
     /// Maximum tokens per response
@@ -218,7 +232,7 @@ pub trait Transport: Send + Sync {
     /// Run an agent turn, streaming events
     async fn run(
         &self,
-        messages: Vec<tau_ai::Message>,
+        messages: Vec<Message>,
         config: &AgentRunConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<AgentEventStream>;
@@ -265,7 +279,7 @@ impl Default for ProviderTransport {
 impl Transport for ProviderTransport {
     async fn run(
         &self,
-        messages: Vec<tau_ai::Message>,
+        messages: Vec<Message>,
         config: &AgentRunConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<AgentEventStream> {
@@ -317,7 +331,7 @@ impl Transport for ProviderTransport {
                                 delay
                             );
                             attempt += 1;
-                            tokio::time::sleep(delay).await;
+                            time::sleep(delay).await;
                             continue;
                         }
 
@@ -331,9 +345,13 @@ impl Transport for ProviderTransport {
 
             let mut builder = MessageBuilder::new();
             let mut final_message = None;
-            let mut final_usage = tau_ai::Usage::default();
+            let mut final_usage = Usage::default();
             let mut stall_warned = false;
-            let mut last_event_at = tokio::time::Instant::now();
+            let mut last_event_at = time::Instant::now();
+
+            let local = is_local_provider(model.provider);
+            let stall_warn_secs = if local { LOCAL_STREAM_STALL_WARN_SECS } else { STREAM_STALL_WARN_SECS };
+            let idle_timeout_secs = if local { LOCAL_STREAM_IDLE_TIMEOUT_SECS } else { STREAM_IDLE_TIMEOUT_SECS };
 
             loop {
                 if cancel.is_cancelled() {
@@ -341,34 +359,34 @@ impl Transport for ProviderTransport {
                     return;
                 }
 
-                let stall_remaining = Duration::from_secs(STREAM_STALL_WARN_SECS)
+                let stall_remaining = Duration::from_secs(stall_warn_secs)
                     .saturating_sub(last_event_at.elapsed());
-                let idle_remaining = Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)
+                let idle_remaining = Duration::from_secs(idle_timeout_secs)
                     .saturating_sub(last_event_at.elapsed());
 
                 if idle_remaining.is_zero() {
-                    tracing::error!("Stream idle for {}s, aborting", STREAM_IDLE_TIMEOUT_SECS);
+                    tracing::error!("Stream idle for {}s, aborting", idle_timeout_secs);
                     yield AgentEvent::Error {
-                        message: format!("Stream timed out after {}s of inactivity", STREAM_IDLE_TIMEOUT_SECS),
+                        message: format!("Stream timed out after {}s of inactivity", idle_timeout_secs),
                     };
                     return;
                 }
 
                 if stall_remaining.is_zero() && !stall_warned {
                     tracing::warn!("Stream stalled for {}s, waiting up to {}s before aborting",
-                        STREAM_STALL_WARN_SECS, STREAM_IDLE_TIMEOUT_SECS);
+                        stall_warn_secs, idle_timeout_secs);
                     stall_warned = true;
                 }
 
-                let event = match tokio::time::timeout(
+                let event = match time::timeout(
                     idle_remaining,
                     message_stream.next(),
                 ).await {
                     Ok(event) => event,
                     Err(_) => {
-                        tracing::error!("Stream idle for {}s, aborting", STREAM_IDLE_TIMEOUT_SECS);
+                        tracing::error!("Stream idle for {}s, aborting", idle_timeout_secs);
                         yield AgentEvent::Error {
-                            message: format!("Stream timed out after {}s of inactivity", STREAM_IDLE_TIMEOUT_SECS),
+                            message: format!("Stream timed out after {}s of inactivity", idle_timeout_secs),
                         };
                         return;
                     }
@@ -376,25 +394,25 @@ impl Transport for ProviderTransport {
 
                 let Some(event) = event else { break };
 
-                last_event_at = tokio::time::Instant::now();
+                last_event_at = time::Instant::now();
                 stall_warned = false;
 
                 builder.process_event(&event);
 
                 match &event {
-                    tau_ai::stream::MessageEvent::Start { message } => {
+                    MessageEvent::Start { message } => {
                         yield AgentEvent::MessageStart { message: message.clone() };
                     }
-                    tau_ai::stream::MessageEvent::TextDelta { .. }
-                    | tau_ai::stream::MessageEvent::ThinkingDelta { .. }
-                    | tau_ai::stream::MessageEvent::ToolCallDelta { .. } => {
-                        let partial = tau_ai::Message::Assistant {
+                    MessageEvent::TextDelta { .. }
+                    | MessageEvent::ThinkingDelta { .. }
+                    | MessageEvent::ToolCallDelta { .. } => {
+                        let partial = Message::Assistant {
                             content: builder.current_content(),
-                            metadata: tau_ai::AssistantMetadata::default(),
+                            metadata: AssistantMetadata::default(),
                         };
                         yield AgentEvent::MessageUpdate { message: partial };
                     }
-                    tau_ai::stream::MessageEvent::ServerToolStart { id, name, input, .. } => {
+                    MessageEvent::ServerToolStart { id, name, input, .. } => {
                         yield AgentEvent::ToolExecutionStart {
                             tool_call_id: id.clone(),
                             tool_name: name.clone(),
@@ -402,7 +420,7 @@ impl Transport for ProviderTransport {
                             activity: format!("Running {}", name),
                         };
                     }
-                    tau_ai::stream::MessageEvent::ServerToolEnd { tool_use_id, api_type, content, .. } => {
+                    MessageEvent::ServerToolEnd { tool_use_id, api_type, content, .. } => {
                         let result = format_server_tool_result(api_type, content);
                         yield AgentEvent::ToolExecutionEnd {
                             tool_call_id: tool_use_id.clone(),
@@ -411,12 +429,12 @@ impl Transport for ProviderTransport {
                             is_error: false,
                         };
                     }
-                    tau_ai::stream::MessageEvent::Done { message, usage, .. } => {
+                    MessageEvent::Done { message, usage, .. } => {
                         final_message = Some(message.clone());
                         final_usage = usage.clone();
                         yield AgentEvent::MessageEnd { message: message.clone() };
                     }
-                    tau_ai::stream::MessageEvent::Error { message } => {
+                    MessageEvent::Error { message } => {
                         yield AgentEvent::Error { message: message.clone() };
                         return;
                     }

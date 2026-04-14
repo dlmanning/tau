@@ -8,10 +8,10 @@ use std::collections::HashMap;
 
 use tau_ai::{Content, Message, Usage};
 
-use crate::state::{AgentState, ToolCall};
 use crate::compaction::{CompactionReason, CompactionResult};
 use crate::config::DequeueMode;
 use crate::overflow::is_context_overflow;
+use crate::state::{AgentState, ToolCall};
 use crate::stream::StreamOutcome;
 use crate::tool::{BoxedTool, Concurrency, ToolResult, to_api_tool};
 use crate::tool_executor::has_meaningful_content;
@@ -260,7 +260,11 @@ impl AgentState {
         }
 
         // Wait for background agents?
-        if self.pending_follow_ups.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        if self
+            .pending_follow_ups
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
             return FollowUpAction::WaitForFollowUps;
         }
 
@@ -312,7 +316,10 @@ impl AgentState {
     /// Apply a compaction result to conversation state.
     pub(crate) fn apply_compaction_result(&mut self, result: CompactionResult) {
         self.conversation.previous_summary = Some(result.summary.clone());
-        let kept = self.conversation.messages.split_off(result.first_kept_index);
+        let kept = self
+            .conversation
+            .messages
+            .split_off(result.first_kept_index);
         self.conversation.messages = vec![Message::user(format!(
             "<context-summary>\n{}\n</context-summary>\n\nThe conversation was compacted. Continue from where we left off.",
             result.summary
@@ -492,9 +499,21 @@ mod tests {
     fn build_tool_groups_all_parallel() {
         let tools: Vec<BoxedTool> = vec![Arc::new(EchoTool)];
         let calls = vec![
-            ToolCall { id: "1".into(), name: "echo".into(), args: serde_json::json!({}) },
-            ToolCall { id: "2".into(), name: "echo".into(), args: serde_json::json!({}) },
-            ToolCall { id: "3".into(), name: "echo".into(), args: serde_json::json!({}) },
+            ToolCall {
+                id: "1".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "3".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
         ];
         let groups = build_tool_groups(&tools, &calls);
         assert_eq!(groups.len(), 1);
@@ -505,9 +524,21 @@ mod tests {
     fn build_tool_groups_unknown_tool_is_sequential() {
         let tools: Vec<BoxedTool> = vec![Arc::new(EchoTool)];
         let calls = vec![
-            ToolCall { id: "1".into(), name: "echo".into(), args: serde_json::json!({}) },
-            ToolCall { id: "2".into(), name: "unknown".into(), args: serde_json::json!({}) },
-            ToolCall { id: "3".into(), name: "echo".into(), args: serde_json::json!({}) },
+            ToolCall {
+                id: "1".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "unknown".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "3".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
         ];
         let groups = build_tool_groups(&tools, &calls);
         // echo(parallel), unknown(sequential), echo(parallel)
@@ -528,10 +559,7 @@ mod tests {
 
     #[test]
     fn drain_queue_all_mode() {
-        let mut queue = vec![
-            make_user_message("a"),
-            make_user_message("b"),
-        ];
+        let mut queue = vec![make_user_message("a"), make_user_message("b")];
         let drained = drain_queue(&mut queue, DequeueMode::All);
         assert_eq!(drained.len(), 2);
         assert!(queue.is_empty());
@@ -539,10 +567,7 @@ mod tests {
 
     #[test]
     fn drain_queue_one_at_a_time() {
-        let mut queue = vec![
-            make_user_message("a"),
-            make_user_message("b"),
-        ];
+        let mut queue = vec![make_user_message("a"), make_user_message("b")];
         let drained = drain_queue(&mut queue, DequeueMode::OneAtATime);
         assert_eq!(drained.len(), 1);
         assert_eq!(queue.len(), 1);
@@ -562,7 +587,11 @@ mod tests {
         let mut state = make_test_state();
         let outcome = StreamOutcome {
             assistant_message: Some(make_assistant_message("hello")),
-            usage: tau_ai::Usage { input: 100, output: 50, ..Default::default() },
+            usage: tau_ai::Usage {
+                input: 100,
+                output: 50,
+                ..Default::default()
+            },
             error: None,
             partial_message: None,
         };
@@ -591,7 +620,9 @@ mod tests {
         let decision = state.process_response(outcome, vec![], None);
 
         match decision.action {
-            ResponseAction::RunTools { tool_calls, groups, .. } => {
+            ResponseAction::RunTools {
+                tool_calls, groups, ..
+            } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].name, "echo");
                 assert_eq!(groups.len(), 1);
@@ -646,7 +677,10 @@ mod tests {
         let outcome = StreamOutcome {
             assistant_message: Some(make_assistant_message("hi")),
             // input + cache_read = 950 > 1000 - 100 = 900
-            usage: tau_ai::Usage { input: 950, ..Default::default() },
+            usage: tau_ai::Usage {
+                input: 950,
+                ..Default::default()
+            },
             error: None,
             partial_message: None,
         };
@@ -667,7 +701,10 @@ mod tests {
         let msg = make_tool_call_message("echo", "call_1", serde_json::json!({"text": "x"}));
         let outcome = StreamOutcome {
             assistant_message: Some(msg),
-            usage: tau_ai::Usage { input: 950, ..Default::default() },
+            usage: tau_ai::Usage {
+                input: 950,
+                ..Default::default()
+            },
             error: None,
             partial_message: None,
         };
@@ -749,9 +786,14 @@ mod tests {
     #[test]
     fn drain_follow_ups_waits_for_background() {
         let mut state = make_test_state();
-        state.pending_follow_ups.store(1, std::sync::atomic::Ordering::Release);
+        state
+            .pending_follow_ups
+            .store(1, std::sync::atomic::Ordering::Release);
 
-        assert!(matches!(state.drain_follow_ups(), FollowUpAction::WaitForFollowUps));
+        assert!(matches!(
+            state.drain_follow_ups(),
+            FollowUpAction::WaitForFollowUps
+        ));
     }
 
     #[test]
@@ -766,14 +808,20 @@ mod tests {
     fn should_compact_when_over_threshold() {
         let state = make_test_state();
         // context_window=200000, reserve=16384, limit=183616
-        let usage = tau_ai::Usage { input: 190000, ..Default::default() };
+        let usage = tau_ai::Usage {
+            input: 190000,
+            ..Default::default()
+        };
         assert!(state.should_compact_proactively(&usage));
     }
 
     #[test]
     fn should_not_compact_when_under_threshold() {
         let state = make_test_state();
-        let usage = tau_ai::Usage { input: 100, ..Default::default() };
+        let usage = tau_ai::Usage {
+            input: 100,
+            ..Default::default()
+        };
         assert!(!state.should_compact_proactively(&usage));
     }
 
@@ -781,7 +829,10 @@ mod tests {
     fn should_not_compact_when_disabled() {
         let mut state = make_test_state();
         state.config.compaction.enabled = false;
-        let usage = tau_ai::Usage { input: 999999, ..Default::default() };
+        let usage = tau_ai::Usage {
+            input: 999999,
+            ..Default::default()
+        };
         assert!(!state.should_compact_proactively(&usage));
     }
 
@@ -809,7 +860,11 @@ mod tests {
 
         // Should have: summary message + 2 recent messages
         assert_eq!(state.conversation.messages.len(), 3);
-        assert!(state.conversation.messages[0].text().contains("context-summary"));
+        assert!(
+            state.conversation.messages[0]
+                .text()
+                .contains("context-summary")
+        );
         assert_eq!(state.conversation.messages[1].text(), "recent 1");
         assert_eq!(state.conversation.messages[2].text(), "recent 2");
         assert_eq!(
@@ -823,13 +878,35 @@ mod tests {
     #[test]
     fn collect_ordered_results_preserves_order() {
         let calls = vec![
-            ToolCall { id: "a".into(), name: "t1".into(), args: serde_json::json!({}) },
-            ToolCall { id: "b".into(), name: "t2".into(), args: serde_json::json!({}) },
+            ToolCall {
+                id: "a".into(),
+                name: "t1".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".into(),
+                name: "t2".into(),
+                args: serde_json::json!({}),
+            },
         ];
         let mut results = HashMap::new();
         // Insert in reverse order
-        results.insert(1, ("b".to_string(), "t2".to_string(), ToolResult::text("result_b")));
-        results.insert(0, ("a".to_string(), "t1".to_string(), ToolResult::text("result_a")));
+        results.insert(
+            1,
+            (
+                "b".to_string(),
+                "t2".to_string(),
+                ToolResult::text("result_b"),
+            ),
+        );
+        results.insert(
+            0,
+            (
+                "a".to_string(),
+                "t1".to_string(),
+                ToolResult::text("result_a"),
+            ),
+        );
 
         let messages = collect_ordered_results(&calls, results);
         assert_eq!(messages.len(), 2);
@@ -839,9 +916,11 @@ mod tests {
 
     #[test]
     fn collect_ordered_results_handles_missing() {
-        let calls = vec![
-            ToolCall { id: "a".into(), name: "t1".into(), args: serde_json::json!({}) },
-        ];
+        let calls = vec![ToolCall {
+            id: "a".into(),
+            name: "t1".into(),
+            args: serde_json::json!({}),
+        }];
         let results = HashMap::new(); // No results at all
 
         let messages = collect_ordered_results(&calls, results);
@@ -930,13 +1009,20 @@ mod tests {
     #[test]
     fn drain_follow_ups_decrements_pending_count() {
         let mut state = make_test_state();
-        state.pending_follow_ups.store(2, std::sync::atomic::Ordering::Release);
+        state
+            .pending_follow_ups
+            .store(2, std::sync::atomic::Ordering::Release);
         state.follow_up_queue.push(make_user_message("a"));
         state.follow_up_queue.push(make_user_message("b"));
 
         let action = state.drain_follow_ups();
         assert!(matches!(action, FollowUpAction::Continue(_)));
-        assert_eq!(state.pending_follow_ups.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(
+            state
+                .pending_follow_ups
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 
     // ─── handle_batch_complete ─────────────────────────────────────
@@ -944,11 +1030,16 @@ mod tests {
     #[test]
     fn batch_complete_no_steering_all_done() {
         let mut state = make_test_state();
-        let calls = vec![
-            ToolCall { id: "a".into(), name: "echo".into(), args: serde_json::json!({}) },
-        ];
+        let calls = vec![ToolCall {
+            id: "a".into(),
+            name: "echo".into(),
+            args: serde_json::json!({}),
+        }];
         let mut results = HashMap::new();
-        results.insert(0, ("a".to_string(), "echo".to_string(), ToolResult::text("ok")));
+        results.insert(
+            0,
+            ("a".to_string(), "echo".to_string(), ToolResult::text("ok")),
+        );
 
         let action = state.handle_batch_complete(&[], &calls, &mut results);
         assert!(matches!(action, BatchCompleteAction::AllGroupsDone));
@@ -958,11 +1049,22 @@ mod tests {
     fn batch_complete_more_groups_remaining() {
         let mut state = make_test_state();
         let calls = vec![
-            ToolCall { id: "a".into(), name: "echo".into(), args: serde_json::json!({}) },
-            ToolCall { id: "b".into(), name: "echo".into(), args: serde_json::json!({}) },
+            ToolCall {
+                id: "a".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
         ];
         let mut results = HashMap::new();
-        results.insert(0, ("a".to_string(), "echo".to_string(), ToolResult::text("ok")));
+        results.insert(
+            0,
+            ("a".to_string(), "echo".to_string(), ToolResult::text("ok")),
+        );
 
         let remaining = vec![vec![1]];
         let action = state.handle_batch_complete(&remaining, &calls, &mut results);
@@ -980,17 +1082,31 @@ mod tests {
         state.steering_queue.push(make_user_message("redirect"));
 
         let calls = vec![
-            ToolCall { id: "a".into(), name: "echo".into(), args: serde_json::json!({}) },
-            ToolCall { id: "b".into(), name: "echo".into(), args: serde_json::json!({}) },
+            ToolCall {
+                id: "a".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".into(),
+                name: "echo".into(),
+                args: serde_json::json!({}),
+            },
         ];
         let mut results = HashMap::new();
-        results.insert(0, ("a".to_string(), "echo".to_string(), ToolResult::text("ok")));
+        results.insert(
+            0,
+            ("a".to_string(), "echo".to_string(), ToolResult::text("ok")),
+        );
         // Group 1 (index 1) not yet executed
         let remaining = vec![vec![1]];
 
         let action = state.handle_batch_complete(&remaining, &calls, &mut results);
         match action {
-            BatchCompleteAction::Redirect { steering, skipped_indices } => {
+            BatchCompleteAction::Redirect {
+                steering,
+                skipped_indices,
+            } => {
                 assert_eq!(steering.len(), 1);
                 assert_eq!(steering[0].text(), "redirect");
                 // Index 1 ("b") should be skipped
@@ -1001,7 +1117,10 @@ mod tests {
         }
 
         // Tool results should be committed to conversation (2: one real, one skipped)
-        let tool_results: Vec<_> = state.conversation.messages.iter()
+        let tool_results: Vec<_> = state
+            .conversation
+            .messages
+            .iter()
             .filter(|m| matches!(m, Message::ToolResult { .. }))
             .collect();
         assert_eq!(tool_results.len(), 2);
@@ -1035,7 +1154,11 @@ mod tests {
         let msg = make_tool_call_message("echo", "c1", serde_json::json!({"text": "x"}));
         let outcome = StreamOutcome {
             assistant_message: Some(msg),
-            usage: tau_ai::Usage { input: 100, output: 50, ..Default::default() },
+            usage: tau_ai::Usage {
+                input: 100,
+                output: 50,
+                ..Default::default()
+            },
             error: None,
             partial_message: None,
         };

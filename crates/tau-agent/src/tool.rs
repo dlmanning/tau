@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tau_ai::{Content, Message};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -79,7 +80,7 @@ impl FileAccessTracker {
 
 /// Resolve a file path from tool arguments, handling `~/`, relative paths,
 /// and canonicalization.
-fn resolve_tool_path(args: &serde_json::Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
+fn resolve_tool_path(args: &Value, cwd: &Option<PathBuf>) -> Option<PathBuf> {
     let path_str = args.get("path").and_then(|v| v.as_str())?;
     let path = if let Some(rest) = path_str.strip_prefix("~/") {
         dirs::home_dir()
@@ -111,7 +112,7 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Optional structured details (for UI rendering)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
+    pub details: Option<Value>,
 }
 
 impl ToolResult {
@@ -143,7 +144,7 @@ impl ToolResult {
     }
 
     /// Add details to the result
-    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+    pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
         self
     }
@@ -269,7 +270,7 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
 
     /// JSON Schema for parameters
-    fn parameters_schema(&self) -> serde_json::Value;
+    fn parameters_schema(&self) -> Value;
 
     /// Whether this tool can run concurrently with other Parallel tools.
     /// Defaults to `Parallel`. Override to `Sequential` for tools that
@@ -281,12 +282,12 @@ pub trait Tool: Send + Sync {
     /// Short, human-readable description of what this invocation is doing,
     /// shown in the TUI while the tool executes (e.g. "Reading main.rs").
     /// Default: "Running {name}".
-    fn activity_description(&self, _arguments: &serde_json::Value) -> String {
+    fn activity_description(&self, _arguments: &Value) -> String {
         format!("Running {}", self.name())
     }
 
     /// Execute the tool with the given arguments and execution context.
-    async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult;
+    async fn execute(&self, arguments: Value, ctx: ExecutionContext) -> ToolResult;
 }
 
 /// Type alias for a boxed tool
@@ -315,7 +316,7 @@ mod tests {
         fn description(&self) -> &str {
             "Echoes input"
         }
-        fn parameters_schema(&self) -> serde_json::Value {
+        fn parameters_schema(&self) -> Value {
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -323,11 +324,7 @@ mod tests {
                 }
             })
         }
-        async fn execute(
-            &self,
-            arguments: serde_json::Value,
-            _ctx: ExecutionContext,
-        ) -> ToolResult {
+        async fn execute(&self, arguments: Value, _ctx: ExecutionContext) -> ToolResult {
             let text = arguments
                 .get("text")
                 .and_then(|v| v.as_str())

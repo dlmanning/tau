@@ -10,13 +10,20 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream;
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::watch;
+use serde_json::Value;
+use tau_ai::{
+    Api, AssistantMetadata, Content, CostInfo, InputType, Message, Model, Provider, ReasoningLevel,
+    Usage,
+};
+use tokio::sync::{broadcast, watch};
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{AgentConfig, DequeueMode};
@@ -32,29 +39,29 @@ use crate::transport::{AgentEventStream, AgentRunConfig, Transport};
 // ---------------------------------------------------------------------------
 
 /// Create a user message with text content.
-pub fn make_user_message(text: &str) -> tau_ai::Message {
-    tau_ai::Message::user(text)
+pub fn make_user_message(text: &str) -> Message {
+    Message::user(text)
 }
 
 /// Create an assistant message with text content.
-pub fn make_assistant_message(text: &str) -> tau_ai::Message {
-    tau_ai::Message::Assistant {
-        content: vec![tau_ai::Content::text(text)],
-        metadata: tau_ai::AssistantMetadata::default(),
+pub fn make_assistant_message(text: &str) -> Message {
+    Message::Assistant {
+        content: vec![Content::text(text)],
+        metadata: AssistantMetadata::default(),
     }
 }
 
 /// Create an assistant message containing a tool call.
-pub fn make_tool_call_message(name: &str, id: &str, args: serde_json::Value) -> tau_ai::Message {
-    tau_ai::Message::Assistant {
-        content: vec![tau_ai::Content::tool_call(id, name, args)],
-        metadata: tau_ai::AssistantMetadata::default(),
+pub fn make_tool_call_message(name: &str, id: &str, args: Value) -> Message {
+    Message::Assistant {
+        content: vec![Content::tool_call(id, name, args)],
+        metadata: AssistantMetadata::default(),
     }
 }
 
 /// Create a tool result message.
-pub fn make_tool_result(id: &str, name: &str, text: &str) -> tau_ai::Message {
-    tau_ai::Message::tool_result(id, name, vec![tau_ai::Content::text(text)], false)
+pub fn make_tool_result(id: &str, name: &str, text: &str) -> Message {
+    Message::tool_result(id, name, vec![Content::text(text)], false)
 }
 
 // ---------------------------------------------------------------------------
@@ -62,16 +69,16 @@ pub fn make_tool_result(id: &str, name: &str, text: &str) -> tau_ai::Message {
 // ---------------------------------------------------------------------------
 
 /// Create a minimal Model suitable for tests. Does not hit any real API.
-pub fn make_test_model() -> tau_ai::Model {
-    tau_ai::Model {
+pub fn make_test_model() -> Model {
+    Model {
         id: "test-model".to_string(),
         name: "Test Model".to_string(),
-        api: tau_ai::Api::AnthropicMessages,
-        provider: tau_ai::Provider::Anthropic,
+        api: Api::AnthropicMessages,
+        provider: Provider::Anthropic,
         base_url: "https://test.invalid".to_string(),
         reasoning: false,
-        input_types: vec![tau_ai::InputType::Text],
-        cost: tau_ai::CostInfo::default(),
+        input_types: vec![InputType::Text],
+        cost: CostInfo::default(),
         context_window: 200_000,
         max_tokens: 8192,
         headers: Default::default(),
@@ -90,7 +97,7 @@ pub fn make_test_config() -> AgentConfig {
     AgentConfig {
         system_prompt: None,
         model: make_test_model(),
-        reasoning: tau_ai::ReasoningLevel::Off,
+        reasoning: ReasoningLevel::Off,
         thinking_adaptive: false,
         max_tokens: None,
         max_turns: None,
@@ -105,7 +112,7 @@ pub fn make_test_config() -> AgentConfig {
 
 /// Create an `ExecutionContext` for testing tools in isolation.
 pub fn make_execution_context() -> ExecutionContext {
-    let (tx, _rx) = tokio::sync::broadcast::channel(256);
+    let (tx, _rx) = broadcast::channel(256);
     ExecutionContext {
         cwd: PathBuf::from("/tmp"),
         cancel: CancellationToken::new(),
@@ -163,7 +170,7 @@ impl MockTransport {
             AgentEvent::TurnEnd {
                 turn_number: 1,
                 message: msg,
-                usage: tau_ai::Usage {
+                usage: Usage {
                     input: 100,
                     output: 50,
                     ..Default::default()
@@ -174,12 +181,7 @@ impl MockTransport {
     }
 
     /// Queue a complete turn where the assistant requests a tool call.
-    pub fn with_tool_call_response(
-        self,
-        tool_name: &str,
-        tool_call_id: &str,
-        args: serde_json::Value,
-    ) -> Self {
+    pub fn with_tool_call_response(self, tool_name: &str, tool_call_id: &str, args: Value) -> Self {
         let msg = make_tool_call_message(tool_name, tool_call_id, args);
         let events = vec![
             AgentEvent::TurnStart { turn_number: 1 },
@@ -192,7 +194,7 @@ impl MockTransport {
             AgentEvent::TurnEnd {
                 turn_number: 1,
                 message: msg,
-                usage: tau_ai::Usage {
+                usage: Usage {
                     input: 100,
                     output: 50,
                     ..Default::default()
@@ -231,7 +233,7 @@ impl Default for MockTransport {
 impl Transport for MockTransport {
     async fn run(
         &self,
-        _messages: Vec<tau_ai::Message>,
+        _messages: Vec<Message>,
         _config: &AgentRunConfig,
         _cancel: tokio_util::sync::CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
@@ -241,9 +243,7 @@ impl Transport for MockTransport {
             *count += 1;
             let total = *self.total_queued.lock().unwrap();
             responses.pop_front().unwrap_or_else(|| {
-                panic!(
-                    "MockTransport: no more queued responses (queued {total}, call #{count})"
-                )
+                panic!("MockTransport: no more queued responses (queued {total}, call #{count})")
             })
         };
 
@@ -301,8 +301,8 @@ impl EventCollector {
                         };
                         let _ = count_tx_clone.send(new_count);
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         panic!(
                             "EventCollector: broadcast receiver lagged by {n} events. \
                              Increase broadcast channel capacity or reduce event volume."
@@ -340,7 +340,7 @@ impl EventCollector {
     /// Wait until at least `count` events have been collected.
     /// Panics if the count isn't reached within 5 seconds.
     pub async fn wait_for_count(&self, count: usize) {
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let result = time::timeout(Duration::from_secs(5), async {
             let mut rx = self.count_rx.clone();
             loop {
                 rx.borrow_and_update();
@@ -370,8 +370,7 @@ impl EventCollector {
         pred: impl Fn(&AgentEvent) -> bool,
         timeout: Duration,
     ) {
-        let result =
-            tokio::time::timeout(timeout, self.wait_for_event_inner(&pred)).await;
+        let result = time::timeout(timeout, self.wait_for_event_inner(&pred)).await;
         if result.is_err() {
             let events = self.event_names();
             panic!(
@@ -394,9 +393,7 @@ impl EventCollector {
             }
             if rx.changed().await.is_err() {
                 let names = self.event_names();
-                panic!(
-                    "EventCollector: channel closed while waiting. Collected: {names:?}"
-                );
+                panic!("EventCollector: channel closed while waiting. Collected: {names:?}");
             }
         }
     }
@@ -413,7 +410,7 @@ impl EventCollector {
     }
 
     /// Extract assistant messages from collected events (from MessageEnd events).
-    pub fn assistant_messages(&self) -> Vec<tau_ai::Message> {
+    pub fn assistant_messages(&self) -> Vec<Message> {
         self.inner
             .lock()
             .unwrap()
@@ -479,7 +476,7 @@ impl Tool for EchoTool {
         "Echoes the text argument back"
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -496,7 +493,7 @@ impl Tool for EchoTool {
         Concurrency::Parallel
     }
 
-    async fn execute(&self, arguments: serde_json::Value, _ctx: ExecutionContext) -> ToolResult {
+    async fn execute(&self, arguments: Value, _ctx: ExecutionContext) -> ToolResult {
         let text = arguments
             .get("text")
             .and_then(|v| v.as_str())
@@ -522,14 +519,14 @@ impl Tool for FailTool {
         "Always fails"
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {}
         })
     }
 
-    async fn execute(&self, _arguments: serde_json::Value, _ctx: ExecutionContext) -> ToolResult {
+    async fn execute(&self, _arguments: Value, _ctx: ExecutionContext) -> ToolResult {
         ToolResult::error("intentional failure")
     }
 }
@@ -583,16 +580,26 @@ impl TextTransport {
 impl Transport for TextTransport {
     async fn run(
         &self,
-        _messages: Vec<tau_ai::Message>,
+        _messages: Vec<Message>,
         _config: &AgentRunConfig,
         _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
         let msg = make_assistant_message(&self.text);
-        let usage = tau_ai::Usage { input: 100, output: 50, ..Default::default() };
+        let usage = Usage {
+            input: 100,
+            output: 50,
+            ..Default::default()
+        };
         let events = vec![
             AgentEvent::TurnStart { turn_number: 1 },
-            AgentEvent::MessageEnd { message: msg.clone() },
-            AgentEvent::TurnEnd { turn_number: 1, message: msg, usage },
+            AgentEvent::MessageEnd {
+                message: msg.clone(),
+            },
+            AgentEvent::TurnEnd {
+                turn_number: 1,
+                message: msg,
+                usage,
+            },
         ];
         Ok(Box::pin(stream::iter(events)))
     }
@@ -601,14 +608,14 @@ impl Transport for TextTransport {
 /// Returns tool calls for `n` turns, then a text response.
 /// Each turn's tool call has a unique id based on the turn counter.
 pub struct ToolCallTransport {
-    remaining: std::sync::atomic::AtomicU32,
+    remaining: AtomicU32,
     pub tool_name: String,
 }
 
 impl ToolCallTransport {
     pub fn create(tool_turns: u32, tool_name: impl Into<String>) -> Arc<dyn Transport> {
         Arc::new(Self {
-            remaining: std::sync::atomic::AtomicU32::new(tool_turns),
+            remaining: AtomicU32::new(tool_turns),
             tool_name: tool_name.into(),
         })
     }
@@ -618,36 +625,48 @@ impl ToolCallTransport {
 impl Transport for ToolCallTransport {
     async fn run(
         &self,
-        _messages: Vec<tau_ai::Message>,
+        _messages: Vec<Message>,
         _config: &AgentRunConfig,
         _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
-        use std::sync::atomic::Ordering;
-        let prev = self.remaining.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        }).unwrap_or(0);
+        let prev = self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n: u32| {
+                Some(n.saturating_sub(1))
+            })
+            .unwrap_or(0);
 
         let msg = if prev > 0 {
-            tau_ai::Message::Assistant {
+            Message::Assistant {
                 content: vec![
-                    tau_ai::Content::text("Calling tool."),
-                    tau_ai::Content::tool_call(
+                    Content::text("Calling tool."),
+                    Content::tool_call(
                         format!("call_{}", prev),
                         &self.tool_name,
                         serde_json::json!({"text": "hello"}),
                     ),
                 ],
-                metadata: tau_ai::AssistantMetadata::default(),
+                metadata: AssistantMetadata::default(),
             }
         } else {
             make_assistant_message("Done.")
         };
 
-        let usage = tau_ai::Usage { input: 50, output: 25, ..Default::default() };
+        let usage = Usage {
+            input: 50,
+            output: 25,
+            ..Default::default()
+        };
         let events = vec![
             AgentEvent::TurnStart { turn_number: 1 },
-            AgentEvent::MessageEnd { message: msg.clone() },
-            AgentEvent::TurnEnd { turn_number: 1, message: msg, usage },
+            AgentEvent::MessageEnd {
+                message: msg.clone(),
+            },
+            AgentEvent::TurnEnd {
+                turn_number: 1,
+                message: msg,
+                usage,
+            },
         ];
         Ok(Box::pin(stream::iter(events)))
     }
@@ -669,7 +688,7 @@ impl SlowTransport {
 impl Transport for SlowTransport {
     async fn run(
         &self,
-        _messages: Vec<tau_ai::Message>,
+        _messages: Vec<Message>,
         _config: &AgentRunConfig,
         cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
@@ -677,7 +696,7 @@ impl Transport for SlowTransport {
         let events = async_stream::stream! {
             yield AgentEvent::TurnStart { turn_number: 1 };
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                _ = time::sleep(Duration::from_millis(delay)) => {}
                 _ = cancel.cancelled() => {
                     yield AgentEvent::Error { message: "Cancelled".into() };
                     return;
@@ -688,7 +707,7 @@ impl Transport for SlowTransport {
             yield AgentEvent::TurnEnd {
                 turn_number: 1,
                 message: msg,
-                usage: tau_ai::Usage::default(),
+                usage: Usage::default(),
             };
         };
         Ok(Box::pin(events))
@@ -698,7 +717,7 @@ impl Transport for SlowTransport {
 /// Captured transport call: messages + config snapshot.
 #[derive(Clone)]
 pub struct CapturedCall {
-    pub messages: Vec<tau_ai::Message>,
+    pub messages: Vec<Message>,
     pub system_prompt: Option<String>,
     pub tool_names: Vec<String>,
     pub model_id: String,
@@ -727,7 +746,7 @@ impl CapturingTransport {
 impl Transport for CapturingTransport {
     async fn run(
         &self,
-        messages: Vec<tau_ai::Message>,
+        messages: Vec<Message>,
         config: &AgentRunConfig,
         _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
@@ -738,11 +757,21 @@ impl Transport for CapturingTransport {
             model_id: config.model.id.clone(),
         });
         let msg = make_assistant_message(&self.text);
-        let usage = tau_ai::Usage { input: 100, output: 50, ..Default::default() };
+        let usage = Usage {
+            input: 100,
+            output: 50,
+            ..Default::default()
+        };
         let events = vec![
             AgentEvent::TurnStart { turn_number: 1 },
-            AgentEvent::MessageEnd { message: msg.clone() },
-            AgentEvent::TurnEnd { turn_number: 1, message: msg, usage },
+            AgentEvent::MessageEnd {
+                message: msg.clone(),
+            },
+            AgentEvent::TurnEnd {
+                turn_number: 1,
+                message: msg,
+                usage,
+            },
         ];
         Ok(Box::pin(stream::iter(events)))
     }
@@ -755,7 +784,9 @@ pub struct ErrorTransport {
 
 impl ErrorTransport {
     pub fn create(message: impl Into<String>) -> Arc<dyn Transport> {
-        Arc::new(Self { message: message.into() })
+        Arc::new(Self {
+            message: message.into(),
+        })
     }
 }
 
@@ -763,7 +794,7 @@ impl ErrorTransport {
 impl Transport for ErrorTransport {
     async fn run(
         &self,
-        _messages: Vec<tau_ai::Message>,
+        _messages: Vec<Message>,
         _config: &AgentRunConfig,
         _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
@@ -785,14 +816,20 @@ pub struct SlowTool {
 
 #[async_trait]
 impl Tool for SlowTool {
-    fn name(&self) -> &str { "slow" }
-    fn description(&self) -> &str { "Slow tool" }
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn name(&self) -> &str {
+        "slow"
+    }
+    fn description(&self) -> &str {
+        "Slow tool"
+    }
+    fn parameters_schema(&self) -> Value {
         serde_json::json!({ "type": "object", "properties": {} })
     }
-    fn concurrency(&self) -> Concurrency { Concurrency::Sequential }
-    async fn execute(&self, _args: serde_json::Value, _ctx: ExecutionContext) -> ToolResult {
-        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
+    }
+    async fn execute(&self, _args: Value, _ctx: ExecutionContext) -> ToolResult {
+        time::sleep(Duration::from_millis(self.delay_ms)).await;
         ToolResult::text("slow done")
     }
 }
@@ -802,7 +839,7 @@ impl Tool for SlowTool {
 // ---------------------------------------------------------------------------
 
 /// Drain all available events from a broadcast receiver.
-pub fn collect_events(rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+pub fn collect_events(rx: &mut broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut events = vec![];
     while let Ok(e) = rx.try_recv() {
         events.push(e);
@@ -869,18 +906,25 @@ mod tests {
 
         // First call
         use futures::StreamExt;
-        let stream = transport.run(vec![], &config, cancel.clone()).await.unwrap();
+        let stream = transport
+            .run(vec![], &config, cancel.clone())
+            .await
+            .unwrap();
         let events: Vec<_> = stream.collect().await;
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::MessageEnd { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+        );
 
         // Second call
         let stream = transport.run(vec![], &config, cancel).await.unwrap();
         let events: Vec<_> = stream.collect().await;
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::MessageEnd { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+        );
     }
 
     #[tokio::test]
@@ -904,7 +948,10 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
 
         // First call succeeds
-        let _ = transport.run(vec![], &config, cancel.clone()).await.unwrap();
+        let _ = transport
+            .run(vec![], &config, cancel.clone())
+            .await
+            .unwrap();
         // Second call panics
         let _ = transport.run(vec![], &config, cancel).await.unwrap();
     }
@@ -918,12 +965,12 @@ mod tests {
         collector.wait_for_end().await;
 
         let events = collector.events();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::AgentStart)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::AgentEnd { .. })));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentStart)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
 
         let messages = collector.assistant_messages();
         assert_eq!(messages.len(), 1);
@@ -945,9 +992,9 @@ mod tests {
         let events = collector.events();
 
         // Should have tool execution events
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { tool_name, .. } if tool_name == "echo")));
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ToolExecutionStart { tool_name, .. } if tool_name == "echo")
+        ));
         assert!(events
             .iter()
             .any(|e| matches!(e, AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } if tool_name == "echo" && !is_error)));
@@ -986,9 +1033,11 @@ mod tests {
         collector.wait_for_end().await;
 
         let events = collector.events();
-        assert!(events.iter().any(
-            |e| matches!(e, AgentEvent::ToolExecutionEnd { is_error, .. } if *is_error)
-        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolExecutionEnd { is_error, .. } if *is_error))
+        );
     }
 
     #[tokio::test]
