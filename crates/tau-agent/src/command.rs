@@ -44,3 +44,11 @@ pub(crate) enum Command {
         reply: oneshot::Sender<PromptResult>,
     },
 }
+
+impl Command {
+    /// Whether this command needs priority processing during streaming/tool execution.
+    /// Urgent commands bypass any queued normal commands via a separate channel.
+    pub(crate) fn is_urgent(&self) -> bool {
+        matches!(self, Command::Steer(_) | Command::FollowUp(_))
+    }
+}

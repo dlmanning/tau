@@ -1,11 +1,9 @@
 //! Edge case tests: empty streams, tool panics, multi-group batching,
 //! DequeueMode::OneAtATime, steer while idle, follow-up while busy.
 
-mod harness;
-
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
@@ -122,7 +120,7 @@ async fn multi_group_sequential_then_parallel() {
 #[tokio::test]
 async fn follow_up_during_tool_execution() {
     // Post a follow-up while tools are running. It should be processed after the prompt completes.
-    let transport = ToolCallTransport::new(1, "echo");
+    let transport = ToolCallTransport::create(1, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
     let handle = builder.spawn();
@@ -146,7 +144,7 @@ async fn follow_up_during_tool_execution() {
 async fn dequeue_mode_one_at_a_time() {
     let mut cfg = test_config();
     cfg.follow_up_mode = DequeueMode::OneAtATime;
-    let handle = AgentBuilder::new(cfg, TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(cfg, TextTransport::create("ok")).spawn();
 
     // Queue up 2 follow-ups, then prompt
     handle.follow_up(Message::user("fu1"));
@@ -178,7 +176,7 @@ async fn dequeue_mode_one_at_a_time() {
 
 #[tokio::test]
 async fn steer_while_idle_is_not_lost() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
     let handle = builder.spawn();
 

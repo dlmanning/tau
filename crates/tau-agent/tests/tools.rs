@@ -1,11 +1,9 @@
 //! Tests for tool execution: single tool, multi-turn, parallel ordering,
 //! sequential vs parallel grouping, tool-only assistant messages.
 
-mod harness;
-
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
@@ -14,7 +12,7 @@ use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn single_tool_call_round_trip() {
-    let transport = ToolCallTransport::new(1, "echo");
+    let transport = ToolCallTransport::create(1, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
     let handle = builder.spawn();
@@ -46,7 +44,7 @@ async fn single_tool_call_round_trip() {
 
 #[tokio::test]
 async fn multi_turn_tool_loop() {
-    let transport = ToolCallTransport::new(3, "echo");
+    let transport = ToolCallTransport::create(3, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
     let handle = builder.spawn();
@@ -211,7 +209,7 @@ async fn tool_only_assistant_message_is_stored() {
 
 #[tokio::test]
 async fn context_includes_full_conversation_history() {
-    let transport = CapturingTransport::new("response");
+    let transport = CapturingTransport::create("response");
     let builder = AgentBuilder::new(test_config(), transport.clone());
     let handle = builder.spawn();
 

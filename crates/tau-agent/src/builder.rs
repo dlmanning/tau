@@ -8,7 +8,8 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{AgentState, run_actor};
+use crate::actor::run_actor;
+use crate::state::AgentState;
 use crate::config::AgentConfig;
 use crate::events::AgentEvent;
 use crate::handle::AgentHandle;
@@ -37,8 +38,10 @@ pub struct AgentBuilder {
 
     // Pre-created shared primitives (created in new(), used by pre_handle() and spawn())
     event_tx: broadcast::Sender<AgentEvent>,
-    cmd_tx: mpsc::Sender<crate::command::Command>,
-    cmd_rx: Option<mpsc::Receiver<crate::command::Command>>,
+    urgent_tx: mpsc::Sender<crate::command::Command>,
+    urgent_rx: Option<mpsc::Receiver<crate::command::Command>>,
+    normal_tx: mpsc::Sender<crate::command::Command>,
+    normal_rx: Option<mpsc::Receiver<crate::command::Command>>,
     cancel: Arc<parking_lot::Mutex<CancellationToken>>,
     is_running: Arc<AtomicBool>,
     pending_follow_ups: Arc<AtomicU32>,
@@ -47,7 +50,8 @@ pub struct AgentBuilder {
 impl AgentBuilder {
     pub fn new(config: AgentConfig, transport: Arc<dyn Transport>) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (urgent_tx, urgent_rx) = mpsc::channel(64);
+        let (normal_tx, normal_rx) = mpsc::channel(32);
         let cancel = Arc::new(parking_lot::Mutex::new(CancellationToken::new()));
         let is_running = Arc::new(AtomicBool::new(false));
         let pending_follow_ups = Arc::new(AtomicU32::new(0));
@@ -63,8 +67,10 @@ impl AgentBuilder {
             initial_messages: vec![],
             previous_summary: None,
             event_tx,
-            cmd_tx,
-            cmd_rx: Some(cmd_rx),
+            urgent_tx,
+            urgent_rx: Some(urgent_rx),
+            normal_tx,
+            normal_rx: Some(normal_rx),
             cancel,
             is_running,
             pending_follow_ups,
@@ -154,7 +160,8 @@ impl AgentBuilder {
     /// by the actor once `spawn()` starts it.
     pub fn pre_handle(&self) -> AgentHandle {
         AgentHandle {
-            cmd_tx: self.cmd_tx.clone(),
+            urgent_tx: self.urgent_tx.clone(),
+            normal_tx: self.normal_tx.clone(),
             event_tx: self.event_tx.clone(),
             cancel: self.cancel.clone(),
             is_running: self.is_running.clone(),
@@ -167,8 +174,12 @@ impl AgentBuilder {
     /// The returned handle is identical to one from `pre_handle()` — same channels,
     /// same shared primitives.
     pub fn spawn(mut self) -> AgentHandle {
-        let cmd_rx = self
-            .cmd_rx
+        let urgent_rx = self
+            .urgent_rx
+            .take()
+            .expect("spawn() called twice on the same builder");
+        let normal_rx = self
+            .normal_rx
             .take()
             .expect("spawn() called twice on the same builder");
 
@@ -213,10 +224,11 @@ impl AgentBuilder {
         };
 
         // Spawn the actor task
-        tokio::spawn(run_actor(state, cmd_rx));
+        tokio::spawn(run_actor(state, urgent_rx, normal_rx));
 
         AgentHandle {
-            cmd_tx: self.cmd_tx,
+            urgent_tx: self.urgent_tx,
+            normal_tx: self.normal_tx,
             event_tx: self.event_tx,
             cancel: self.cancel,
             is_running: self.is_running,

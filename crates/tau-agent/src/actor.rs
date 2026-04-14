@@ -5,61 +5,26 @@
 //! it `select!`s on the command channel to handle queries and abort.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use futures::StreamExt;
-use parking_lot::Mutex;
-use tau_ai::{Content, Message};
-use tokio::sync::{broadcast, mpsc};
+use tau_ai::Message;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::builder::TransformContextFn;
 use crate::command::{Command, PromptResult};
 use crate::compaction::{self, CompactionReason};
-use crate::config::{AgentConfig, DequeueMode};
-use crate::conversation::Conversation;
 use crate::events::AgentEvent;
+use crate::logic::{self, ResponseAction, FollowUpAction};
 use crate::overflow::is_context_overflow;
+use crate::state::{AgentState, ToolCall};
 use crate::stream::{StreamOutcome, StreamReducer};
 use crate::tool::{
-    BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, ToolResult,
-    send_event, to_api_tool,
+    ExecutionContext, ProgressSender, ToolResult,
+    send_event,
 };
-use crate::tool_executor::{has_meaningful_content, run_single_tool};
-use crate::transport::{AgentEventStream, AgentRunConfig, Transport};
-
-/// A single tool call extracted from the model's response.
-pub(crate) struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub args: serde_json::Value,
-}
-
-/// All mutable state the agent needs. Owned exclusively by the actor task.
-pub(crate) struct AgentState {
-    pub config: AgentConfig,
-    pub conversation: Conversation,
-    pub tools: Vec<BoxedTool>,
-    pub transport: Arc<dyn Transport>,
-    pub event_tx: broadcast::Sender<AgentEvent>,
-    pub server_tools: Vec<tau_ai::ServerTool>,
-    pub schema_cache: HashMap<String, Arc<jsonschema::Validator>>,
-    pub cwd: Option<PathBuf>,
-    pub file_access: Arc<Mutex<FileAccessTracker>>,
-    pub interaction_tx: Option<mpsc::Sender<crate::interaction::InteractionRequest>>,
-    pub transform_context: Option<Arc<TransformContextFn>>,
-    pub steering_queue: Vec<Message>,
-    pub follow_up_queue: Vec<Message>,
-    /// Shared with AgentHandle. External code (AgentManager) increments via handle.expect_follow_up().
-    pub pending_follow_ups: Arc<AtomicU32>,
-    // Shared with AgentHandle
-    pub is_running: Arc<AtomicBool>,
-    /// Shared with all AgentHandle clones. The actor replaces the inner token at
-    /// each prompt start so handle.abort() always targets the active prompt.
-    pub cancel: Arc<Mutex<CancellationToken>>,
-}
+use crate::tool_executor::run_single_tool;
+use crate::transport::AgentEventStream;
 
 /// Phases of a single turn in the agent loop.
 enum StepPhase {
@@ -124,7 +89,11 @@ enum StepPhase {
 
 // ─── Actor entry point ──────────────────────────────────────────────
 
-pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<Command>) {
+pub(crate) async fn run_actor(
+    mut state: AgentState,
+    mut urgent_rx: mpsc::Receiver<Command>,
+    mut normal_rx: mpsc::Receiver<Command>,
+) {
     let mut phase = StepPhase::Idle;
     let mut prompt_reply: Option<tokio::sync::oneshot::Sender<PromptResult>> = None;
     let mut turn_number: u32 = 0;
@@ -135,18 +104,19 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
 
     loop {
         phase = match phase {
-            StepPhase::Idle => match cmd_rx.recv().await {
-                Some(cmd) => {
-                    handle_idle_command(
-                        &mut state,
-                        cmd,
-                        &mut prompt_reply,
-                        &mut turn_number,
-                        &mut prompt_cancel,
-                    )
+            StepPhase::Idle => {
+                // In Idle, drain both channels. Urgent first via biased select.
+                tokio::select! {
+                    biased;
+                    Some(cmd) = urgent_rx.recv() => {
+                        handle_idle_command(&mut state, cmd, &mut prompt_reply, &mut turn_number, &mut prompt_cancel)
+                    }
+                    Some(cmd) = normal_rx.recv() => {
+                        handle_idle_command(&mut state, cmd, &mut prompt_reply, &mut turn_number, &mut prompt_cancel)
+                    }
+                    else => break,
                 }
-                None => break,
-            },
+            }
 
             StepPhase::PrepareTurn {
                 pending,
@@ -175,7 +145,10 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
                 loop {
                     tokio::select! {
                         biased;
-                        Some(cmd) = cmd_rx.recv() => {
+                        Some(cmd) = urgent_rx.recv() => {
+                            handle_busy_command(&mut state, cmd);
+                        }
+                        Some(cmd) = normal_rx.recv() => {
                             handle_busy_command(&mut state, cmd);
                         }
                         event = stream.next() => {
@@ -201,7 +174,38 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
                 outcome,
                 first_user_message,
                 pending,
-            } => process_response(&mut state, *outcome, first_user_message, pending, &prompt_cancel).await,
+            } => {
+                let decision = state.process_response(*outcome, pending, first_user_message);
+                if decision.needs_proactive_compaction {
+                    run_proactive_compaction(&mut state, &prompt_cancel).await;
+                }
+                match decision.action {
+                    ResponseAction::RunTools { tool_calls, groups, first_user_message } => {
+                        let mut remaining = groups;
+                        let first = remaining.remove(0);
+                        let join_set = spawn_group(&state, &tool_calls, &first, &prompt_cancel);
+                        StepPhase::AwaitingTools {
+                            join_set,
+                            remaining_groups: remaining,
+                            all_tool_calls: tool_calls,
+                            results_map: HashMap::new(),
+                            first_user_message,
+                        }
+                    }
+                    ResponseAction::Compact { reason, resume_pending } => {
+                        StepPhase::RunCompaction {
+                            reason,
+                            reply: None,
+                            resume_after: resume_pending,
+                        }
+                    }
+                    ResponseAction::Done => StepPhase::DrainFollowUps,
+                    ResponseAction::Error(e) => {
+                        send_event(&state.event_tx, AgentEvent::Error { message: e.to_string() });
+                        StepPhase::Done(Err(e))
+                    }
+                }
+            }
 
             StepPhase::AwaitingTools {
                 mut join_set,
@@ -213,7 +217,10 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
                 loop {
                     tokio::select! {
                         biased;
-                        Some(cmd) = cmd_rx.recv() => {
+                        Some(cmd) = urgent_rx.recv() => {
+                            handle_busy_command(&mut state, cmd);
+                        }
+                        Some(cmd) = normal_rx.recv() => {
                             handle_busy_command(&mut state, cmd);
                         }
                         result = join_set.join_next() => {
@@ -225,55 +232,67 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
                                     tracing::error!("Tool task panicked: {}", join_err);
                                 }
                                 None => {
-                                    // Current batch done. Check steering before next group.
-                                    if !state.steering_queue.is_empty() {
-                                        // Steering arrived — skip remaining groups
-                                        let steering = drain_queue(
-                                            &mut state.steering_queue,
-                                            state.config.steering_mode,
-                                        );
-                                        skip_remaining_groups(
-                                            &state.event_tx,
-                                            &remaining_groups,
-                                            &all_tool_calls,
-                                            &mut results_map,
-                                        );
-                                        // Collect final ordered results + steering
-                                        let mut tool_results = collect_ordered_results(
-                                            &all_tool_calls,
-                                            results_map,
-                                        );
-                                        tool_results.extend(steering);
-                                        state.conversation.messages.extend(tool_results.iter().cloned());
-                                        break StepPhase::PrepareTurn {
-                                            pending: tool_results,
-                                            first_user_message: None,
-                                        };
-                                    }
-
-                                    if remaining_groups.is_empty() {
-                                        break StepPhase::ApplyToolResults {
-                                            tool_calls: all_tool_calls,
-                                            results_map,
-                                            first_user_message,
-                                        };
-                                    } else {
-                                        // Spawn next group
-                                        let mut remaining = remaining_groups;
-                                        let next_group = remaining.remove(0);
-                                        let new_join_set = spawn_group(
-                                            &state,
-                                            &all_tool_calls,
-                                            &next_group,
-                                            &prompt_cancel,
-                                        );
-                                        break StepPhase::AwaitingTools {
-                                            join_set: new_join_set,
-                                            remaining_groups: remaining,
-                                            all_tool_calls,
-                                            results_map,
-                                            first_user_message,
-                                        };
+                                    // Current batch done — delegate decision to logic.
+                                    match state.handle_batch_complete(
+                                        &remaining_groups,
+                                        &all_tool_calls,
+                                        &mut results_map,
+                                    ) {
+                                        logic::BatchCompleteAction::Redirect {
+                                            steering,
+                                            skipped_indices,
+                                            ..
+                                        } => {
+                                            // Emit skip events for the skipped tools (I/O)
+                                            for (_, id, name) in &skipped_indices {
+                                                send_event(
+                                                    &state.event_tx,
+                                                    AgentEvent::ToolExecutionStart {
+                                                        tool_call_id: id.clone(),
+                                                        tool_name: name.clone(),
+                                                        arguments: serde_json::Value::Null,
+                                                        activity: "Skipped".to_string(),
+                                                    },
+                                                );
+                                                send_event(
+                                                    &state.event_tx,
+                                                    AgentEvent::ToolExecutionEnd {
+                                                        tool_call_id: id.clone(),
+                                                        tool_name: name.clone(),
+                                                        result: "Skipped due to steering message".to_string(),
+                                                        is_error: true,
+                                                    },
+                                                );
+                                            }
+                                            break StepPhase::PrepareTurn {
+                                                pending: steering,
+                                                first_user_message: None,
+                                            };
+                                        }
+                                        logic::BatchCompleteAction::AllGroupsDone => {
+                                            break StepPhase::ApplyToolResults {
+                                                tool_calls: all_tool_calls,
+                                                results_map,
+                                                first_user_message,
+                                            };
+                                        }
+                                        logic::BatchCompleteAction::NextGroup(next_group) => {
+                                            let mut remaining = remaining_groups;
+                                            remaining.remove(0);
+                                            let new_join_set = spawn_group(
+                                                &state,
+                                                &all_tool_calls,
+                                                &next_group,
+                                                &prompt_cancel,
+                                            );
+                                            break StepPhase::AwaitingTools {
+                                                join_set: new_join_set,
+                                                remaining_groups: remaining,
+                                                all_tool_calls,
+                                                results_map,
+                                                first_user_message,
+                                            };
+                                        }
                                     }
                                 }
                             }
@@ -287,7 +306,7 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
                 results_map,
                 first_user_message,
             } => {
-                let tool_results = collect_ordered_results(&tool_calls, results_map);
+                let tool_results = logic::collect_ordered_results(&tool_calls, results_map);
                 state.conversation.messages.extend(tool_results.iter().cloned());
 
                 // Tool results are now committed to conversation.messages.
@@ -299,30 +318,36 @@ pub(crate) async fn run_actor(mut state: AgentState, mut cmd_rx: mpsc::Receiver<
             }
 
             StepPhase::DrainFollowUps => {
-                drain_follow_ups(&mut state)
+                match state.drain_follow_ups() {
+                    FollowUpAction::Continue(msgs) => StepPhase::PrepareTurn {
+                        pending: msgs,
+                        first_user_message: None,
+                    },
+                    FollowUpAction::WaitForFollowUps => StepPhase::WaitingForFollowUps,
+                    FollowUpAction::Done => StepPhase::Done(Ok(())),
+                }
             }
 
             StepPhase::WaitingForFollowUps => {
-                // Block on cmd_rx waiting for FollowUp commands from background agents.
-                // Also handle queries and cancellation.
+                // Block waiting for FollowUp commands from background agents.
+                // Urgent channel gets priority (FollowUp is urgent).
                 loop {
                     tokio::select! {
                         biased;
                         _ = prompt_cancel.cancelled() => {
                             break StepPhase::Done(Ok(()));
                         }
-                        cmd = cmd_rx.recv() => {
+                        Some(cmd) = urgent_rx.recv() => {
                             match cmd {
-                                Some(Command::FollowUp(msg)) => {
+                                Command::FollowUp(msg) => {
                                     state.follow_up_queue.push(msg);
-                                    // Re-check via DrainFollowUps (it will drain and start a turn)
                                     break StepPhase::DrainFollowUps;
                                 }
-                                Some(other) => {
-                                    handle_busy_command(&mut state, other);
-                                }
-                                None => break StepPhase::Done(Ok(())),
+                                other => handle_busy_command(&mut state, other),
                             }
+                        }
+                        Some(cmd) = normal_rx.recv() => {
+                            handle_busy_command(&mut state, cmd);
                         }
                     }
                 }
@@ -471,9 +496,8 @@ async fn prepare_turn(
 ) -> StepPhase {
     *turn_number += 1;
 
-    // Build context: conversation.messages + pending (not yet committed)
-    let context = build_context(state, &pending);
-    let run_config = build_run_config(state);
+    let context = state.build_context(&pending);
+    let run_config = state.build_run_config();
 
     match state.transport.run(context, &run_config, cancel.clone()).await {
         Ok(stream) => StepPhase::AwaitingModel {
@@ -486,7 +510,7 @@ async fn prepare_turn(
             let overflow = e.is_context_overflow() || is_context_overflow(&error_msg);
             if overflow && state.config.compaction.enabled {
                 // Commit pending so compaction sees them
-                flush_pending(&mut state.conversation.messages, &pending);
+                logic::flush_pending(&mut state.conversation.messages, &pending);
                 StepPhase::RunCompaction {
                     reason: CompactionReason::Overflow,
                     reply: None,
@@ -507,216 +531,7 @@ async fn prepare_turn(
     }
 }
 
-/// Build context: conversation.messages + pending, with optional transform.
-fn build_context(state: &AgentState, pending: &[Message]) -> Vec<Message> {
-    let mut context: Vec<Message> = state
-        .conversation
-        .messages
-        .iter()
-        .cloned()
-        .chain(pending.iter().cloned())
-        .collect();
-
-    if let Some(ref transform) = state.transform_context {
-        context = transform(context);
-    }
-    context
-}
-
-fn build_run_config(state: &AgentState) -> AgentRunConfig {
-    AgentRunConfig {
-        system_prompt: state.config.system_prompt.clone(),
-        tools: state.tools.iter().map(|t| to_api_tool(t.as_ref())).collect(),
-        server_tools: state.server_tools.clone(),
-        model: state.config.model.clone(),
-        reasoning: Some(state.config.reasoning),
-        thinking_adaptive: state.config.thinking_adaptive,
-        max_tokens: state.config.max_tokens,
-        temperature: None,
-        cache_scope: state.config.cache_scope.clone(),
-        cache_ttl: state.config.cache_ttl.clone(),
-        system_prompt_boundary: state.config.system_prompt_boundary.clone(),
-    }
-}
-
-/// Commit pending messages into the conversation.
-fn flush_pending(messages: &mut Vec<Message>, pending: &[Message]) {
-    for m in pending {
-        messages.push(m.clone());
-    }
-}
-
-// ─── Response processing ────────────────────────────────────────────
-
-async fn process_response(
-    state: &mut AgentState,
-    outcome: StreamOutcome,
-    first_user_message: Option<Message>,
-    pending: Vec<Message>,
-    cancel: &CancellationToken,
-) -> StepPhase {
-    // Handle error
-    if let Some(ref error_msg) = outcome.error {
-        // Save partial message if present
-        if let Some(ref partial) = outcome.partial_message {
-            if has_meaningful_content(partial) {
-                flush_pending(&mut state.conversation.messages, &pending);
-                state.conversation.messages.push(partial.clone());
-            }
-        }
-
-        // Try overflow recovery
-        let overflow = is_context_overflow(error_msg);
-        if overflow && state.config.compaction.enabled {
-            flush_pending(&mut state.conversation.messages, &pending);
-            return StepPhase::RunCompaction {
-                reason: CompactionReason::Overflow,
-                reply: None,
-                resume_after: Some((
-                    first_user_message.iter().cloned().collect(),
-                    first_user_message,
-                )),
-            };
-        }
-
-        state.conversation.error = Some(error_msg.clone());
-        return StepPhase::Done(Err(crate::error::Error::Other(error_msg.clone())));
-    }
-
-    // Update usage
-    state.conversation.total_usage.input += outcome.usage.input;
-    state.conversation.total_usage.output += outcome.usage.output;
-    state.conversation.total_usage.cache_read += outcome.usage.cache_read;
-    state.conversation.total_usage.cache_write += outcome.usage.cache_write;
-    state.conversation.total_usage.thinking += outcome.usage.thinking;
-    state.conversation.total_usage.cache_creation_1h += outcome.usage.cache_creation_1h;
-    state.conversation.total_usage.cache_creation_5m += outcome.usage.cache_creation_5m;
-
-    if let Some(ref assistant_msg) = outcome.assistant_message {
-        // Always commit pending + assistant message (original never gates on has_meaningful_content here)
-        flush_pending(&mut state.conversation.messages, &pending);
-        state.conversation.messages.push(assistant_msg.clone());
-
-        // Proactive compaction check using real token counts from the API.
-        // Run inline so tool calls are not lost.
-        let used = outcome.usage.input + outcome.usage.cache_read;
-        let limit = (state.config.model.context_window as u64)
-            .saturating_sub(state.config.compaction.reserve_tokens);
-        if state.config.compaction.enabled && used > limit {
-            send_event(
-                &state.event_tx,
-                AgentEvent::CompactionStart {
-                    reason: CompactionReason::Threshold,
-                },
-            );
-            let result = compaction::compact(
-                &state.conversation.messages,
-                &state.config.compaction,
-                &state.config,
-                &state.transport,
-                state.conversation.previous_summary.as_deref(),
-                cancel,
-            )
-            .await;
-            match result {
-                Ok(cr) => {
-                    let tokens_after = compaction::estimate_total_tokens(
-                        &state.conversation.messages[cr.first_kept_index..],
-                    );
-                    send_event(
-                        &state.event_tx,
-                        AgentEvent::CompactionEnd {
-                            tokens_before: cr.tokens_before,
-                            tokens_after,
-                        },
-                    );
-                    apply_compaction_result(state, cr);
-                }
-                Err(e) => {
-                    tracing::warn!("Proactive compaction failed: {}", e);
-                }
-            }
-        }
-
-        // Extract tool calls
-        let tool_calls = extract_tool_calls(assistant_msg);
-
-        if tool_calls.is_empty() {
-            StepPhase::DrainFollowUps
-        } else {
-            // Build groups and spawn first batch
-            let groups = build_tool_groups(&state.tools, &tool_calls);
-            if groups.is_empty() {
-                StepPhase::DrainFollowUps
-            } else {
-                let mut remaining = groups;
-                let first_group = remaining.remove(0);
-                let join_set = spawn_group(state, &tool_calls, &first_group, cancel);
-                StepPhase::AwaitingTools {
-                    join_set,
-                    remaining_groups: remaining,
-                    all_tool_calls: tool_calls,
-                    results_map: HashMap::new(),
-                    first_user_message,
-                }
-            }
-        }
-    } else {
-        // No assistant message at all
-        StepPhase::Done(Ok(()))
-    }
-}
-
-fn extract_tool_calls(msg: &Message) -> Vec<ToolCall> {
-    let content = match msg {
-        Message::Assistant { content, .. } => content,
-        _ => return vec![],
-    };
-
-    content
-        .iter()
-        .filter_map(|c| match c {
-            Content::ToolCall { id, name, arguments } => Some(ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                args: arguments.clone(),
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
 // ─── Tool execution ─────────────────────────────────────────────────
-
-/// Build groups of tool calls: consecutive Parallel tools form a group, Sequential is singleton.
-fn build_tool_groups(tools: &[BoxedTool], tool_calls: &[ToolCall]) -> Vec<Vec<usize>> {
-    let mut groups: Vec<Vec<usize>> = vec![];
-    let mut current_group: Vec<usize> = vec![];
-    let mut current_is_parallel = false;
-
-    for (idx, tc) in tool_calls.iter().enumerate() {
-        let is_parallel = tools
-            .iter()
-            .find(|t| t.name() == tc.name.as_str())
-            .map(|t| t.concurrency() == Concurrency::Parallel)
-            .unwrap_or(false);
-
-        if idx == 0 {
-            current_is_parallel = is_parallel;
-            current_group.push(idx);
-        } else if is_parallel && current_is_parallel {
-            current_group.push(idx);
-        } else {
-            groups.push(std::mem::take(&mut current_group));
-            current_group.push(idx);
-            current_is_parallel = is_parallel;
-        }
-    }
-    if !current_group.is_empty() {
-        groups.push(current_group);
-    }
-    groups
-}
 
 /// Spawn tool tasks for a single group. Returns (idx, id, name, result) tuples
 /// to preserve original ordering.
@@ -765,110 +580,44 @@ fn spawn_group(
     join_set
 }
 
-/// Skip remaining tool groups by emitting start/end events with error results.
-fn skip_remaining_groups(
-    event_tx: &broadcast::Sender<AgentEvent>,
-    remaining_groups: &[Vec<usize>],
-    tool_calls: &[ToolCall],
-    results_map: &mut HashMap<usize, (String, String, ToolResult)>,
-) {
-    for group in remaining_groups {
-        for &idx in group {
-            let tc = &tool_calls[idx];
+// (skip_remaining_groups logic moved to AgentState::handle_batch_complete in logic.rs)
+
+// ─── Proactive compaction (I/O) ────────────────────────────────────
+
+/// Run proactive compaction inline. Called when `ResponseDecision::needs_proactive_compaction`
+/// is true, before executing tool calls or finishing the turn.
+async fn run_proactive_compaction(state: &mut AgentState, cancel: &CancellationToken) {
+    send_event(
+        &state.event_tx,
+        AgentEvent::CompactionStart {
+            reason: CompactionReason::Threshold,
+        },
+    );
+    let result = compaction::compact(
+        &state.conversation.messages,
+        &state.config.compaction,
+        &state.config,
+        &state.transport,
+        state.conversation.previous_summary.as_deref(),
+        cancel,
+    )
+    .await;
+    match result {
+        Ok(cr) => {
+            let tokens_after = compaction::estimate_total_tokens(
+                &state.conversation.messages[cr.first_kept_index..],
+            );
             send_event(
-                event_tx,
-                AgentEvent::ToolExecutionStart {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    arguments: serde_json::Value::Null,
-                    activity: "Skipped".to_string(),
+                &state.event_tx,
+                AgentEvent::CompactionEnd {
+                    tokens_before: cr.tokens_before,
+                    tokens_after,
                 },
             );
-            let skip_result = ToolResult::error("Skipped due to steering message");
-            send_event(
-                event_tx,
-                AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    result: skip_result.text_content(),
-                    is_error: skip_result.is_error,
-                },
-            );
-            results_map.insert(idx, (tc.id.clone(), tc.name.clone(), skip_result));
+            state.apply_compaction_result(cr);
         }
-    }
-}
-
-/// Collect tool results in original request order, producing ToolResult messages.
-fn collect_ordered_results(
-    tool_calls: &[ToolCall],
-    mut results_map: HashMap<usize, (String, String, ToolResult)>,
-) -> Vec<Message> {
-    let mut messages = Vec::new();
-    for (idx, tc) in tool_calls.iter().enumerate() {
-        let (id, name, result) = results_map.remove(&idx).unwrap_or_else(|| {
-            (
-                tc.id.clone(),
-                tc.name.clone(),
-                ToolResult::error("Task failed (panicked or cancelled)"),
-            )
-        });
-        messages.push(Message::ToolResult {
-            tool_call_id: id,
-            tool_name: name,
-            content: result.content,
-            is_error: result.is_error,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-        });
-    }
-    messages
-}
-
-// ─── Follow-up draining ─────────────────────────────────────────────
-
-fn drain_follow_ups(state: &mut AgentState) -> StepPhase {
-    // Check steering queue first (user messages injected during execution)
-    let steering = drain_queue(&mut state.steering_queue, state.config.steering_mode);
-    if !steering.is_empty() {
-        return StepPhase::PrepareTurn {
-            pending: steering,
-            first_user_message: None,
-        };
-    }
-
-    // Check follow-up queue
-    let follow_ups = drain_queue(&mut state.follow_up_queue, state.config.follow_up_mode);
-    if !follow_ups.is_empty() {
-        let count = follow_ups.len() as u32;
-        let _ = state.pending_follow_ups.fetch_update(
-            Ordering::Release,
-            Ordering::Acquire,
-            |n| Some(n.saturating_sub(count)),
-        );
-        return StepPhase::PrepareTurn {
-            pending: follow_ups,
-            first_user_message: None,
-        };
-    }
-
-    // If background agents are still pending, wait for their follow-ups.
-    // WaitingForFollowUps is handled in the main loop with select! on cmd_rx.
-    if state.pending_follow_ups.load(Ordering::Acquire) > 0 {
-        return StepPhase::WaitingForFollowUps;
-    }
-
-    StepPhase::Done(Ok(()))
-}
-
-fn drain_queue(queue: &mut Vec<Message>, mode: DequeueMode) -> Vec<Message> {
-    match mode {
-        DequeueMode::All => std::mem::take(queue),
-        DequeueMode::OneAtATime => {
-            if queue.is_empty() {
-                vec![]
-            } else {
-                vec![queue.remove(0)]
-            }
+        Err(e) => {
+            tracing::warn!("Proactive compaction failed: {}", e);
         }
     }
 }
@@ -910,7 +659,7 @@ async fn run_compaction_phase(
                     tokens_after,
                 },
             );
-            apply_compaction_result(state, cr);
+            state.apply_compaction_result(cr);
 
             if let Some(r) = reply {
                 let _ = r.send(PromptResult { result: Ok(()) });
@@ -948,16 +697,6 @@ async fn run_compaction_phase(
     }
 }
 
-fn apply_compaction_result(state: &mut AgentState, result: compaction::CompactionResult) {
-    state.conversation.previous_summary = Some(result.summary.clone());
-    let kept = state.conversation.messages.split_off(result.first_kept_index);
-    state.conversation.messages = vec![Message::user(format!(
-        "<context-summary>\n{}\n</context-summary>\n\nThe conversation was compacted. Continue from where we left off.",
-        result.summary
-    ))];
-    state.conversation.messages.extend(kept);
-}
-
 /// Run a final summary turn with tools disabled when max_turns is reached.
 async fn run_final_summary(
     state: &mut AgentState,
@@ -978,7 +717,7 @@ async fn run_final_summary(
     tracing::info!("Agent reached max turns ({}), running final summary", max);
 
     // Flush pending tool results
-    flush_pending(&mut state.conversation.messages, pending);
+    logic::flush_pending(&mut state.conversation.messages, pending);
 
     let summary_prompt = vec![Message::user(format!(
         "[System: You have reached the maximum of {} turns. \
@@ -986,8 +725,8 @@ async fn run_final_summary(
         max
     ))];
 
-    let context = build_context(state, &summary_prompt);
-    let mut final_config = build_run_config(state);
+    let context = state.build_context(&summary_prompt);
+    let mut final_config = state.build_run_config();
     final_config.tools.clear();
 
     if let Ok(mut stream) = state.transport.run(context, &final_config, cancel.clone()).await {
@@ -997,8 +736,7 @@ async fn run_final_summary(
             reducer.observe(&event);
         }
         let outcome = reducer.finalize();
-        state.conversation.total_usage.input += outcome.usage.input;
-        state.conversation.total_usage.output += outcome.usage.output;
+        state.accumulate_usage(&outcome.usage);
         if let Some(msg) = outcome.assistant_message {
             state.conversation.messages.push(msg);
         }

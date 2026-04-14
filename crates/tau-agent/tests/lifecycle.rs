@@ -1,14 +1,12 @@
 //! Tests for the basic agent lifecycle: spawn, prompt, events, shutdown.
 
-mod harness;
-
-use harness::*;
+use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::Message;
 
 #[tokio::test]
 async fn spawn_and_query_config() {
-    let mut builder = AgentBuilder::new(test_config(), TextTransport::new("hi"));
+    let mut builder = AgentBuilder::new(test_config(), TextTransport::create("hi"));
     builder.set_system_prompt("custom");
     let handle = builder.spawn();
 
@@ -18,7 +16,7 @@ async fn spawn_and_query_config() {
 
 #[tokio::test]
 async fn set_model_via_handle() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("hi")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("hi")).spawn();
 
     let mut m = test_config().model;
     m.id = "new-model".into();
@@ -30,7 +28,7 @@ async fn set_model_via_handle() {
 
 #[tokio::test]
 async fn prompt_returns_assistant_message() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("Hello!")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("Hello!")).spawn();
 
     handle.prompt_and_wait("hi").await.unwrap();
 
@@ -42,7 +40,7 @@ async fn prompt_returns_assistant_message() {
 
 #[tokio::test]
 async fn prompt_emits_start_and_end_events() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     let mut rx = handle.subscribe();
 
     handle.prompt_and_wait("go").await.unwrap();
@@ -58,7 +56,7 @@ async fn prompt_emits_start_and_end_events() {
 
 #[tokio::test]
 async fn usage_is_accumulated() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
 
     handle.prompt_and_wait("a").await.unwrap();
     let s1 = handle.state().await.unwrap();
@@ -71,7 +69,7 @@ async fn usage_is_accumulated() {
 
 #[tokio::test]
 async fn is_streaming_false_after_prompt() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     handle.prompt_and_wait("go").await.unwrap();
 
     let state = handle.state().await.unwrap();
@@ -81,7 +79,7 @@ async fn is_streaming_false_after_prompt() {
 
 #[tokio::test]
 async fn clear_messages_resets_state() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     handle.prompt_and_wait("go").await.unwrap();
 
     handle.clear_messages();
@@ -97,7 +95,7 @@ async fn clear_messages_resets_state() {
 
 #[tokio::test]
 async fn set_messages_replaces_conversation() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     handle.set_messages(vec![Message::user("a"), Message::user("b")]);
     let _ = handle.config().await;
 
@@ -107,7 +105,7 @@ async fn set_messages_replaces_conversation() {
 
 #[tokio::test]
 async fn timestamps_are_milliseconds() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     handle.prompt_and_wait("go").await.unwrap();
 
     for msg in handle.messages().await.unwrap() {
@@ -130,7 +128,7 @@ async fn handle_is_clone_send_sync() {
 
 #[tokio::test]
 async fn dropping_all_handles_makes_queries_return_none() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     // Clone to keep one alive, drop the original
     let h2 = handle.clone();
     drop(handle);

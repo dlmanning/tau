@@ -19,9 +19,16 @@ use crate::events::AgentEvent;
 
 /// Cloneable handle to a running agent. All methods take `&self`.
 /// This is the only way external code interacts with the agent.
+///
+/// Commands are split across two channels:
+/// - **urgent** (Steer, FollowUp) — processed with priority during streaming/tools
+/// - **normal** (everything else) — queries, config mutations, prompts
 #[derive(Clone)]
 pub struct AgentHandle {
-    pub(crate) cmd_tx: mpsc::Sender<Command>,
+    /// Priority channel for Steer/FollowUp commands.
+    pub(crate) urgent_tx: mpsc::Sender<Command>,
+    /// Normal channel for everything else.
+    pub(crate) normal_tx: mpsc::Sender<Command>,
     pub(crate) event_tx: broadcast::Sender<AgentEvent>,
     /// Shared with actor. The actor replaces the inner token at each prompt start.
     /// `abort()` cancels the current token. `Arc<Mutex<>>` ensures the handle
@@ -44,7 +51,7 @@ impl AgentHandle {
         content: Vec<tau_ai::Content>,
     ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.cmd_tx
+        self.normal_tx
             .send(Command::Prompt {
                 content,
                 reply: reply_tx,
@@ -77,40 +84,46 @@ impl AgentHandle {
 
     // === Fire-and-forget mutations ===
 
+    /// Route a command to the correct channel based on urgency.
+    fn send_command(&self, cmd: Command) {
+        let tx = if cmd.is_urgent() { &self.urgent_tx } else { &self.normal_tx };
+        let _ = tx.try_send(cmd);
+    }
+
     pub fn steer(&self, message: tau_ai::Message) {
-        let _ = self.cmd_tx.try_send(Command::Steer(message));
+        self.send_command(Command::Steer(message));
     }
 
     pub fn follow_up(&self, message: tau_ai::Message) {
-        let _ = self.cmd_tx.try_send(Command::FollowUp(message));
+        self.send_command(Command::FollowUp(message));
     }
 
     pub fn set_model(&self, model: tau_ai::Model) {
-        let _ = self.cmd_tx.try_send(Command::SetModel(model));
+        self.send_command(Command::SetModel(model));
     }
 
     pub fn set_reasoning(&self, level: tau_ai::ReasoningLevel) {
-        let _ = self.cmd_tx.try_send(Command::SetReasoning(level));
+        self.send_command(Command::SetReasoning(level));
     }
 
     pub fn set_system_prompt(&self, prompt: String) {
-        let _ = self.cmd_tx.try_send(Command::SetSystemPrompt(prompt));
+        self.send_command(Command::SetSystemPrompt(prompt));
     }
 
     pub fn set_compaction_config(&self, config: CompactionConfig) {
-        let _ = self.cmd_tx.try_send(Command::SetCompactionConfig(config));
+        self.send_command(Command::SetCompactionConfig(config));
     }
 
     pub fn clear_messages(&self) {
-        let _ = self.cmd_tx.try_send(Command::ClearMessages);
+        self.send_command(Command::ClearMessages);
     }
 
     pub fn set_messages(&self, messages: Vec<tau_ai::Message>) {
-        let _ = self.cmd_tx.try_send(Command::SetMessages(messages));
+        self.send_command(Command::SetMessages(messages));
     }
 
     pub fn set_previous_summary(&self, summary: Option<String>) {
-        let _ = self.cmd_tx.try_send(Command::SetPreviousSummary(summary));
+        self.send_command(Command::SetPreviousSummary(summary));
     }
 
     // === Abort ===
@@ -149,19 +162,19 @@ impl AgentHandle {
 
     pub async fn config(&self) -> Option<AgentConfig> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::GetConfig(tx)).await.ok()?;
+        self.normal_tx.send(Command::GetConfig(tx)).await.ok()?;
         rx.await.ok()
     }
 
     pub async fn messages(&self) -> Option<Vec<tau_ai::Message>> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::GetMessages(tx)).await.ok()?;
+        self.normal_tx.send(Command::GetMessages(tx)).await.ok()?;
         rx.await.ok()
     }
 
     pub async fn state(&self) -> Option<Conversation> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::GetState(tx)).await.ok()?;
+        self.normal_tx.send(Command::GetState(tx)).await.ok()?;
         rx.await.ok()
     }
 
@@ -172,7 +185,7 @@ impl AgentHandle {
         reason: CompactionReason,
     ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.cmd_tx
+        self.normal_tx
             .send(Command::Compact {
                 reason,
                 reply: reply_tx,

@@ -7,6 +7,8 @@
 pub(crate) mod actor;
 pub mod builder;
 pub(crate) mod command;
+pub(crate) mod logic;
+pub(crate) mod state;
 pub mod compaction;
 pub mod config;
 pub mod context;
@@ -39,4 +41,5 @@ pub use tool::{
 pub use builder::AgentBuilder;
 pub use transport::Transport;
 
-
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;

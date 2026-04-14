@@ -1,10 +1,8 @@
 //! Tests for error handling: transport errors, conversation.error, overflow.
 
-mod harness;
-
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
@@ -13,7 +11,7 @@ use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn transport_error_sets_conversation_error() {
-    let handle = AgentBuilder::new(test_config(), ErrorTransport::new("something broke")).spawn();
+    let handle = AgentBuilder::new(test_config(), ErrorTransport::create("something broke")).spawn();
 
     let result = handle.prompt_and_wait("go").await;
     assert!(result.is_err());
@@ -25,7 +23,7 @@ async fn transport_error_sets_conversation_error() {
 
 #[tokio::test]
 async fn transport_error_emits_error_event() {
-    let handle = AgentBuilder::new(test_config(), ErrorTransport::new("boom")).spawn();
+    let handle = AgentBuilder::new(test_config(), ErrorTransport::create("boom")).spawn();
     let mut rx = handle.subscribe();
 
     let _ = handle.prompt_and_wait("go").await;
@@ -91,7 +89,7 @@ async fn error_cleared_on_next_prompt() {
 
 #[tokio::test]
 async fn agent_is_idle_after_error() {
-    let handle = AgentBuilder::new(test_config(), ErrorTransport::new("fail")).spawn();
+    let handle = AgentBuilder::new(test_config(), ErrorTransport::create("fail")).spawn();
     let _ = handle.prompt_and_wait("go").await;
 
     assert!(!handle.is_running(), "should be idle after error");

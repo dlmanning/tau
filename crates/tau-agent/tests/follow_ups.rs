@@ -1,10 +1,8 @@
 //! Tests for steering, follow-ups, and background agent waiting.
 
-mod harness;
-
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
@@ -13,7 +11,7 @@ use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn follow_up_processed_after_prompt() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
 
     handle.expect_follow_up();
     assert!(handle.has_pending_follow_ups());
@@ -36,7 +34,7 @@ async fn follow_up_processed_after_prompt() {
 
 #[tokio::test]
 async fn no_pending_follow_ups_finishes_immediately() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::new("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
     // No expect_follow_up — should finish immediately after LLM responds
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
