@@ -11,7 +11,10 @@ pub(crate) async fn run_command(
     println!();
 
     let mut receiver = handle.subscribe();
-    let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+    let config = handle
+        .config()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
     let model_for_cost = config.model.clone();
 
     let event_handle = tokio::spawn(async move {

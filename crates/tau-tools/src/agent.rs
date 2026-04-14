@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
 use tau_agent::handle::AgentHandle;
+use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]

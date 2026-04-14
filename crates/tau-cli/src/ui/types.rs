@@ -1,8 +1,8 @@
 use std::time::Instant;
 
+use super::widgets::SelectorState;
 use futures::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
-use super::widgets::SelectorState;
 
 use super::constants;
 

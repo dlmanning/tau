@@ -15,7 +15,10 @@ pub(crate) async fn run_interactive(
     let _interaction_handle = tokio::spawn(handle_interaction_stdin(interaction_rx));
 
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+        let config = handle
+            .config()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
         let model_id = &config.model.id;
         let model_short = model_id.split('/').next_back().unwrap_or(model_id);
         if let Some(ref s) = session {
@@ -41,9 +44,18 @@ pub(crate) async fn run_interactive(
         }
 
         if input.starts_with('/') {
-            let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
-            let messages = handle.messages().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
-            let state = handle.state().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let config = handle
+                .config()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let messages = handle
+                .messages()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let state = handle
+                .state()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
             let ctx = commands::CommandContext {
                 args: "",
                 config: &config,
@@ -82,7 +94,10 @@ pub(crate) async fn run_interactive(
                     commands::CommandResult::OpenModelSelector => {
                         println!(
                             "{}",
-                            commands::ModelCommand::list_models_text(&config.model, &available_models)
+                            commands::ModelCommand::list_models_text(
+                                &config.model,
+                                &available_models
+                            )
                         );
                     }
                     commands::CommandResult::OpenBranchSelector => {
@@ -107,14 +122,15 @@ pub(crate) async fn run_interactive(
                     }
                     commands::CommandResult::Compact => {
                         println!("Compacting context...");
-                        match handle
-                            .compact(tau_agent::CompactionReason::Manual)
-                            .await
-                        {
+                        match handle.compact(tau_agent::CompactionReason::Manual).await {
                             Ok(rx) => match rx.await {
                                 Ok(r) if r.result.is_ok() => {
-                                    let msg_count = handle.messages().await.map(|m| m.len()).unwrap_or(0);
-                                    println!("Context compacted. {} messages remaining.", msg_count);
+                                    let msg_count =
+                                        handle.messages().await.map(|m| m.len()).unwrap_or(0);
+                                    println!(
+                                        "Context compacted. {} messages remaining.",
+                                        msg_count
+                                    );
                                 }
                                 _ => println!("Compaction failed."),
                             },
@@ -158,7 +174,12 @@ pub(crate) async fn run_interactive(
         println!();
 
         let mut receiver = handle.subscribe();
-        let model_for_cost = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?.model.clone();
+        let model_for_cost = handle
+            .config()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?
+            .model
+            .clone();
 
         let is_tty = std::io::IsTerminal::is_terminal(&io::stdout());
         let event_handle = tokio::spawn(async move {
@@ -255,7 +276,10 @@ pub(crate) async fn run_interactive(
             for msg in all_msgs.iter().skip(msgs_before) {
                 let _ = s.append_message(msg);
             }
-            let state = handle.state().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+            let state = handle
+                .state()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
             let _ = s.append_usage(&state.total_usage);
         }
 

@@ -15,7 +15,7 @@ use crate::{
 /// OpenAI API client
 pub struct OpenAIProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -23,7 +23,15 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key: api_key.into(),
+            api_key: Some(api_key.into()),
+        }
+    }
+
+    /// Create without an API key (for local providers like Ollama)
+    pub fn without_key() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key: None,
         }
     }
 
@@ -37,12 +45,11 @@ impl OpenAIProvider {
     pub async fn list_models(&self) -> Result<Vec<OpenAIModelInfo>> {
         let url = "https://api.openai.com/v1/models";
 
-        let response = self
-            .client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        let mut req = self.client.get(url);
+        if let Some(ref api_key) = self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+        let response = req.send().await?;
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -66,12 +73,14 @@ impl OpenAIProvider {
         let url = format!("{}/chat/completions", model.base_url);
 
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", self.api_key)
-                .parse()
-                .map_err(|_| Error::InvalidConfig("invalid API key for header".into()))?,
-        );
+        if let Some(ref api_key) = self.api_key {
+            headers.insert(
+                "Authorization",
+                format!("Bearer {}", api_key)
+                    .parse()
+                    .map_err(|_| Error::InvalidConfig("invalid API key for header".into()))?,
+            );
+        }
         headers.insert("content-type", super::APPLICATION_JSON);
 
         for (key, value) in &model.headers {
@@ -143,6 +152,7 @@ impl OpenAIProvider {
                 None
             },
             stream_options: Some(serde_json::json!({"include_usage": true})),
+            options: None,
         })
     }
 }
@@ -370,6 +380,9 @@ struct OpenAIRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<serde_json::Value>,
+    /// Ollama-specific: override context window size
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

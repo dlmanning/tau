@@ -94,31 +94,37 @@ async fn main() -> anyhow::Result<()> {
     let use_tui = !args.no_tui && cfg.tui.unwrap_or(true);
 
     // Check for API key (OAuth, config, or env)
-    let api_key = match cfg.get_api_key_with_oauth(&provider).await {
-        Some(key) => key,
+    // Providers like Ollama don't require an API key
+    let api_key: Option<String> = match cfg.get_api_key_with_oauth(&provider).await {
+        Some(key) => Some(key),
         None => {
-            let api_key_var = model
-                .provider
-                .api_key_env_var()
-                .unwrap_or("ANTHROPIC_API_KEY");
-            eprintln!("Error: No authentication found for {}", provider);
-            eprintln!();
-            if provider == "anthropic" {
-                eprintln!("Options:");
-                eprintln!("  1. Login with Claude Pro/Max: tau --login anthropic");
-                eprintln!("  2. Set API key: export {}=your-key", api_key_var);
-                eprintln!("  3. Add to config: tau --init-config");
-            } else {
-                eprintln!("Set your API key with: export {}=your-key", api_key_var);
-                eprintln!("Or add it to config file: tau --init-config");
+            if model.provider.api_key_env_var().is_some() {
+                let api_key_var = model
+                    .provider
+                    .api_key_env_var()
+                    .unwrap_or("ANTHROPIC_API_KEY");
+                eprintln!("Error: No authentication found for {}", provider);
+                eprintln!();
+                if provider == "anthropic" {
+                    eprintln!("Options:");
+                    eprintln!("  1. Login with Claude Pro/Max: tau --login anthropic");
+                    eprintln!("  2. Set API key: export {}=your-key", api_key_var);
+                    eprintln!("  3. Add to config: tau --init-config");
+                } else {
+                    eprintln!("Set your API key with: export {}=your-key", api_key_var);
+                    eprintln!("Or add it to config file: tau --init-config");
+                }
+                std::process::exit(1);
             }
-            std::process::exit(1);
+            None
         }
     };
 
-    let transport = Arc::new(tau_agent::transport::ProviderTransport::with_api_key(
-        api_key,
-    ));
+    let transport = Arc::new(if let Some(key) = api_key {
+        tau_agent::transport::ProviderTransport::with_api_key(key)
+    } else {
+        tau_agent::transport::ProviderTransport::new()
+    });
 
     let compaction = if let Some(ref compaction_settings) = cfg.compaction {
         tau_agent::CompactionConfig {

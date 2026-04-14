@@ -31,15 +31,18 @@ impl Command for SessionCommand {
         output.push_str(&format!("Reasoning:  {:?}\n", ctx.config.reasoning));
         output.push('\n');
 
-        let user_msgs = ctx.messages
+        let user_msgs = ctx
+            .messages
             .iter()
             .filter(|m| matches!(m, tau_ai::Message::User { .. }))
             .count();
-        let assistant_msgs = ctx.messages
+        let assistant_msgs = ctx
+            .messages
             .iter()
             .filter(|m| matches!(m, tau_ai::Message::Assistant { .. }))
             .count();
-        let tool_results = ctx.messages
+        let tool_results = ctx
+            .messages
             .iter()
             .filter(|m| matches!(m, tau_ai::Message::ToolResult { .. }))
             .count();

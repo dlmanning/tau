@@ -31,17 +31,17 @@ use crossterm::event::EventStream;
 use futures::StreamExt;
 use tau_agent::{AgentEvent, AgentHandle};
 use tau_ai::Model;
-use widgets::{SelectorState, message_list::ChatMessage};
 use tokio::sync::mpsc;
+use widgets::{SelectorState, message_list::ChatMessage};
 
 /// Apply a branch operation: create a branch session and truncate conversation state.
-async fn apply_branch(
-    state: &mut TuiState,
-    handle: &AgentHandle,
-    branch_index: Option<usize>,
-) {
-    let Some(config) = handle.config().await else { return };
-    let Some(messages) = handle.messages().await else { return };
+async fn apply_branch(state: &mut TuiState, handle: &AgentHandle, branch_index: Option<usize>) {
+    let Some(config) = handle.config().await else {
+        return;
+    };
+    let Some(messages) = handle.messages().await else {
+        return;
+    };
     match crate::session::SessionManager::branch_from(&messages, branch_index, &config.model.id) {
         Ok(new_session) => {
             let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
@@ -82,9 +82,15 @@ async fn dispatch_ui_message(
             *pending_prompt = Some(content);
         }
         UiMessage::Command(cmd) => {
-            let Some(config) = handle.config().await else { return true };
-            let Some(messages) = handle.messages().await else { return true };
-            let Some(conv_state) = handle.state().await else { return true };
+            let Some(config) = handle.config().await else {
+                return true;
+            };
+            let Some(messages) = handle.messages().await else {
+                return true;
+            };
+            let Some(conv_state) = handle.state().await else {
+                return true;
+            };
             let ctx = CommandContext {
                 args: "",
                 config: &config,
@@ -126,13 +132,11 @@ async fn dispatch_ui_message(
                     }
                     CommandResult::Compact => {
                         state.show_system_message("Compacting context...");
-                        match handle
-                            .compact(tau_agent::CompactionReason::Manual)
-                            .await
-                        {
+                        match handle.compact(tau_agent::CompactionReason::Manual).await {
                             Ok(rx) => match rx.await {
                                 Ok(r) if r.result.is_ok() => {
-                                    let msg_count = handle.messages().await.map(|m| m.len()).unwrap_or(0);
+                                    let msg_count =
+                                        handle.messages().await.map(|m| m.len()).unwrap_or(0);
                                     state.show_system_message(&format!(
                                         "Context compacted. {} messages remaining.",
                                         msg_count,
@@ -206,12 +210,11 @@ pub async fn run_tui(
 
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(constants::UI_CHANNEL_CAPACITY);
 
-    let config = handle.config().await.ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
-    let mut state = TuiState::new(
-        &config,
-        available_models.to_vec(),
-        ui_tx,
-    );
+    let config = handle
+        .config()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
+    let mut state = TuiState::new(&config, available_models.to_vec(), ui_tx);
 
     let mut agent_rx = handle.subscribe();
     let mut event_stream = EventStream::new();
@@ -239,7 +242,9 @@ pub async fn run_tui(
             let prompt_rx = match handle.prompt(&content).await {
                 Ok(rx) => rx,
                 Err(e) => {
-                    state.handle_agent_event(AgentEvent::Error { message: e.to_string() });
+                    state.handle_agent_event(AgentEvent::Error {
+                        message: e.to_string(),
+                    });
                     state.is_processing = false;
                     continue;
                 }

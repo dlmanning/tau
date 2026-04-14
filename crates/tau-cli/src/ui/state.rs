@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use ratatui::layout::Rect;
-use tau_ai::Model;
 use tau_agent::AgentConfig;
+use tau_ai::Model;
 
 use super::{
     theme::Theme,

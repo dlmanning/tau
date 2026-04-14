@@ -1,3 +1,4 @@
+use super::widgets::{MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -5,7 +6,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
-use super::widgets::{MessageList, OwnedSelector, OwnedSelectorItem, Selector, SelectorItem};
 
 use super::constants;
 use super::state::TuiState;

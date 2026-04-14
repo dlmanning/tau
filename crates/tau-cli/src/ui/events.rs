@@ -1,5 +1,5 @@
-use crossterm::event::{Event, MouseEventKind};
 use super::{input::Action, widgets::message_list::ChatMessage};
+use crossterm::event::{Event, MouseEventKind};
 
 use super::constants;
 use super::state::TuiState;

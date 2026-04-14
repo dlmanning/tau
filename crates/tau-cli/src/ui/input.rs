@@ -117,4 +117,3 @@ pub fn key_to_action(event: KeyEvent) -> Action {
         _ => Action::Unknown,
     }
 }
-
