@@ -2,14 +2,12 @@
 //! spawn, resume, eviction, event forwarding, background agents,
 //! find_agent, send_to_running, cancel propagation.
 
-mod harness;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use tau_agent::manager::{AgentManager, AgentStatus, AgentType, SpawnRequest};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
@@ -39,7 +37,7 @@ fn spawn_request(prompt: &str, description: &str) -> SpawnRequest {
 
 #[tokio::test]
 async fn spawn_foreground_completes_and_returns_result() {
-    let manager = make_manager(TextTransport::new("subagent response"));
+    let manager = make_manager(TextTransport::create("subagent response"));
     let cancel = CancellationToken::new();
 
     let result = manager
@@ -57,7 +55,7 @@ async fn spawn_foreground_completes_and_returns_result() {
 
 #[tokio::test]
 async fn spawn_foreground_stores_agent_for_resumption() {
-    let manager = make_manager(TextTransport::new("first response"));
+    let manager = make_manager(TextTransport::create("first response"));
     let cancel = CancellationToken::new();
 
     let result = manager
@@ -103,7 +101,7 @@ async fn resume_agent_with_send() {
 
 #[tokio::test]
 async fn send_to_nonexistent_agent_errors() {
-    let manager = make_manager(TextTransport::new("ok"));
+    let manager = make_manager(TextTransport::create("ok"));
     let cancel = CancellationToken::new();
 
     let result = manager.send("nonexistent-id", "hello", cancel).await;
@@ -116,7 +114,7 @@ async fn send_to_nonexistent_agent_errors() {
 #[tokio::test]
 async fn eviction_removes_oldest_agent() {
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let transport = TextTransport::new("ok");
+    let transport = TextTransport::create("ok");
     let config = test_config();
     // Max 2 agents
     let manager = Arc::new(AgentManager::new(
@@ -157,7 +155,7 @@ async fn eviction_removes_oldest_agent() {
 #[tokio::test]
 async fn subagent_events_forwarded_as_wrapped() {
     let (event_tx, mut parent_rx) = tokio::sync::broadcast::channel(256);
-    let transport = TextTransport::new("ok");
+    let transport = TextTransport::create("ok");
     let config = test_config();
     let manager = Arc::new(AgentManager::new(
         event_tx,
@@ -199,7 +197,7 @@ async fn subagent_events_forwarded_as_wrapped() {
 
 #[tokio::test]
 async fn find_agent_by_description_substring() {
-    let manager = make_manager(TextTransport::new("ok"));
+    let manager = make_manager(TextTransport::create("ok"));
     let cancel = CancellationToken::new();
 
     manager
@@ -214,7 +212,7 @@ async fn find_agent_by_description_substring() {
 
 #[tokio::test]
 async fn find_agent_not_found() {
-    let manager = make_manager(TextTransport::new("ok"));
+    let manager = make_manager(TextTransport::create("ok"));
     assert!(manager.find_agent("nonexistent").await.is_none());
 }
 
@@ -222,7 +220,7 @@ async fn find_agent_not_found() {
 
 #[tokio::test]
 async fn spawn_background_posts_follow_up() {
-    let transport = TextTransport::new("background result");
+    let transport = TextTransport::create("background result");
     let config = test_config();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let manager = Arc::new(AgentManager::new(
@@ -234,7 +232,7 @@ async fn spawn_background_posts_follow_up() {
     ));
 
     // Create a parent agent to receive the follow-up
-    let parent_builder = AgentBuilder::new(config, TextTransport::new("parent response"));
+    let parent_builder = AgentBuilder::new(config, TextTransport::create("parent response"));
     let parent_handle = parent_builder.spawn();
 
     let parent_cancel = CancellationToken::new();
@@ -270,7 +268,7 @@ async fn spawn_background_posts_follow_up() {
 
 #[tokio::test]
 async fn cancel_propagates_to_subagent() {
-    let transport = SlowTransport::new(5000);
+    let transport = SlowTransport::create(5000);
     let manager = make_manager(transport);
     let cancel = CancellationToken::new();
 
@@ -298,7 +296,7 @@ async fn cancel_propagates_to_subagent() {
 
 #[tokio::test]
 async fn subagent_executes_tools() {
-    let transport = ToolCallTransport::new(1, "echo");
+    let transport = ToolCallTransport::create(1, "echo");
     let manager = make_manager(transport);
     let cancel = CancellationToken::new();
 
@@ -318,7 +316,7 @@ async fn subagent_executes_tools() {
 
 #[tokio::test]
 async fn resume_tracks_delta_usage() {
-    let transport = TextTransport::new("ok");
+    let transport = TextTransport::create("ok");
     let manager = make_manager(transport);
     let cancel = CancellationToken::new();
 
@@ -389,7 +387,7 @@ async fn multiple_background_agents_complete_at_different_times() {
     ));
 
     // Parent agent receives follow-ups
-    let parent_handle = AgentBuilder::new(config, TextTransport::new("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
 
     let mut agent_ids = vec![];
@@ -435,7 +433,7 @@ async fn multiple_background_agents_complete_at_different_times() {
 async fn cancel_all_concurrent_background_agents() {
     // Spawn 4 slow background agents, then cancel the parent.
     // All should terminate promptly.
-    let transport = SlowTransport::new(10_000);
+    let transport = SlowTransport::create(10_000);
     let config = test_config();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let manager = Arc::new(AgentManager::new(
@@ -446,7 +444,7 @@ async fn cancel_all_concurrent_background_agents() {
         20,
     ));
 
-    let parent_handle = AgentBuilder::new(config, TextTransport::new("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
 
     for i in 0..4 {
@@ -487,7 +485,7 @@ async fn interleave_foreground_and_background_agents() {
         20,
     ));
 
-    let parent_handle = AgentBuilder::new(config, TextTransport::new("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
     let cancel = CancellationToken::new();
 
@@ -549,7 +547,7 @@ async fn resume_while_background_agent_running() {
         20,
     ));
 
-    let parent_handle = AgentBuilder::new(config, TextTransport::new("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
     let cancel = CancellationToken::new();
 
@@ -631,6 +629,130 @@ impl Transport for VariableDelayTransport {
 }
 
 // ─── Harness helper: transport with call counter ────────────────────
+
+#[tokio::test]
+async fn abort_root_agent_cancels_all_subagents() {
+    // Scenario: a root agent is running a slow prompt. While it streams,
+    // 3 background subagents are spawned (each takes 60s). The user aborts
+    // the root agent via handle.abort(). All 3 subagents must terminate
+    // immediately — the entire post-abort sequence must complete within 1s.
+    //
+    // Cancellation chain:
+    //   handle.abort() → root cancel token → parent_cancel in spawn_background
+    //     → select! fires → bg_cancel.cancel() → subagent transport cancelled
+
+    // Track how many subagent transports have been cancelled
+    let cancel_count = Arc::new(AtomicU32::new(0));
+
+    // Custom transport that increments a counter when cancelled
+    struct CancelCountingTransport {
+        counter: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Transport for CancelCountingTransport {
+        async fn run(
+            &self,
+            _: Vec<Message>,
+            _: &AgentRunConfig,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> tau_ai::Result<AgentEventStream> {
+            let counter = self.counter.clone();
+            let events = async_stream::stream! {
+                yield AgentEvent::TurnStart { turn_number: 1 };
+                // Wait for cancellation or a long timeout
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        yield AgentEvent::Error { message: "Cancelled".into() };
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        let msg = Message::Assistant {
+                            content: vec![Content::text("should not reach")],
+                            metadata: AssistantMetadata::default(),
+                        };
+                        yield AgentEvent::MessageEnd { message: msg.clone() };
+                        yield AgentEvent::TurnEnd {
+                            turn_number: 1,
+                            message: msg,
+                            usage: Usage::default(),
+                        };
+                    }
+                }
+            };
+            Ok(Box::pin(events))
+        }
+    }
+
+    let sub_transport: Arc<dyn Transport> = Arc::new(CancelCountingTransport {
+        counter: cancel_count.clone(),
+    });
+    let config = test_config();
+    let (event_tx, _) = tokio::sync::broadcast::channel(256);
+    let manager = Arc::new(AgentManager::new(
+        event_tx,
+        vec![Arc::new(EchoTool)],
+        config.clone(),
+        sub_transport,
+        20,
+    ));
+
+    // Root agent with a slow transport (simulates LLM streaming)
+    let root_handle = AgentBuilder::new(config, SlowTransport::create(60_000)).spawn();
+    let prompt_rx = root_handle.prompt("start").await.unwrap();
+
+    // Wait for root to enter AwaitingModel
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Extract the root's cancel token for spawning subagents
+    let parent_cancel = root_handle.cancel_token().lock().clone();
+
+    // Spawn 3 slow background subagents
+    for i in 0..3 {
+        manager
+            .spawn_background(
+                spawn_request(&format!("slow task {i}"), &format!("sub-{i}")),
+                root_handle.clone(),
+                parent_cancel.clone(),
+            )
+            .await;
+    }
+
+    // Wait for subagents to start their transports
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(cancel_count.load(Ordering::SeqCst), 0, "no cancellations yet");
+
+    // User aborts the root agent
+    root_handle.abort();
+
+    // Everything — root + all 3 subagents — must terminate within 1 second.
+    // Without cancellation propagation, this would take 60s.
+    let deadline = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        // Root prompt finishes
+        let _ = prompt_rx.await;
+
+        // Wait until all 3 subagent transports have seen cancellation
+        loop {
+            if cancel_count.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        deadline.is_ok(),
+        "root + all 3 subagents must terminate within 1s of abort, \
+         but only {} of 3 subagents were cancelled",
+        cancel_count.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        cancel_count.load(Ordering::SeqCst),
+        3,
+        "all 3 subagent transports must have received cancellation"
+    );
+}
 
 struct CallCountTransport {
     text: String,

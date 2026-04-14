@@ -1,11 +1,9 @@
 //! Tests that verify what the actor sends TO the transport — system prompt,
 //! tool definitions, model config, message context, and tool results.
 
-mod harness;
-
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
@@ -14,7 +12,7 @@ use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn system_prompt_sent_to_transport() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.set_system_prompt("You are helpful.");
     let handle = builder.spawn();
@@ -27,7 +25,7 @@ async fn system_prompt_sent_to_transport() {
 
 #[tokio::test]
 async fn tool_definitions_sent_to_transport() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.add_tool(Arc::new(EchoTool));
     let handle = builder.spawn();
@@ -44,7 +42,7 @@ async fn tool_definitions_sent_to_transport() {
 
 #[tokio::test]
 async fn model_id_sent_to_transport() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
     let handle = builder.spawn();
 
@@ -56,7 +54,7 @@ async fn model_id_sent_to_transport() {
 
 #[tokio::test]
 async fn user_message_in_first_call_context() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
     let handle = builder.spawn();
 
@@ -168,7 +166,7 @@ async fn tool_results_sent_to_transport_on_next_turn() {
 
 #[tokio::test]
 async fn model_change_reflected_in_subsequent_calls() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
     let handle = builder.spawn();
 
@@ -187,7 +185,7 @@ async fn model_change_reflected_in_subsequent_calls() {
 
 #[tokio::test]
 async fn transform_context_applied_before_transport() {
-    let transport = CapturingTransport::new("ok");
+    let transport = CapturingTransport::create("ok");
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.set_transform_context(Arc::new(|mut msgs| {
         msgs.push(Message::user("[injected by transform]"));
@@ -206,4 +204,99 @@ async fn transform_context_applied_before_transport() {
         has_injected,
         "transform_context should inject a message into the context"
     );
+}
+
+#[tokio::test]
+async fn steering_during_tools_does_not_duplicate_tool_results() {
+    /// Turn 1: returns [slow, echo] tool calls. Turn 2 (after steering): captures context.
+    struct SteerCaptureTransport {
+        call_count: AtomicU32,
+        captured: std::sync::Mutex<Vec<CapturedCall>>,
+    }
+
+    #[async_trait]
+    impl Transport for SteerCaptureTransport {
+        async fn run(
+            &self,
+            messages: Vec<Message>,
+            config: &AgentRunConfig,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> tau_ai::Result<AgentEventStream> {
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+            self.captured.lock().unwrap().push(CapturedCall {
+                messages: messages.clone(),
+                system_prompt: config.system_prompt.clone(),
+                tool_names: config.tools.iter().map(|t| t.name.clone()).collect(),
+                model_id: config.model.id.clone(),
+            });
+
+            let msg = if n == 0 {
+                // First call: return two sequential tool calls
+                Message::Assistant {
+                    content: vec![
+                        Content::tool_call("c1", "slow", serde_json::json!({})),
+                        Content::tool_call("c2", "echo", serde_json::json!({"text": "x"})),
+                    ],
+                    metadata: AssistantMetadata::default(),
+                }
+            } else {
+                // Subsequent calls: text response
+                Message::Assistant {
+                    content: vec![Content::text("done")],
+                    metadata: AssistantMetadata::default(),
+                }
+            };
+            let events = vec![
+                AgentEvent::TurnStart { turn_number: 1 },
+                AgentEvent::MessageEnd { message: msg.clone() },
+                AgentEvent::TurnEnd {
+                    turn_number: 1,
+                    message: msg,
+                    usage: Usage::default(),
+                },
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    let transport = Arc::new(SteerCaptureTransport {
+        call_count: AtomicU32::new(0),
+        captured: std::sync::Mutex::new(vec![]),
+    });
+    let mut builder = AgentBuilder::new(test_config(), transport.clone());
+    builder.add_tool(Arc::new(SlowTool { delay_ms: 100 }));
+    builder.add_tool(Arc::new(EchoTool));
+    let handle = builder.spawn();
+
+    let rx = handle.prompt("go").await.unwrap();
+
+    // Wait for slow tool to start, then steer
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    handle.steer(Message::user("redirect"));
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+
+    let calls = transport.captured.lock().unwrap().clone();
+    assert!(calls.len() >= 2, "should have at least 2 transport calls, got {}", calls.len());
+
+    // The second call's context should NOT have duplicate ToolResult messages.
+    // Before the fix, tool results appeared twice (once committed, once as pending).
+    let second_ctx = &calls[1].messages;
+    let tool_result_count = second_ctx
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .count();
+
+    // There should be at most as many ToolResults as there were tool calls (2: c1 executed, c2 skipped)
+    assert!(
+        tool_result_count <= 2,
+        "tool results should not be duplicated in context, found {tool_result_count} ToolResult messages"
+    );
+
+    // The steering message should appear exactly once
+    let steer_count = second_ctx
+        .iter()
+        .filter(|m| m.text().contains("redirect"))
+        .count();
+    assert_eq!(steer_count, 1, "steering message should appear exactly once");
 }

@@ -1,11 +1,9 @@
 //! Tests for concurrent access: abort, busy rejection, queries during streaming,
 //! cancel token lifecycle across multiple prompts.
 
-mod harness;
-
 use async_trait::async_trait;
 use futures::stream;
-use harness::*;
+use tau_agent::test_utils::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tau_agent::transport::{AgentEventStream, AgentRunConfig};
@@ -14,7 +12,7 @@ use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn reject_concurrent_prompt() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::new(200)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(200)).spawn();
 
     let rx1 = handle.prompt("first").await.unwrap();
     let _ = handle.config().await; // ensure actor picked it up
@@ -30,7 +28,7 @@ async fn reject_concurrent_prompt() {
 
 #[tokio::test]
 async fn is_running_tracks_lifecycle() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::new(100)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(100)).spawn();
     assert!(!handle.is_running());
 
     let rx = handle.prompt("go").await.unwrap();
@@ -44,7 +42,7 @@ async fn is_running_tracks_lifecycle() {
 
 #[tokio::test]
 async fn abort_stops_active_prompt() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::new(5000)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(5000)).spawn();
 
     let rx = handle.prompt("go").await.unwrap();
     let _ = handle.config().await;
@@ -117,7 +115,7 @@ async fn abort_then_new_prompt_succeeds() {
 
 #[tokio::test]
 async fn queries_work_during_streaming() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::new(200)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(200)).spawn();
     let rx = handle.prompt("go").await.unwrap();
 
     // These should not hang — the actor select!s on cmd_rx during AwaitingModel
@@ -133,7 +131,7 @@ async fn queries_work_during_streaming() {
 
 #[tokio::test]
 async fn config_mutation_during_streaming_takes_effect_next_turn() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::new(100)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(100)).spawn();
     let rx = handle.prompt("go").await.unwrap();
 
     handle.set_reasoning(tau_ai::ReasoningLevel::High);
@@ -141,4 +139,98 @@ async fn config_mutation_during_streaming_takes_effect_next_turn() {
 
     let cfg = handle.config().await.unwrap();
     assert_eq!(cfg.reasoning, tau_ai::ReasoningLevel::High);
+}
+
+#[tokio::test]
+async fn steer_arrives_during_slow_stream() {
+    /// Transport that captures messages and streams slowly on first call,
+    /// then responds instantly with a text response.
+    struct SlowCapture {
+        call_count: AtomicU32,
+        captured: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl Transport for SlowCapture {
+        async fn run(
+            &self,
+            messages: Vec<Message>,
+            _config: &AgentRunConfig,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> tau_ai::Result<AgentEventStream> {
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+            self.captured.lock().unwrap().push(messages);
+
+            if n == 0 {
+                // First call: slow stream
+                let events = async_stream::stream! {
+                    yield AgentEvent::TurnStart { turn_number: 1 };
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                        _ = cancel.cancelled() => {
+                            yield AgentEvent::Error { message: "Cancelled".into() };
+                            return;
+                        }
+                    }
+                    let msg = Message::Assistant {
+                        content: vec![Content::text("first response")],
+                        metadata: AssistantMetadata::default(),
+                    };
+                    yield AgentEvent::MessageEnd { message: msg.clone() };
+                    yield AgentEvent::TurnEnd {
+                        turn_number: 1,
+                        message: msg,
+                        usage: Usage::default(),
+                    };
+                };
+                Ok(Box::pin(events))
+            } else {
+                // Subsequent calls: instant response
+                let msg = Message::Assistant {
+                    content: vec![Content::text("steered response")],
+                    metadata: AssistantMetadata::default(),
+                };
+                Ok(Box::pin(stream::iter(vec![
+                    AgentEvent::TurnStart { turn_number: 1 },
+                    AgentEvent::MessageEnd { message: msg.clone() },
+                    AgentEvent::TurnEnd {
+                        turn_number: 1,
+                        message: msg,
+                        usage: Usage::default(),
+                    },
+                ])))
+            }
+        }
+    }
+
+    let transport = Arc::new(SlowCapture {
+        call_count: AtomicU32::new(0),
+        captured: std::sync::Mutex::new(vec![]),
+    });
+    let handle = AgentBuilder::new(test_config(), transport.clone()).spawn();
+
+    let rx = handle.prompt("initial").await.unwrap();
+
+    // While the first response is streaming (200ms), send a steer.
+    // The steer (urgent channel) should be queued and processed after
+    // the first turn completes — triggering a second transport call.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    handle.steer(Message::user("urgent redirect"));
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+    assert!(result.is_ok(), "should complete");
+
+    let captured = transport.captured.lock().unwrap().clone();
+    // Should have at least 2 calls: initial prompt + steered follow-up
+    assert!(
+        captured.len() >= 2,
+        "steer during streaming should trigger a second transport call, got {} calls",
+        captured.len()
+    );
+
+    // The second call should contain the steering message
+    let has_steer = captured[1]
+        .iter()
+        .any(|m| m.text().contains("urgent redirect"));
+    assert!(has_steer, "second call should include the steering message");
 }
