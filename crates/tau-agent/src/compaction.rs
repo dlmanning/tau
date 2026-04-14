@@ -612,4 +612,78 @@ mod tests {
         assert!(text.contains("[User]: Hello"));
         assert!(text.contains("[Assistant]: Hi there!"));
     }
+
+    fn assistant_tool_call(name: &str) -> Message {
+        Message::Assistant {
+            content: vec![Content::tool_call("id", name, serde_json::json!({}))],
+            metadata: AssistantMetadata::default(),
+        }
+    }
+
+    fn tool_result(tool_call_id: &str) -> Message {
+        Message::ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "test".to_string(),
+            content: vec![Content::text("result")],
+            is_error: false,
+            timestamp: 0,
+        }
+    }
+
+    // ─── find_turn_start ──────────────────────────────────────────
+
+    #[test]
+    fn find_turn_start_walks_back_through_multi_step_execution() {
+        // A single agent execution: user prompt → assistant(tool) → result → assistant(tool)
+        // find_turn_start should walk back to the first assistant message (index 1),
+        // since all intermediate assistant/tool_result pairs are part of one execution.
+        let messages = vec![
+            user_msg("do something"),         // 0
+            assistant_tool_call("read"),       // 1 — first step
+            tool_result("id"),                 // 2
+            assistant_tool_call("write"),      // 3 — second step (from=3)
+            tool_result("id"),                 // 4
+        ];
+        assert_eq!(find_turn_start(&messages, 3), 1);
+    }
+
+    #[test]
+    fn find_turn_start_stops_at_user_boundary() {
+        // Two separate user turns. find_turn_start from the second assistant
+        // should stop at the user message boundary (index 3), not walk into turn 1.
+        let messages = vec![
+            user_msg("do X"),                 // 0
+            assistant_tool_call("read"),       // 1 — turn 1
+            tool_result("id"),                 // 2
+            user_msg("now do Y"),             // 3 — new user turn
+            assistant_tool_call("write"),      // 4 — turn 2 start
+            tool_result("id"),                 // 5
+            assistant_tool_call("edit"),       // 6 — from=6
+            tool_result("id"),                 // 7
+        ];
+        assert_eq!(find_turn_start(&messages, 6), 4);
+    }
+
+    #[test]
+    fn find_turn_start_at_beginning_of_conversation() {
+        // from points to the very first assistant message — should return 0.
+        let messages = vec![
+            assistant_tool_call("read"),       // 0
+            tool_result("id"),                 // 1
+            assistant_tool_call("write"),      // 2 — from=2
+            tool_result("id"),                 // 3
+        ];
+        assert_eq!(find_turn_start(&messages, 2), 0);
+    }
+
+    #[test]
+    fn find_turn_start_single_step() {
+        // Only one assistant+tool_result before from — should return the assistant index.
+        let messages = vec![
+            user_msg("hello"),                // 0
+            assistant_tool_call("read"),       // 1 — from=1
+            tool_result("id"),                 // 2
+        ];
+        assert_eq!(find_turn_start(&messages, 1), 1);
+    }
 }

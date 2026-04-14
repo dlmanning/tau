@@ -297,7 +297,7 @@ impl AgentState {
             }
 
             // Commit tool results to conversation
-            let tool_results = collect_ordered_results(tool_calls, results_map.clone());
+            let tool_results = collect_ordered_results(tool_calls, results_map);
             self.conversation.messages.extend(tool_results);
 
             return BatchCompleteAction::Redirect {
@@ -388,7 +388,7 @@ pub(crate) fn build_tool_groups(tools: &[BoxedTool], tool_calls: &[ToolCall]) ->
 /// Collect tool results in original request order, producing ToolResult messages.
 pub(crate) fn collect_ordered_results(
     tool_calls: &[ToolCall],
-    mut results_map: HashMap<usize, (String, String, ToolResult)>,
+    results_map: &mut HashMap<usize, (String, String, ToolResult)>,
 ) -> Vec<Message> {
     let mut messages = Vec::new();
     for (idx, tc) in tool_calls.iter().enumerate() {
@@ -908,7 +908,7 @@ mod tests {
             ),
         );
 
-        let messages = collect_ordered_results(&calls, results);
+        let messages = collect_ordered_results(&calls, &mut results);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text(), "result_a");
         assert_eq!(messages[1].text(), "result_b");
@@ -921,9 +921,9 @@ mod tests {
             name: "t1".into(),
             args: serde_json::json!({}),
         }];
-        let results = HashMap::new(); // No results at all
+        let mut results = HashMap::new(); // No results at all
 
-        let messages = collect_ordered_results(&calls, results);
+        let messages = collect_ordered_results(&calls, &mut results);
         assert_eq!(messages.len(), 1);
         // Should have a fallback error
         match &messages[0] {

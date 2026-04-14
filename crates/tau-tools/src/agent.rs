@@ -19,7 +19,7 @@ struct AgentArgs {
     /// Resume a previous agent by ID. Use with prompt to send a follow-up message.
     to: Option<String>,
     /// Type of agent. Explore/Plan are read-only.
-    #[schemars(extend("enum" = ["general-purpose", "Explore", "Plan"]))]
+    #[schemars(extend("enum" = ["general-purpose", "explore", "plan"]))]
     subagent_type: Option<String>,
     /// Override model for this subagent
     model: Option<String>,

@@ -324,10 +324,10 @@ pub(crate) async fn run_actor(
 
             StepPhase::ApplyToolResults {
                 tool_calls,
-                results_map,
+                mut results_map,
                 first_user_message,
             } => {
-                let tool_results = logic::collect_ordered_results(&tool_calls, results_map);
+                let tool_results = logic::collect_ordered_results(&tool_calls, &mut results_map);
                 state
                     .conversation
                     .messages

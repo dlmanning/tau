@@ -34,10 +34,10 @@ pub enum AgentType {
 
 impl AgentType {
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "general-purpose" => Some(Self::GeneralPurpose),
-            "Explore" => Some(Self::Explore),
-            "Plan" => Some(Self::Plan),
+            "explore" => Some(Self::Explore),
+            "plan" => Some(Self::Plan),
             _ => None,
         }
     }
@@ -61,8 +61,8 @@ impl std::fmt::Display for AgentType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GeneralPurpose => write!(f, "general-purpose"),
-            Self::Explore => write!(f, "Explore"),
-            Self::Plan => write!(f, "Plan"),
+            Self::Explore => write!(f, "explore"),
+            Self::Plan => write!(f, "plan"),
         }
     }
 }
@@ -655,24 +655,40 @@ mod tests {
             Some(AgentType::GeneralPurpose)
         ));
         assert!(matches!(
+            AgentType::parse("explore"),
+            Some(AgentType::Explore)
+        ));
+        assert!(matches!(AgentType::parse("plan"), Some(AgentType::Plan)));
+    }
+
+    #[test]
+    fn test_parse_case_insensitive() {
+        assert!(matches!(
             AgentType::parse("Explore"),
             Some(AgentType::Explore)
         ));
         assert!(matches!(AgentType::parse("Plan"), Some(AgentType::Plan)));
+        assert!(matches!(
+            AgentType::parse("EXPLORE"),
+            Some(AgentType::Explore)
+        ));
+        assert!(matches!(
+            AgentType::parse("General-Purpose"),
+            Some(AgentType::GeneralPurpose)
+        ));
     }
 
     #[test]
     fn test_parse_invalid_type() {
         assert!(AgentType::parse("unknown").is_none());
-        assert!(AgentType::parse("explore").is_none());
         assert!(AgentType::parse("").is_none());
     }
 
     #[test]
     fn test_display() {
         assert_eq!(AgentType::GeneralPurpose.to_string(), "general-purpose");
-        assert_eq!(AgentType::Explore.to_string(), "Explore");
-        assert_eq!(AgentType::Plan.to_string(), "Plan");
+        assert_eq!(AgentType::Explore.to_string(), "explore");
+        assert_eq!(AgentType::Plan.to_string(), "plan");
     }
 
     #[test]
