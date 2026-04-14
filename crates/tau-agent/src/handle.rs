@@ -86,8 +86,14 @@ impl AgentHandle {
 
     /// Route a command to the correct channel based on urgency.
     fn send_command(&self, cmd: Command) {
-        let tx = if cmd.is_urgent() { &self.urgent_tx } else { &self.normal_tx };
-        let _ = tx.try_send(cmd);
+        let (tx, label) = if cmd.is_urgent() {
+            (&self.urgent_tx, "urgent")
+        } else {
+            (&self.normal_tx, "normal")
+        };
+        if let Err(e) = tx.try_send(cmd) {
+            tracing::warn!("Failed to send command on {label} channel: {e}");
+        }
     }
 
     pub fn steer(&self, message: tau_ai::Message) {
