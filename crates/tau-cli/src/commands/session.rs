@@ -80,14 +80,6 @@ impl Command for SessionCommand {
         let cost = usage.calculate_cost(model);
         output.push_str(&format!("Estimated cost: ${:.4}\n", cost.total));
 
-        let total_tokens = usage.input + usage.output;
-        let context_pct = (total_tokens as f64 / model.context_window as f64) * 100.0;
-        output.push_str(&format!(
-            "Context usage:  ~{:.1}% of {}k window\n",
-            context_pct,
-            model.context_window / 1000
-        ));
-
         CommandResult::Message(output)
     }
 }

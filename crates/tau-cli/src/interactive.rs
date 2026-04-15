@@ -29,6 +29,8 @@ pub(crate) async fn run_interactive(
         eprintln!();
     }
 
+    let mut prev_usage = tau_ai::Usage::default();
+
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -280,7 +282,19 @@ pub(crate) async fn run_interactive(
                 .state()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
-            let _ = s.append_usage(&state.total_usage);
+            let turn_usage = tau_ai::Usage {
+                input: state.total_usage.input.saturating_sub(prev_usage.input),
+                output: state.total_usage.output.saturating_sub(prev_usage.output),
+                cache_read: state.total_usage.cache_read.saturating_sub(prev_usage.cache_read),
+                cache_write: state
+                    .total_usage
+                    .cache_write
+                    .saturating_sub(prev_usage.cache_write),
+                thinking: state.total_usage.thinking.saturating_sub(prev_usage.thinking),
+                ..Default::default()
+            };
+            let _ = s.append_usage(&turn_usage);
+            prev_usage = state.total_usage.clone();
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(2), event_handle).await {

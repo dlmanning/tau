@@ -92,8 +92,44 @@ impl Config {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file {}", path.display()))?;
 
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file {}", path.display()))
+        let config: Self = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate config values
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(ref level) = self.reasoning_level {
+            match level.as_str() {
+                "off" | "minimal" | "low" | "medium" | "high" => {}
+                _ => anyhow::bail!(
+                    "Invalid reasoning_level '{}' in config. Valid values: off, minimal, low, medium, high",
+                    level
+                ),
+            }
+        }
+        if let Some(ref cache) = self.cache {
+            if let Some(ref scope) = cache.scope {
+                match scope.as_str() {
+                    "global" | "org" => {}
+                    _ => anyhow::bail!(
+                        "Invalid cache.scope '{}' in config. Valid values: global, org",
+                        scope
+                    ),
+                }
+            }
+            if let Some(ref ttl) = cache.ttl {
+                match ttl.as_str() {
+                    "1h" | "5m" => {}
+                    _ => anyhow::bail!(
+                        "Invalid cache.ttl '{}' in config. Valid values: 1h, 5m",
+                        ttl
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Save config to file

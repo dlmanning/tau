@@ -18,16 +18,22 @@ pub(crate) async fn run_command(
     let model_for_cost = config.model.clone();
 
     let event_handle = tokio::spawn(async move {
+        let mut last_text_len = 0;
         while let Ok(event) = receiver.recv().await {
             match event {
                 AgentEvent::MessageUpdate { message } => {
                     let text = message.text();
-                    if !text.is_empty() {
-                        print!("\r{}", text);
+                    let text_chars: Vec<char> = text.chars().collect();
+                    if text_chars.len() > last_text_len {
+                        let new_text: String = text_chars[last_text_len..].iter().collect();
+                        print!("{}", new_text);
+                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                        last_text_len = text_chars.len();
                     }
                 }
-                AgentEvent::MessageEnd { message } => {
-                    println!("\r{}", message.text());
+                AgentEvent::MessageEnd { .. } => {
+                    println!();
+                    last_text_len = 0;
                 }
                 AgentEvent::ToolExecutionStart { tool_name, .. } => {
                     println!("\n[Running {}...]", tool_name);

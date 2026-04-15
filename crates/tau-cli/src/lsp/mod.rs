@@ -450,7 +450,8 @@ fn format_references_result(result: Option<Vec<Location>>) -> String {
         _ => return "No references found".into(),
     };
 
-    let mut by_file: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_file: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for loc in &locs {
         let path = uri_to_path(&loc.uri);
         by_file.entry(path).or_default().push(format!(

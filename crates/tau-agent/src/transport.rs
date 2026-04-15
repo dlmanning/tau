@@ -354,11 +354,6 @@ impl Transport for ProviderTransport {
             let idle_timeout_secs = if local { LOCAL_STREAM_IDLE_TIMEOUT_SECS } else { STREAM_IDLE_TIMEOUT_SECS };
 
             loop {
-                if cancel.is_cancelled() {
-                    yield AgentEvent::Error { message: "Cancelled".to_string() };
-                    return;
-                }
-
                 let stall_remaining = Duration::from_secs(stall_warn_secs)
                     .saturating_sub(last_event_at.elapsed());
                 let idle_remaining = Duration::from_secs(idle_timeout_secs)
@@ -378,17 +373,23 @@ impl Transport for ProviderTransport {
                     stall_warned = true;
                 }
 
-                let event = match time::timeout(
-                    idle_remaining,
-                    message_stream.next(),
-                ).await {
-                    Ok(event) => event,
-                    Err(_) => {
-                        tracing::error!("Stream idle for {}s, aborting", idle_timeout_secs);
-                        yield AgentEvent::Error {
-                            message: format!("Stream timed out after {}s of inactivity", idle_timeout_secs),
-                        };
+                let event = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        yield AgentEvent::Error { message: "Cancelled".to_string() };
                         return;
+                    }
+                    result = time::timeout(idle_remaining, message_stream.next()) => {
+                        match result {
+                            Ok(event) => event,
+                            Err(_) => {
+                                tracing::error!("Stream idle for {}s, aborting", idle_timeout_secs);
+                                yield AgentEvent::Error {
+                                    message: format!("Stream timed out after {}s of inactivity", idle_timeout_secs),
+                                };
+                                return;
+                            }
+                        }
                     }
                 };
 

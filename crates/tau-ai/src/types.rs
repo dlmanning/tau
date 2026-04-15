@@ -172,7 +172,13 @@ pub struct Usage {
 impl Usage {
     /// Calculate cost for this usage given a model
     pub fn calculate_cost(&self, model: &Model) -> CostBreakdown {
-        let input = (self.input as f64 / 1_000_000.0) * model.cost.input;
+        // input_tokens from the API includes cache hits/writes — subtract them
+        // to get the uncached portion charged at the full input rate.
+        let uncached_input = self
+            .input
+            .saturating_sub(self.cache_read)
+            .saturating_sub(self.cache_write);
+        let input = (uncached_input as f64 / 1_000_000.0) * model.cost.input;
         let output = (self.output as f64 / 1_000_000.0) * model.cost.output;
         let cache_read = (self.cache_read as f64 / 1_000_000.0) * model.cost.cache_read;
         let cache_write = (self.cache_write as f64 / 1_000_000.0) * model.cost.cache_write;

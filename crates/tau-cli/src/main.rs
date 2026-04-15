@@ -225,9 +225,10 @@ async fn main() -> anyhow::Result<()> {
     };
     builder.set_system_prompt(tau_agent::prompts::build_system_prompt(&prompt_opts));
 
+    let mut resumed_session: Option<session::SessionManager> = None;
     if let Some(ref session_id) = args.resume {
         match session::SessionManager::load(session_id) {
-            Ok((_session, messages, previous_summary)) => {
+            Ok((session_mgr, messages, previous_summary)) => {
                 println!(
                     "Resuming session {} ({} messages{})",
                     session_id,
@@ -240,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 builder.set_messages(messages);
                 builder.set_previous_summary(previous_summary);
+                resumed_session = Some(session_mgr);
             }
             Err(e) => {
                 eprintln!("Error loading session: {}", e);
@@ -260,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
         ui::run_tui(&handle, &available_models, interaction_rx).await
     } else {
         // Interactive mode (simple stdin/stdout)
-        let session = session::SessionManager::new(&model.id).ok();
+        let session = resumed_session.or_else(|| session::SessionManager::new(&model.id).ok());
         interactive::run_interactive(&handle, session, interaction_rx).await
     };
 

@@ -238,6 +238,10 @@ pub(crate) async fn run_actor(
                 loop {
                     tokio::select! {
                         biased;
+                        _ = prompt_cancel.cancelled() => {
+                            // JoinSet aborts all spawned tasks on drop.
+                            break StepPhase::Done(Ok(()));
+                        }
                         Some(cmd) = urgent_rx.recv() => {
                             handle_busy_command(&mut state, cmd);
                         }
