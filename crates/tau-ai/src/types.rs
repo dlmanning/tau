@@ -12,6 +12,7 @@ pub enum Api {
     OpenAICompletions,
     OpenAIResponses,
     GoogleGenerativeAI,
+    Ollama,
 }
 
 /// Known LLM providers
@@ -81,6 +82,7 @@ impl Provider {
             Provider::Anthropic => Api::AnthropicMessages,
             Provider::OpenAI => Api::OpenAIResponses,
             Provider::Google => Api::GoogleGenerativeAI,
+            Provider::Ollama => Api::Ollama,
             _ => Api::OpenAICompletions,
         }
     }
@@ -95,7 +97,7 @@ impl Provider {
             Provider::Cerebras => "https://api.cerebras.ai/v1",
             Provider::XAI => "https://api.x.ai/v1",
             Provider::OpenRouter => "https://openrouter.ai/api/v1",
-            Provider::Ollama => "http://localhost:11434/v1",
+            Provider::Ollama => "http://localhost:11434",
             Provider::Custom => "",
         }
     }

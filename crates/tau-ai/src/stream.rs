@@ -89,8 +89,6 @@ pub type MessageEventStream = Pin<Box<dyn Stream<Item = MessageEvent> + Send>>;
 /// Builder for constructing an assistant message from streaming events
 #[derive(Debug, Default)]
 pub struct MessageBuilder {
-    #[allow(dead_code)]
-    content: Vec<Content>,
     content_buffers: Vec<ContentBuffer>,
     usage: Usage,
     stop_reason: Option<StopReason>,

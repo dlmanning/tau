@@ -3124,7 +3124,6 @@ name = "tau-ai"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "base64",
  "chrono",
  "futures",
  "reqwest 0.12.28",

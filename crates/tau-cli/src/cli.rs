@@ -79,7 +79,7 @@ pub(crate) fn parse_reasoning_level(s: &str) -> anyhow::Result<ReasoningLevel> {
     }
 }
 
-pub(crate) fn get_model(provider: &str, model_id: &str) -> Model {
+pub(crate) async fn get_model(provider: &str, model_id: &str) -> Model {
     if let Some(model) = tau_ai::models::get_model_by_id(model_id) {
         return model;
     }
@@ -87,7 +87,7 @@ pub(crate) fn get_model(provider: &str, model_id: &str) -> Model {
     // Fallback: construct a default model for unknown/custom model IDs
     let provider_enum = Provider::from_id(provider);
 
-    Model {
+    let mut model = Model {
         id: model_id.to_string(),
         name: model_id.to_string(),
         api: provider_enum.default_api(),
@@ -99,7 +99,25 @@ pub(crate) fn get_model(provider: &str, model_id: &str) -> Model {
         context_window: 128000,
         max_tokens: 8192,
         headers: Default::default(),
+    };
+
+    // Auto-detect capabilities for Ollama models
+    if provider_enum == Provider::Ollama {
+        let ollama = tau_ai::providers::ollama::OllamaProvider::new(model.base_url.clone());
+        if let Ok(detail) = ollama.show_model(model_id).await {
+            if detail.supports_vision() {
+                model.input_types.push(InputType::Image);
+            }
+            model.reasoning = detail.has_capability("thinking");
+            if let Some(ctx) = detail.context_length() {
+                model.context_window = ctx;
+                // Default max output to 1/3 of context, capped at 16K
+                model.max_tokens = (ctx / 3).min(16384);
+            }
+        }
     }
+
+    model
 }
 
 /// Get list of commonly available models

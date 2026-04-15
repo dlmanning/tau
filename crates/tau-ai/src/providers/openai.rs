@@ -9,7 +9,7 @@ use crate::{
     error::{Error, Result},
     messages::ensure_tool_result_pairing,
     stream::{MessageEvent, MessageEventStream, StreamAccumulator},
-    types::{Content, Context, Message, Model, StopReason},
+    types::{Content, Context, Message, Model, StopReason, StreamOptions},
 };
 
 /// OpenAI API client
@@ -41,11 +41,11 @@ impl OpenAIProvider {
         Ok(Self::new(api_key))
     }
 
-    /// List available models from OpenAI
-    pub async fn list_models(&self) -> Result<Vec<OpenAIModelInfo>> {
-        let url = "https://api.openai.com/v1/models";
+    /// List available models from an OpenAI-compatible API
+    pub async fn list_models(&self, base_url: &str) -> Result<Vec<OpenAIModelInfo>> {
+        let url = format!("{}/models", base_url);
 
-        let mut req = self.client.get(url);
+        let mut req = self.client.get(&url);
         if let Some(ref api_key) = self.api_key {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
@@ -67,9 +67,14 @@ impl OpenAIProvider {
         Ok(chat_models)
     }
 
-    /// Stream a response from OpenAI
-    pub async fn stream(&self, model: &Model, context: &Context) -> Result<MessageEventStream> {
-        let request = self.build_request(model, context)?;
+    /// Stream a response from an OpenAI-compatible API
+    pub async fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> Result<MessageEventStream> {
+        let request = self.build_request(model, context, options)?;
         let url = format!("{}/chat/completions", model.base_url);
 
         let mut headers = reqwest::header::HeaderMap::new();
@@ -100,7 +105,12 @@ impl OpenAIProvider {
         Ok(Box::pin(create_stream(event_source, model.clone())))
     }
 
-    fn build_request(&self, model: &Model, context: &Context) -> Result<OpenAIRequest> {
+    fn build_request(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> Result<OpenAIRequest> {
         let mut messages = Vec::new();
 
         if let Some(ref system_prompt) = context.system_prompt {
@@ -138,13 +148,21 @@ impl OpenAIProvider {
             )
         };
 
+        let max_tokens = options
+            .and_then(|o| o.max_tokens)
+            .unwrap_or(model.max_tokens / 3);
+        let temperature = options.and_then(|o| o.temperature);
+        let stop = options
+            .map(|o| o.stop_sequences.clone())
+            .unwrap_or_default();
+
         let has_tools = tools.is_some();
         Ok(OpenAIRequest {
             model: model.id.clone(),
             messages,
             stream: true,
-            max_tokens: Some(model.max_tokens / 3),
-            temperature: None,
+            max_tokens: Some(max_tokens),
+            temperature,
             tools,
             tool_choice: if has_tools {
                 Some(serde_json::json!("auto"))
@@ -152,6 +170,7 @@ impl OpenAIProvider {
                 None
             },
             stream_options: Some(serde_json::json!({"include_usage": true})),
+            stop: if stop.is_empty() { None } else { Some(stop) },
             options: None,
         })
     }
@@ -187,18 +206,40 @@ struct OpenAIModelList {
 fn convert_message(msg: &Message) -> Vec<OpenAIMessage> {
     match msg {
         Message::User { content, .. } => {
-            let text = content
-                .iter()
-                .filter_map(|c| match c {
-                    Content::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
+            let has_images = content.iter().any(|c| matches!(c, Content::Image { .. }));
+
+            let msg_content = if has_images {
+                // Use content array for multi-modal messages
+                let parts: Vec<serde_json::Value> = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text } => {
+                            Some(serde_json::json!({"type": "text", "text": text}))
+                        }
+                        Content::Image { data, mime_type } => {
+                            Some(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", mime_type, data)
+                                }
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                MessageContent::Parts(parts)
+            } else {
+                let text = content
+                    .iter()
+                    .filter_map(|c| c.as_text())
+                    .collect::<Vec<_>>()
+                    .join("");
+                MessageContent::Text(text)
+            };
 
             vec![OpenAIMessage {
                 role: "user".to_string(),
-                content: Some(MessageContent::Text(text)),
+                content: Some(msg_content),
                 tool_calls: None,
                 tool_call_id: None,
             }]
@@ -296,11 +337,18 @@ fn create_stream(
 ) -> impl futures::Stream<Item = MessageEvent> {
     stream! {
         let (mut acc, start) = StreamAccumulator::new(
-            crate::Api::OpenAICompletions,
-            crate::Provider::OpenAI,
+            model.api,
+            model.provider,
             model.id.clone(),
         );
         yield start;
+
+        // Track index allocation to avoid collisions between text and tool calls.
+        // OpenAI text deltas have no index and tool_calls have their own 0-based
+        // index namespace, so we allocate accumulator indices independently.
+        let mut next_index = 0usize;
+        let mut text_index: Option<usize> = None;
+        let mut tool_index_map: Vec<Option<usize>> = Vec::new();
 
         while let Some(event) = event_source.next().await {
             match event {
@@ -314,19 +362,34 @@ fn create_stream(
                         Ok(chunk) => {
                             for choice in &chunk.choices {
                                 if let Some(ref content) = choice.delta.content {
-                                    for ev in acc.text_delta(0, content) { yield ev; }
+                                    let idx = *text_index.get_or_insert_with(|| {
+                                        let i = next_index;
+                                        next_index += 1;
+                                        i
+                                    });
+                                    for ev in acc.text_delta(idx, content) { yield ev; }
                                 }
 
                                 if let Some(ref tcs) = choice.delta.tool_calls {
                                     for tc in tcs {
-                                        let idx = tc.index as usize;
+                                        let tc_idx = tc.index as usize;
+                                        // Grow the map if needed
+                                        if tc_idx >= tool_index_map.len() {
+                                            tool_index_map.resize(tc_idx + 1, None);
+                                        }
                                         if let Some(ref function) = tc.function {
                                             if let Some(ref name) = function.name {
+                                                // New tool call — allocate an accumulator index
+                                                let acc_idx = next_index;
+                                                next_index += 1;
+                                                tool_index_map[tc_idx] = Some(acc_idx);
                                                 let id = tc.id.as_deref().unwrap_or("");
-                                                for ev in acc.tool_call_start(idx, id, name) { yield ev; }
+                                                for ev in acc.tool_call_start(acc_idx, id, name) { yield ev; }
                                             }
                                             if let Some(ref args) = function.arguments {
-                                                for ev in acc.tool_call_delta(idx, args) { yield ev; }
+                                                if let Some(acc_idx) = tool_index_map[tc_idx] {
+                                                    for ev in acc.tool_call_delta(acc_idx, args) { yield ev; }
+                                                }
                                             }
                                         }
                                     }
@@ -380,7 +443,9 @@ struct OpenAIRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<serde_json::Value>,
-    /// Ollama-specific: override context window size
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
+    /// Provider-specific options (e.g. context window override for local providers)
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<serde_json::Value>,
 }
@@ -400,6 +465,7 @@ struct OpenAIMessage {
 #[serde(untagged)]
 enum MessageContent {
     Text(String),
+    Parts(Vec<serde_json::Value>),
 }
 
 #[derive(Debug, Serialize)]
@@ -572,10 +638,75 @@ mod tests {
             tools: vec![],
             server_tools: vec![],
         };
-        let request = provider.build_request(&model, &context).unwrap();
+        let request = provider.build_request(&model, &context, None).unwrap();
         assert!(request.stream);
         assert!(request.stream_options.is_some());
         let opts = request.stream_options.unwrap();
         assert_eq!(opts["include_usage"], true);
+    }
+
+    #[test]
+    fn test_stream_options_flow_into_request() {
+        let provider = OpenAIProvider::new("test-key");
+        let model = Model {
+            id: "gpt-4".to_string(),
+            name: "GPT-4".to_string(),
+            api: crate::Api::OpenAICompletions,
+            provider: crate::Provider::OpenAI,
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning: false,
+            input_types: vec![],
+            cost: Default::default(),
+            context_window: 128000,
+            max_tokens: 8192,
+            headers: Default::default(),
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![],
+            server_tools: vec![],
+        };
+        let options = crate::StreamOptions {
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            stop_sequences: vec!["STOP".to_string()],
+            ..Default::default()
+        };
+        let request = provider.build_request(&model, &context, Some(&options)).unwrap();
+        assert_eq!(request.max_tokens, Some(4096));
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.stop, Some(vec!["STOP".to_string()]));
+    }
+
+    #[test]
+    fn test_convert_user_image_message() {
+        let msg = Message::User {
+            content: vec![
+                Content::text("What's in this image?"),
+                Content::Image {
+                    mime_type: "image/png".to_string(),
+                    data: "base64data".to_string(),
+                },
+            ],
+            timestamp: 0,
+        };
+        let result = convert_message(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        // Should use parts array, not plain text
+        match &result[0].content {
+            Some(MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0]["type"], "text");
+                assert_eq!(parts[0]["text"], "What's in this image?");
+                assert_eq!(parts[1]["type"], "image_url");
+                assert_eq!(
+                    parts[1]["image_url"]["url"],
+                    "data:image/png;base64,base64data"
+                );
+            }
+            other => panic!("expected Parts, got {:?}", other),
+        }
     }
 }

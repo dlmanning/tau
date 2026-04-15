@@ -130,7 +130,12 @@ async fn create_provider_and_stream(
             } else {
                 tau_ai::providers::openai::OpenAIProvider::without_key()
             };
-            provider.stream(model, context).await
+            let options = tau_ai::StreamOptions {
+                max_tokens: config.max_tokens,
+                temperature: config.temperature,
+                ..Default::default()
+            };
+            provider.stream(model, context, Some(&options)).await
         }
         Api::GoogleGenerativeAI => {
             let provider = if let Some(key) = api_key {
@@ -138,7 +143,26 @@ async fn create_provider_and_stream(
             } else {
                 tau_ai::providers::google::GoogleProvider::from_env()?
             };
-            provider.stream(model, context).await
+            let options = tau_ai::StreamOptions {
+                max_tokens: config.max_tokens,
+                temperature: config.temperature,
+                ..Default::default()
+            };
+            provider.stream(model, context, Some(&options)).await
+        }
+        Api::Ollama => {
+            let provider =
+                tau_ai::providers::ollama::OllamaProvider::new(&model.base_url);
+            let options = tau_ai::providers::ollama::OllamaOptions {
+                base: tau_ai::StreamOptions {
+                    max_tokens: config.max_tokens,
+                    temperature: config.temperature,
+                    ..Default::default()
+                },
+                reasoning: config.reasoning,
+                ..Default::default()
+            };
+            provider.stream(model, context, Some(&options)).await
         }
     }
 }

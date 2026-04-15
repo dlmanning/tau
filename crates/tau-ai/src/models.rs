@@ -15,6 +15,7 @@ impl ModelEntry {
                 "OpenAICompletions" => Api::OpenAICompletions,
                 "OpenAIResponses" => Api::OpenAIResponses,
                 "GoogleGenerativeAI" => Api::GoogleGenerativeAI,
+                "Ollama" => Api::Ollama,
                 _ => unreachable!("unknown api: {}", self.api),
             },
             provider: parse_provider(self.provider).unwrap_or(Provider::Custom),
@@ -95,6 +96,7 @@ fn parse_provider(name: &str) -> Option<Provider> {
         "Groq" => Some(Provider::Groq),
         "Cerebras" => Some(Provider::Cerebras),
         "xAI" => Some(Provider::XAI),
+        "Ollama" => Some(Provider::Ollama),
         _ => None,
     }
 }

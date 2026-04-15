@@ -9,7 +9,7 @@ use crate::{
     error::{Error, Result},
     messages::ensure_tool_result_pairing,
     stream::{MessageEvent, MessageEventStream, StreamAccumulator},
-    types::{Content, Context, Message, Model, StopReason},
+    types::{Content, Context, Message, Model, StopReason, StreamOptions},
 };
 
 /// Google Generative AI client
@@ -65,8 +65,13 @@ impl GoogleProvider {
     }
 
     /// Stream a response from Gemini
-    pub async fn stream(&self, model: &Model, context: &Context) -> Result<MessageEventStream> {
-        let request = self.build_request(model, context)?;
+    pub async fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> Result<MessageEventStream> {
+        let request = self.build_request(model, context, options)?;
         let url = format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
             model.base_url, model.id, self.api_key
@@ -92,7 +97,12 @@ impl GoogleProvider {
         Ok(Box::pin(create_stream(event_source, model.clone())))
     }
 
-    fn build_request(&self, model: &Model, context: &Context) -> Result<GeminiRequest> {
+    fn build_request(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> Result<GeminiRequest> {
         let mut contents = Vec::new();
 
         let mut context_messages = context.messages.clone();
@@ -128,15 +138,24 @@ impl GoogleProvider {
             }])
         };
 
+        let max_output_tokens = options
+            .and_then(|o| o.max_tokens)
+            .unwrap_or(model.max_tokens / 3);
+        let temperature = options.and_then(|o| o.temperature);
+        let stop = options
+            .map(|o| o.stop_sequences.clone())
+            .unwrap_or_default();
+
         Ok(GeminiRequest {
             contents,
             system_instruction,
             tools,
             generation_config: Some(GeminiGenerationConfig {
-                max_output_tokens: Some(model.max_tokens / 3),
-                temperature: None,
+                max_output_tokens: Some(max_output_tokens),
+                temperature,
                 top_p: None,
                 top_k: None,
+                stop_sequences: if stop.is_empty() { None } else { Some(stop) },
             }),
         })
     }
@@ -260,13 +279,16 @@ fn create_stream(
 ) -> impl futures::Stream<Item = MessageEvent> {
     stream! {
         let (mut acc, start) = StreamAccumulator::new(
-            crate::Api::GoogleGenerativeAI,
-            crate::Provider::Google,
+            model.api,
+            model.provider,
             model.id.clone(),
         );
         yield start;
 
-        let mut tool_count = 0usize;
+        // Track index allocation to avoid collisions between text and tool calls.
+        // Gemini parts have no explicit indices, so we allocate them ourselves.
+        let mut next_index = 0usize;
+        let mut text_index: Option<usize> = None;
 
         while let Some(event) = event_source.next().await {
             match event {
@@ -283,11 +305,16 @@ fn create_stream(
                                     for part in &content.parts {
                                         match part {
                                             GeminiResponsePart::Text { text } => {
-                                                for ev in acc.text_delta(0, text) { yield ev; }
+                                                let idx = *text_index.get_or_insert_with(|| {
+                                                    let i = next_index;
+                                                    next_index += 1;
+                                                    i
+                                                });
+                                                for ev in acc.text_delta(idx, text) { yield ev; }
                                             }
                                             GeminiResponsePart::FunctionCall { function_call } => {
-                                                let idx = tool_count;
-                                                tool_count += 1;
+                                                let idx = next_index;
+                                                next_index += 1;
                                                 let id = format!("call_{}", idx);
                                                 for ev in acc.tool_call_start(idx, &id, &function_call.name) { yield ev; }
                                                 let args_str = serde_json::to_string(&function_call.args).unwrap_or_default();
@@ -417,6 +444,8 @@ struct GeminiGenerationConfig {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_sequences: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +610,41 @@ mod tests {
         assert_eq!(result.role, Some("function".to_string()));
         let json = serde_json::to_value(&result.parts[0]).unwrap();
         assert_eq!(json["functionResponse"]["name"], "read");
+    }
+
+    #[test]
+    fn test_stream_options_flow_into_request() {
+        let provider = GoogleProvider::new("test-key");
+        let model = Model {
+            id: "gemini-2.0-flash".to_string(),
+            name: "Gemini 2.0 Flash".to_string(),
+            api: crate::Api::GoogleGenerativeAI,
+            provider: crate::Provider::Google,
+            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            reasoning: false,
+            input_types: vec![],
+            cost: Default::default(),
+            context_window: 1000000,
+            max_tokens: 8192,
+            headers: Default::default(),
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![],
+            server_tools: vec![],
+        };
+        let options = crate::StreamOptions {
+            max_tokens: Some(2048),
+            temperature: Some(0.5),
+            stop_sequences: vec!["END".to_string()],
+            ..Default::default()
+        };
+        let request = provider.build_request(&model, &context, Some(&options)).unwrap();
+        let config = request.generation_config.unwrap();
+        assert_eq!(config.max_output_tokens, Some(2048));
+        assert_eq!(config.temperature, Some(0.5));
+        assert_eq!(config.stop_sequences, Some(vec!["END".to_string()]));
     }
 
     #[test]

@@ -188,7 +188,7 @@ impl AnthropicProvider {
 
         tracing::debug!("Anthropic API URL: {}", url);
 
-        let is_oauth = self.api_key.contains("sk-ant-oat");
+        let is_oauth = self.api_key.starts_with("sk-ant-oat");
         let mut headers = reqwest::header::HeaderMap::new();
 
         // Build beta headers based on features in use
@@ -248,11 +248,7 @@ impl AnthropicProvider {
             }
         }
 
-        let request_builder = self
-            .client
-            .post(&url)
-            .headers(headers.clone())
-            .json(&request);
+        let request_builder = self.client.post(&url).headers(headers).json(&request);
 
         let event_source = EventSource::new(request_builder)
             .map_err(|e| Error::Sse(format!("Failed to create event source: {}", e)))?;
@@ -266,7 +262,7 @@ impl AnthropicProvider {
         context: &Context,
         options: &AnthropicOptions,
     ) -> Result<AnthropicRequest> {
-        let is_oauth = self.api_key.contains("sk-ant-oat");
+        let is_oauth = self.api_key.starts_with("sk-ant-oat");
         let has_tools = !context.tools.is_empty();
 
         // Build system blocks first so we can count cache breakpoints accurately.

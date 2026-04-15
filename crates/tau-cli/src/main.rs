@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         .or(cfg.model.clone())
         .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
 
-    let model = get_model(&provider, &model_id);
+    let model = get_model(&provider, &model_id).await;
 
     let reasoning = if args.reasoning {
         ReasoningLevel::Medium
