@@ -39,9 +39,11 @@ pub(crate) async fn run_command(
                     println!("\n[Running {}...]", tool_name);
                 }
                 AgentEvent::ToolExecutionUpdate {
-                    tool_name, content, ..
+                    tool_name, lines, ..
                 } => {
-                    println!("[{}: {}]", tool_name, content);
+                    for line in lines {
+                        println!("[{}: {}]", tool_name, line.content);
+                    }
                 }
                 AgentEvent::ToolExecutionEnd {
                     tool_name,

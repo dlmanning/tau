@@ -176,6 +176,7 @@ async fn step_event_from_subagent_arrives_wrapped_in_subagent_variant() {
         isolation: None,
         depth: 0,
         inherit_history_from: None,
+        approval_policy: None,
     };
     let result = manager.spawn(req, cancel).await.expect("spawn");
     let expected_id = result.agent_id;

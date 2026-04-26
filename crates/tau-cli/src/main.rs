@@ -176,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
     builder.add_tool(Arc::new(tau_tools::StepStartedTool::new()));
     builder.add_tool(Arc::new(tau_tools::StepCompletedTool::new()));
     builder.add_tool(Arc::new(tau_tools::PlanCompleteTool::new()));
+    builder.add_tool(Arc::new(tau_tools::SubagentReportTool::new()));
 
     let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
     if lsp_manager.is_available() {
@@ -200,16 +201,20 @@ async fn main() -> anyhow::Result<()> {
     // Plan parents get a tool restricted to spawning read-only subagents
     // so the read-only invariant the Plan prompt advertises is actually enforced.
     let mgr_for_factory = manager.clone();
-    manager.set_agent_tool_factory(Arc::new(move |depth, handle, parent_type| {
-        let mut tool = tau_tools::AgentTool::new(mgr_for_factory.clone(), depth).with_handle(handle);
-        if matches!(parent_type, tau_agent::manager::AgentType::Plan) {
-            tool = tool.with_allowed_types(vec![
-                tau_agent::manager::AgentType::Explore,
-                tau_agent::manager::AgentType::Plan,
-            ]);
-        }
-        Arc::new(tool)
-    }));
+    manager.set_agent_tool_factory(Arc::new(
+        move |depth, handle, parent_type, parent_policy| {
+            let mut tool = tau_tools::AgentTool::new(mgr_for_factory.clone(), depth)
+                .with_handle(handle)
+                .with_inherited_policy(parent_policy);
+            if matches!(parent_type, tau_agent::manager::AgentType::Plan) {
+                tool = tool.with_allowed_types(vec![
+                    tau_agent::manager::AgentType::Explore,
+                    tau_agent::manager::AgentType::Plan,
+                ]);
+            }
+            Arc::new(tool)
+        },
+    ));
 
     let mgr_for_send = manager.clone();
     let mgr_for_commands = manager.clone();
@@ -275,7 +280,11 @@ async fn main() -> anyhow::Result<()> {
     } else if use_tui {
         // TODO(approval-ui): until the TUI renders ConfirmTool prompts,
         // auto-accept all elevated calls so bash etc. don't get rejected.
-        handle.set_approval_policy(Arc::new(tau_agent::AutoAcceptAllPolicy));
+        // Same override is applied to the subagent manager so spawned
+        // subagents inherit the same policy.
+        let auto = Arc::new(tau_agent::AutoAcceptAllPolicy);
+        handle.set_approval_policy(auto.clone());
+        mgr_for_commands.set_default_approval_policy(auto);
         // TUI mode
         let available_models = get_available_models();
         ui::run_tui(&handle, &available_models, interaction_rx, mgr_for_commands.clone()).await

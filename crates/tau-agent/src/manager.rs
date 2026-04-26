@@ -13,9 +13,10 @@ use crate::interaction::InteractionRequest;
 
 use crate::builder::AgentBuilder;
 use crate::config::AgentConfig;
-use crate::events::AgentEvent;
+use crate::approval::{ApprovalPolicy, DefaultApprovalPolicy};
+use crate::events::{AgentEvent, SubagentOutcome};
 use crate::handle::AgentHandle;
-use crate::tool::BoxedTool;
+use crate::tool::{BoxedTool, send_event};
 use crate::transcript::record_transcript;
 use crate::transport::Transport;
 use crate::worktree::{WorktreeInfo, cleanup_worktree, create_worktree};
@@ -69,10 +70,17 @@ impl std::fmt::Display for AgentType {
     }
 }
 
-/// Factory function to create a depth-limited Agent tool for a given parent agent type.
-/// The parent type lets the factory enforce per-parent restrictions
-/// (e.g. Plan agents may only spawn read-only subagents).
-type AgentToolFactory = Arc<dyn Fn(u32, AgentHandle, AgentType) -> BoxedTool + Send + Sync>;
+/// Factory function to create a depth-limited Agent tool for a given parent
+/// agent type. The parent type lets the factory enforce per-parent
+/// restrictions (e.g. Plan agents may only spawn read-only subagents).
+///
+/// The fourth argument is the parent subagent's *effective* approval
+/// policy. Passing it through the factory lets the AgentTool stamp it
+/// onto its `SpawnRequest`s so descendants inherit the same policy — per
+/// the spec's "applies at that level and below unless overridden again
+/// deeper" rule.
+type AgentToolFactory =
+    Arc<dyn Fn(u32, AgentHandle, AgentType, Arc<dyn ApprovalPolicy>) -> BoxedTool + Send + Sync>;
 
 /// Result from a completed subagent.
 #[derive(Debug)]
@@ -111,6 +119,12 @@ pub struct SpawnRequest {
     /// reference tools the new agent may not have — Anthropic tolerates
     /// this; OpenAI/Google may not.
     pub inherit_history_from: Option<String>,
+    /// Override the approval policy this subagent runs under. `None`
+    /// inherits from the parent (configured on the manager via
+    /// [`AgentManager::with_parent_approval_policy`]). The override
+    /// applies to this subagent and any descendants it spawns, unless a
+    /// descendant overrides again.
+    pub approval_policy: Option<Arc<dyn ApprovalPolicy>>,
 }
 
 /// Whether an agent is currently executing or stored (idle).
@@ -132,6 +146,16 @@ pub struct AgentManager {
     /// channel that stamps `agent_id` on outgoing requests and forwards them
     /// to this parent. When `None`, subagents have no interaction channel.
     parent_interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
+    /// Default `ApprovalPolicy` for spawned subagents. Inherited from the
+    /// parent process so subagents gate the same way the parent does (the
+    /// spawn request can override per-call). Defaults to
+    /// [`DefaultApprovalPolicy`] when not configured.
+    ///
+    /// Wrapped in a sync mutex so the host can swap the default at runtime
+    /// (e.g. when the TUI installs an auto-accept override on the parent
+    /// handle, it should mirror that on the manager so subagents stay in
+    /// sync).
+    parent_approval_policy: ParkingMutex<Arc<dyn ApprovalPolicy>>,
     agent_tool_factory: ParkingMutex<Option<AgentToolFactory>>,
     /// Handles for agents that are currently executing (keyed by agent_id).
     running_handles: Mutex<HashMap<String, (AgentHandle, String)>>,
@@ -160,6 +184,7 @@ impl AgentManager {
             parent_config,
             parent_event_tx,
             parent_interaction_tx: None,
+            parent_approval_policy: ParkingMutex::new(Arc::new(DefaultApprovalPolicy)),
             agent_tool_factory: ParkingMutex::new(None),
             running_handles: Mutex::new(HashMap::new()),
         }
@@ -176,11 +201,25 @@ impl AgentManager {
         self
     }
 
-    /// Set the factory for creating recursive agent tools.
-    pub fn set_agent_tool_factory(
-        &self,
-        factory: Arc<dyn Fn(u32, AgentHandle, AgentType) -> BoxedTool + Send + Sync>,
-    ) {
+    /// Default policy spawned subagents run under. Per-spawn override is
+    /// available via [`SpawnRequest::approval_policy`].
+    pub fn with_parent_approval_policy(self, policy: Arc<dyn ApprovalPolicy>) -> Self {
+        *self.parent_approval_policy.lock() = policy;
+        self
+    }
+
+    /// Replace the default approval policy at runtime. Useful for host-side
+    /// overrides applied after construction (e.g. tau-cli installing
+    /// auto-accept when the user enters TUI mode). Affects future spawns
+    /// only; in-flight subagents keep the policy they were spawned with.
+    pub fn set_default_approval_policy(&self, policy: Arc<dyn ApprovalPolicy>) {
+        *self.parent_approval_policy.lock() = policy;
+    }
+
+    /// Set the factory for creating recursive agent tools. The factory
+    /// receives the new agent's depth, handle, type, and the effective
+    /// approval policy of its parent (so descendants inherit it).
+    pub fn set_agent_tool_factory(&self, factory: AgentToolFactory) {
         *self.agent_tool_factory.lock() = Some(factory);
     }
 
@@ -292,9 +331,13 @@ impl AgentManager {
 
         let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
         builder.set_cwd(&cwd);
-        // TODO(approval-inheritance): subagents auto-accept elevated tools
-        // until gap #6 wires real policy inheritance from the parent.
-        builder.set_approval_policy(Arc::new(crate::approval::AutoAcceptAllPolicy));
+        // Inherit approval policy from the parent (or use the per-spawn
+        // override). Subagents now gate the same way the parent does.
+        let policy = request
+            .approval_policy
+            .clone()
+            .unwrap_or_else(|| self.parent_approval_policy.lock().clone());
+        builder.set_approval_policy(policy.clone());
         if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id.as_ref()) {
             builder.set_interaction_sender(sub_tx);
         }
@@ -308,6 +351,7 @@ impl AgentManager {
             request.depth,
             &factory,
             &agent_handle,
+            policy,
         );
         for tool in &tools {
             builder.add_tool(tool.clone());
@@ -345,6 +389,7 @@ impl AgentManager {
         message: &str,
         parent_cancel: CancellationToken,
     ) -> crate::error::Result<SubagentResult> {
+        let started_at = chrono::Utc::now();
         let start = Instant::now();
 
         let mut entry = {
@@ -359,6 +404,17 @@ impl AgentManager {
         };
 
         let usage_before = entry.usage_at_pause.clone();
+
+        // Bracket the resume on the parent's stream.
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentResumed {
+                agent_id: id.to_string(),
+                description: entry.description.clone(),
+                prompt: message.to_string(),
+                resumed_at: started_at,
+            },
+        );
 
         let event_task =
             self.spawn_event_forwarder(entry.handle.subscribe(), id, &entry.description);
@@ -402,7 +458,42 @@ impl AgentManager {
             .map(|p| p.display().to_string());
         entry.usage_at_pause = current_usage;
         entry.messages_at_pause = messages.len();
+        let description = entry.description.clone();
         self.agents.lock().await.push_back((id.to_string(), entry));
+
+        let completed_at = chrono::Utc::now();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let outcome = match &prompt_result {
+            Ok(()) if parent_cancel.is_cancelled() => SubagentOutcome::Aborted {
+                reason: "cancelled by parent".to_string(),
+            },
+            Ok(()) => SubagentOutcome::Completed,
+            Err(e) if parent_cancel.is_cancelled() => SubagentOutcome::Aborted {
+                reason: e.to_string(),
+            },
+            Err(e) => SubagentOutcome::Failed {
+                reason: e.to_string(),
+            },
+        };
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentCompleted {
+                agent_id: id.to_string(),
+                description,
+                outcome,
+                started_at,
+                completed_at,
+                duration_ms,
+                usage: tau_ai::Usage {
+                    input: delta_input,
+                    output: delta_output,
+                    ..Default::default()
+                },
+                tool_use_count,
+                worktree_path: None,
+                worktree_branch: None,
+            },
+        );
 
         prompt_result?;
 
@@ -412,7 +503,7 @@ impl AgentManager {
             input_tokens: delta_input,
             output_tokens: delta_output,
             tool_use_count,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms,
             worktree_path: None,
             worktree_branch: None,
             transcript_path,
@@ -528,6 +619,7 @@ impl AgentManager {
         cancel: CancellationToken,
         agent_id: &str,
     ) -> crate::error::Result<(SubagentResult, AgentHandle)> {
+        let started_at = chrono::Utc::now();
         let start = Instant::now();
 
         let worktree = if req.isolation.as_deref() == Some("worktree") {
@@ -544,7 +636,25 @@ impl AgentManager {
             None
         };
 
-        let agent_result = self.run_agent_inner(req, agent_id, &worktree, cancel).await;
+        // Bracket the inner run with SubagentStarted/SubagentCompleted on
+        // the parent's stream so hosts can render an expandable subagent
+        // block. The intermediate `Subagent { event }` wrapping (set up by
+        // `spawn_event_forwarder` inside `run_agent_inner`) continues to
+        // forward each child event between these two brackets.
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentStarted {
+                agent_id: agent_id.to_string(),
+                agent_type: req.agent_type.to_string(),
+                description: req.description.clone(),
+                prompt: req.prompt.clone(),
+                started_at,
+            },
+        );
+
+        let agent_result = self
+            .run_agent_inner(req, agent_id, &worktree, cancel.clone())
+            .await;
         let (wt_path, wt_branch) = if let Some(wt) = &worktree {
             match cleanup_worktree(wt).await {
                 Ok(true) => (None, None),
@@ -554,16 +664,76 @@ impl AgentManager {
             (None, None)
         };
 
-        let (mut result, handle) = agent_result?;
+        let completed_at = chrono::Utc::now();
+        let duration_ms = start.elapsed().as_millis() as u64;
 
-        let messages = handle.messages().await.unwrap_or_default();
-        result.transcript_path = record_transcript(agent_id, &messages)
-            .await
-            .map(|p| p.display().to_string());
-        result.worktree_path = wt_path;
-        result.worktree_branch = wt_branch;
-        result.duration_ms = start.elapsed().as_millis() as u64;
-        Ok((result, handle))
+        match agent_result {
+            Ok((mut result, handle)) => {
+                let messages = handle.messages().await.unwrap_or_default();
+                result.transcript_path = record_transcript(agent_id, &messages)
+                    .await
+                    .map(|p| p.display().to_string());
+                result.worktree_path = wt_path.clone();
+                result.worktree_branch = wt_branch.clone();
+                result.duration_ms = duration_ms;
+
+                let outcome = if cancel.is_cancelled() {
+                    SubagentOutcome::Aborted {
+                        reason: "cancelled by parent".to_string(),
+                    }
+                } else {
+                    SubagentOutcome::Completed
+                };
+                send_event(
+                    &self.parent_event_tx,
+                    AgentEvent::SubagentCompleted {
+                        agent_id: agent_id.to_string(),
+                        description: req.description.clone(),
+                        outcome,
+                        started_at,
+                        completed_at,
+                        duration_ms,
+                        usage: tau_ai::Usage {
+                            input: result.input_tokens,
+                            output: result.output_tokens,
+                            ..Default::default()
+                        },
+                        tool_use_count: result.tool_use_count,
+                        worktree_path: wt_path,
+                        worktree_branch: wt_branch,
+                    },
+                );
+
+                Ok((result, handle))
+            }
+            Err(e) => {
+                let outcome = if cancel.is_cancelled() {
+                    SubagentOutcome::Aborted {
+                        reason: "cancelled by parent".to_string(),
+                    }
+                } else {
+                    SubagentOutcome::Failed {
+                        reason: e.to_string(),
+                    }
+                };
+                send_event(
+                    &self.parent_event_tx,
+                    AgentEvent::SubagentCompleted {
+                        agent_id: agent_id.to_string(),
+                        description: req.description.clone(),
+                        outcome,
+                        started_at,
+                        completed_at,
+                        duration_ms,
+                        usage: tau_ai::Usage::default(),
+                        tool_use_count: 0,
+                        worktree_path: wt_path,
+                        worktree_branch: wt_branch,
+                    },
+                );
+                Err(e)
+            }
+        }
     }
 
     async fn run_agent_inner(
@@ -597,9 +767,13 @@ impl AgentManager {
 
         let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
         builder.set_cwd(&cwd);
-        // TODO(approval-inheritance): subagents auto-accept elevated tools
-        // until gap #6 wires real policy inheritance from the parent.
-        builder.set_approval_policy(Arc::new(crate::approval::AutoAcceptAllPolicy));
+        // Inherit approval policy from the parent (or use the per-spawn
+        // override). Subagents now gate the same way the parent does.
+        let policy = req
+            .approval_policy
+            .clone()
+            .unwrap_or_else(|| self.parent_approval_policy.lock().clone());
+        builder.set_approval_policy(policy.clone());
         if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id.as_ref()) {
             builder.set_interaction_sender(sub_tx);
         }
@@ -615,6 +789,7 @@ impl AgentManager {
             req.depth,
             &factory,
             &agent_handle,
+            policy,
         );
         for tool in &tools {
             builder.add_tool(tool.clone());
@@ -724,17 +899,21 @@ fn build_tool_set(
     depth: u32,
     agent_tool_factory: &Option<AgentToolFactory>,
     handle: &AgentHandle,
+    effective_policy: Arc<dyn ApprovalPolicy>,
 ) -> Vec<BoxedTool> {
     let mut tools: Vec<BoxedTool> = match agent_type {
         AgentType::Explore | AgentType::Plan => {
             // Plan also gets `submit_plan` so it can round-trip a structured
-            // plan through the host UI for approval.
+            // plan through the host UI for approval. Both Explore and Plan
+            // get `subagent_report` so they can self-label outcomes.
             let plan_extras = ["submit_plan"];
             let read_only = ["read", "glob", "grep", "list", "lsp"];
+            let report_extras = ["subagent_report"];
             all_tools
                 .iter()
                 .filter(|t| {
                     read_only.contains(&t.name())
+                        || report_extras.contains(&t.name())
                         || (matches!(agent_type, AgentType::Plan)
                             && plan_extras.contains(&t.name()))
                 })
@@ -752,7 +931,12 @@ fn build_tool_set(
         && depth + 1 < MAX_AGENT_DEPTH
     {
         if let Some(factory) = agent_tool_factory {
-            tools.push(factory(depth + 1, handle.clone(), agent_type.clone()));
+            tools.push(factory(
+                depth + 1,
+                handle.clone(),
+                agent_type.clone(),
+                effective_policy,
+            ));
         }
     }
 
@@ -896,11 +1080,22 @@ mod tests {
         builder.pre_handle()
     }
 
+    fn default_policy() -> Arc<dyn ApprovalPolicy> {
+        Arc::new(crate::approval::DefaultApprovalPolicy)
+    }
+
     #[test]
     fn test_explore_gets_read_only_tools() {
         let all = mock_tools();
         let handle = test_handle();
-        let filtered = build_tool_set(&AgentType::Explore, &all, 0, &None, &handle);
+        let filtered = build_tool_set(
+            &AgentType::Explore,
+            &all,
+            0,
+            &None,
+            &handle,
+            default_policy(),
+        );
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -917,7 +1112,14 @@ mod tests {
     fn test_general_purpose_gets_all_except_agent() {
         let all = mock_tools();
         let handle = test_handle();
-        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &None, &handle);
+        let filtered = build_tool_set(
+            &AgentType::GeneralPurpose,
+            &all,
+            0,
+            &None,
+            &handle,
+            default_policy(),
+        );
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read"));
@@ -930,8 +1132,15 @@ mod tests {
         let all = mock_tools();
         let handle = test_handle();
         let factory: AgentToolFactory =
-            Arc::new(|_depth, _handle, _parent| Arc::new(MockTool { tool_name: "agent" }));
-        let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory), &handle);
+            Arc::new(|_depth, _handle, _parent, _policy| Arc::new(MockTool { tool_name: "agent" }));
+        let filtered = build_tool_set(
+            &AgentType::GeneralPurpose,
+            &all,
+            0,
+            &Some(factory),
+            &handle,
+            default_policy(),
+        );
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"agent"), "factory should add agent tool");
     }
@@ -941,13 +1150,14 @@ mod tests {
         let all = mock_tools();
         let handle = test_handle();
         let factory: AgentToolFactory =
-            Arc::new(|_depth, _handle, _parent| Arc::new(MockTool { tool_name: "agent" }));
+            Arc::new(|_depth, _handle, _parent, _policy| Arc::new(MockTool { tool_name: "agent" }));
         let filtered = build_tool_set(
             &AgentType::GeneralPurpose,
             &all,
             MAX_AGENT_DEPTH - 1,
             &Some(factory),
             &handle,
+            default_policy(),
         );
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"agent"), "depth exceeded — no agent tool");

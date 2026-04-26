@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::ToolRisk;
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, ConsoleLevel, ConsoleLine};
 
 /// Send an event on a broadcast channel, ignoring errors (no receivers).
 pub(crate) fn send_event(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
@@ -195,14 +195,30 @@ impl ProgressSender {
         &self.tool_name
     }
 
-    /// Send a progress update.
+    /// Send a progress update at `Normal` level. Use `send_at` or
+    /// `send_lines` when the tool already knows the level (e.g. bash
+    /// classifying its own output).
     pub fn send(&self, content: impl Into<String>) {
+        self.send_at(content, ConsoleLevel::Normal);
+    }
+
+    /// Send a single line at the given level.
+    pub fn send_at(&self, content: impl Into<String>, level: ConsoleLevel) {
+        self.send_lines(vec![ConsoleLine::new(content, level)]);
+    }
+
+    /// Send a batch of pre-classified lines. Tools with their own classifier
+    /// can construct lines once and emit them as a unit.
+    pub fn send_lines(&self, lines: Vec<ConsoleLine>) {
+        if lines.is_empty() {
+            return;
+        }
         send_event(
             &self.tx,
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id: self.tool_call_id.clone(),
                 tool_name: self.tool_name.clone(),
-                content: content.into(),
+                lines,
             },
         );
     }
@@ -394,20 +410,35 @@ mod tests {
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
                 tool_name,
-                content,
+                lines,
             } => {
                 assert_eq!(tool_call_id, "call_42");
                 assert_eq!(tool_name, "bash");
-                assert_eq!(content, "50% complete");
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].content, "50% complete");
+                assert_eq!(lines[0].level, ConsoleLevel::Normal);
             }
             other => panic!("expected ToolExecutionUpdate, got {:?}", other),
         }
 
         match event2 {
-            AgentEvent::ToolExecutionUpdate { content, .. } => {
-                assert_eq!(content, "done");
+            AgentEvent::ToolExecutionUpdate { lines, .. } => {
+                assert_eq!(lines[0].content, "done");
             }
             other => panic!("expected ToolExecutionUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_progress_sender_send_at_carries_level() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let sender = ProgressSender::new(tx, "c", "t");
+        sender.send_at("oops", ConsoleLevel::Danger);
+        match rx.recv().await.unwrap() {
+            AgentEvent::ToolExecutionUpdate { lines, .. } => {
+                assert_eq!(lines[0].level, ConsoleLevel::Danger);
+            }
+            other => panic!("got {:?}", other),
         }
     }
 

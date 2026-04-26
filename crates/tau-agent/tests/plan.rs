@@ -323,6 +323,7 @@ async fn subagent_interaction_is_stamped_with_agent_id() {
         isolation: None,
         depth: 0,
         inherit_history_from: None,
+        approval_policy: None,
     };
     let result = manager.spawn(request, cancel).await.expect("spawn");
 
@@ -416,6 +417,7 @@ async fn inherit_history_from_seeds_executor_with_planner_messages() {
         isolation: None,
         depth: 0,
         inherit_history_from: None,
+        approval_policy: None,
     };
     let plan_result = manager
         .spawn(plan_req, cancel.clone())
@@ -437,6 +439,7 @@ async fn inherit_history_from_seeds_executor_with_planner_messages() {
         isolation: None,
         depth: 0,
         inherit_history_from: Some(planner_id.clone()),
+        approval_policy: None,
     };
     manager.spawn(exec_req, cancel).await.expect("executor spawn");
 
@@ -498,6 +501,7 @@ async fn executor_prompt_appended_only_when_inheriting() {
                 isolation: None,
                 depth: 0,
                 inherit_history_from: None,
+                approval_policy: None,
             },
             cancel.clone(),
         )
@@ -515,6 +519,7 @@ async fn executor_prompt_appended_only_when_inheriting() {
                 isolation: None,
                 depth: 0,
                 inherit_history_from: Some(first.agent_id),
+                approval_policy: None,
             },
             cancel,
         )
@@ -564,6 +569,7 @@ async fn inherit_history_from_unknown_id_errors() {
         isolation: None,
         depth: 0,
         inherit_history_from: Some("nonexistent-id".into()),
+        approval_policy: None,
     };
 
     let err = manager

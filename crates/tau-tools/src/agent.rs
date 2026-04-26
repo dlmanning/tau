@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tau_agent::approval::ApprovalPolicy;
 use tau_agent::handle::AgentHandle;
 use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
 use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
@@ -45,6 +46,11 @@ pub struct AgentTool {
     agent_handle: Option<AgentHandle>,
     /// If set, only these agent types are allowed. None means no restriction.
     allowed_types: Option<Vec<AgentType>>,
+    /// Effective approval policy for the agent that *owns* this tool. When
+    /// this agent spawns a descendant, the spawn request inherits this
+    /// policy so the spec's "applies at that level and below" rule holds.
+    /// `None` lets the manager use its own default.
+    inherited_policy: Option<Arc<dyn ApprovalPolicy>>,
 }
 
 impl AgentTool {
@@ -54,6 +60,7 @@ impl AgentTool {
             depth,
             agent_handle: None,
             allowed_types: None,
+            inherited_policy: None,
         }
     }
 
@@ -64,6 +71,13 @@ impl AgentTool {
 
     pub fn with_allowed_types(mut self, types: Vec<AgentType>) -> Self {
         self.allowed_types = Some(types);
+        self
+    }
+
+    /// Set the effective approval policy this tool's owner is running
+    /// under. Descendants spawned via this tool inherit it.
+    pub fn with_inherited_policy(mut self, policy: Arc<dyn ApprovalPolicy>) -> Self {
+        self.inherited_policy = Some(policy);
         self
     }
 }
@@ -141,6 +155,9 @@ impl Tool for AgentTool {
             isolation: args.isolation,
             depth: self.depth,
             inherit_history_from: args.inherit_history_from,
+            // Propagate the parent's effective policy so a per-spawn
+            // override at a higher level reaches deeper subagents.
+            approval_policy: self.inherited_policy.clone(),
         };
 
         if run_in_background {

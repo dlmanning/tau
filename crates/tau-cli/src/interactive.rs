@@ -55,8 +55,10 @@ async fn run_prompt_and_stream(
                     print!("\n[{}...", tool_name);
                     io::stdout().flush().ok();
                 }
-                AgentEvent::ToolExecutionUpdate { content, .. } => {
-                    print!(" {}", content);
+                AgentEvent::ToolExecutionUpdate { lines, .. } => {
+                    for line in lines {
+                        print!(" {}", line.content);
+                    }
                     io::stdout().flush().ok();
                 }
                 AgentEvent::ToolExecutionEnd {
@@ -324,6 +326,7 @@ pub(crate) async fn run_interactive(
                             isolation: None,
                             depth: 0,
                             inherit_history_from: None,
+                            approval_policy: None,
                         };
 
                         match manager.spawn_interactive(request).await {

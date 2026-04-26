@@ -157,6 +157,7 @@ async fn subagent_file_change_reaches_parent_overlay() {
         isolation: None,
         depth: 0,
         inherit_history_from: None,
+        approval_policy: None,
     };
     let _result = manager.spawn(req, cancel).await.expect("spawn");
 

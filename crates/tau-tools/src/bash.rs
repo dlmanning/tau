@@ -183,6 +183,13 @@ impl Tool for BashTool {
             Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
         };
 
+        // Echo the command being run as a muted header so the host UI can
+        // visually anchor the streamed output below.
+        ctx.progress.send_at(
+            format!("$ {command}"),
+            tau_agent::events::ConsoleLevel::Muted,
+        );
+
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
 
@@ -216,6 +223,7 @@ impl Tool for BashTool {
                 line = stdout_reader.next_line(), if !stdout_done => {
                     match line {
                         Ok(Some(l)) => {
+                            crate::console::send_classified(&ctx.progress, l.clone());
                             stdout_collector.push_line(l);
                         }
                         Ok(None) => { stdout_done = true; }
@@ -228,6 +236,7 @@ impl Tool for BashTool {
                 line = stderr_reader.next_line(), if !stderr_done => {
                     match line {
                         Ok(Some(l)) => {
+                            crate::console::send_classified(&ctx.progress, l.clone());
                             stderr_collector.push_line(l);
                         }
                         Ok(None) => { stderr_done = true; }

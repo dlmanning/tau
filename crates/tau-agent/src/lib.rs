@@ -39,7 +39,7 @@ pub use compaction::{CompactionConfig, CompactionReason};
 pub use config::{AgentConfig, DequeueMode};
 pub use conversation::Conversation;
 pub use error::Error;
-pub use events::AgentEvent;
+pub use events::{AgentEvent, ConsoleLevel, ConsoleLine, SubagentOutcome};
 pub use handle::AgentHandle;
 pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
 pub use plan::{Plan, PlanFile, PlanFileOp, PlanFlag, PlanFlagSeverity, PlanStep};

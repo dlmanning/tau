@@ -6,6 +6,44 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tau_ai::{Message, Usage};
 
+/// Visual classification for a streamed console line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleLevel {
+    /// Faded — blank lines, headers, "$ command" prompts.
+    Muted,
+    /// Default — informational output.
+    Normal,
+    /// Caution — `warning:`, `Running …`, soft errors.
+    Warning,
+    /// Positive — `test … ok`, `✓`, success markers.
+    Success,
+    /// Failure — `error:`, panics, `FAILED`.
+    Danger,
+}
+
+/// One line of streamed tool output with a host-facing classification.
+/// `content` may contain ANSI escapes; the level is the tool's call on what
+/// the line means semantically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleLine {
+    pub content: String,
+    pub level: ConsoleLevel,
+}
+
+impl ConsoleLine {
+    pub fn new(content: impl Into<String>, level: ConsoleLevel) -> Self {
+        Self {
+            content: content.into(),
+            level,
+        }
+    }
+
+    pub fn normal(content: impl Into<String>) -> Self {
+        Self::new(content, ConsoleLevel::Normal)
+    }
+}
+
 /// Events emitted during agent execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,11 +72,14 @@ pub enum AgentEvent {
         activity: String,
     },
 
-    /// Tool execution progress update (emitted by tools during execution)
+    /// Tool execution progress update (emitted by tools during execution).
+    /// Each `ConsoleLine` carries a classification the host can style
+    /// without re-parsing the content. Tools that don't classify just
+    /// emit `ConsoleLevel::Normal`.
     ToolExecutionUpdate {
         tool_call_id: String,
         tool_name: String,
-        content: String,
+        lines: Vec<ConsoleLine>,
     },
 
     /// Tool execution completed
@@ -117,6 +158,10 @@ pub enum AgentEvent {
         completed_at: DateTime<Utc>,
     },
 
+    /// A single line of streamed tool output, classified for UI styling.
+    /// ANSI escape codes are preserved in `content`; web hosts strip on
+    /// display, terminal hosts pass through.
+    ///
     /// A file-mutating tool reports a before/after snapshot. Hosts feed
     /// these into a diff overlay (e.g. `tau_tools::diff::SessionDiffOverlay`)
     /// to render the cumulative session diff. `before = None` means the file
@@ -130,6 +175,80 @@ pub enum AgentEvent {
         after: Option<String>,
         tool_call_id: String,
     },
+
+    /// A subagent began executing (fresh spawn). Bracketed by
+    /// `SubagentCompleted` with the same `agent_id`. Hosts can render an
+    /// expandable subagent block from `SubagentStarted` and update its
+    /// status when `SubagentCompleted` arrives. The intermediate
+    /// `Subagent { event }` wrapping continues to forward each child event.
+    ///
+    /// **Canonical start signal.** The forwarded child `AgentStart` arrives
+    /// shortly after as `Subagent { event: AgentStart }`. Hosts should pick
+    /// `SubagentStarted` for rendering the bracket — it carries the
+    /// metadata (agent_type, prompt, started_at) and is guaranteed to fire
+    /// once per subagent run. Treat the wrapped `AgentStart` as a
+    /// duplicate.
+    SubagentStarted {
+        agent_id: String,
+        agent_type: String,
+        description: String,
+        prompt: String,
+        started_at: DateTime<Utc>,
+    },
+
+    /// A previously-paused subagent was reactivated for a follow-up turn
+    /// (e.g. `agent({ to: "<id>", prompt: "..." })`). Bracketed by a fresh
+    /// `SubagentCompleted` with the same `agent_id`.
+    SubagentResumed {
+        agent_id: String,
+        description: String,
+        prompt: String,
+        resumed_at: DateTime<Utc>,
+    },
+
+    /// A subagent terminated (success or abort). Pairs with the most
+    /// recent `SubagentStarted`/`SubagentResumed` for the same `agent_id`.
+    SubagentCompleted {
+        agent_id: String,
+        description: String,
+        outcome: SubagentOutcome,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        duration_ms: u64,
+        usage: Usage,
+        tool_use_count: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worktree_branch: Option<String>,
+    },
+
+    /// A subagent self-labels its outcome before terminating. Emitted by
+    /// the `subagent_report` tool on the subagent's own stream; reaches
+    /// the parent host wrapped as `Subagent { event: SubagentReport { … } }`.
+    /// Hosts correlate with the eventual `SubagentCompleted` by `agent_id`
+    /// and use the `tag` for product-specific badges (e.g. `"passed"`,
+    /// `"failed"`, `"approve"`, `"changes"`).
+    SubagentReport {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        summary: String,
+    },
+}
+
+/// How a subagent terminated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentOutcome {
+    /// Reached `AgentEnd` cleanly (success or model-reported failure).
+    Completed,
+    /// Cancelled by the parent or its own cancellation token.
+    Aborted { reason: String },
+    /// Hit a non-cancellation error (transport, validation, etc.) before
+    /// reaching `AgentEnd`. Hosts may render this differently from `Aborted`
+    /// (which represents user/parent intent) since `Failed` indicates an
+    /// infrastructure problem.
+    Failed { reason: String },
 }
 
 impl AgentEvent {

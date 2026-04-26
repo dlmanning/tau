@@ -193,6 +193,7 @@ async fn dispatch_ui_message(
                             isolation: None,
                             depth: 0,
                             inherit_history_from: None,
+                            approval_policy: None,
                         };
 
                         match manager.spawn_interactive(request).await {

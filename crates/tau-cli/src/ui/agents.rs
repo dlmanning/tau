@@ -98,7 +98,7 @@ impl TuiState {
             }
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
-                content,
+                lines,
                 ..
             } => {
                 if let Some(msg) = self
@@ -107,7 +107,11 @@ impl TuiState {
                     .rev()
                     .find(|m| m.id.as_deref() == Some(&tool_call_id))
                 {
-                    msg.content = content;
+                    // Show only the latest line as the in-progress activity
+                    // until the TUI grows a proper styled console block.
+                    if let Some(last) = lines.last() {
+                        msg.content = last.content.clone();
+                    }
                 }
             }
             AgentEvent::ToolExecutionEnd {
@@ -217,7 +221,11 @@ impl TuiState {
             | AgentEvent::PlanStepStarted { .. }
             | AgentEvent::PlanStepCompleted { .. }
             | AgentEvent::PlanCompleted { .. }
-            | AgentEvent::FileChanged { .. } => {}
+            | AgentEvent::FileChanged { .. }
+            | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentResumed { .. }
+            | AgentEvent::SubagentCompleted { .. }
+            | AgentEvent::SubagentReport { .. } => {}
         }
     }
 

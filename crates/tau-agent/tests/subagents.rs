@@ -31,6 +31,7 @@ fn spawn_request(prompt: &str, description: &str) -> SpawnRequest {
         isolation: None,
         depth: 0,
         inherit_history_from: None,
+        approval_policy: None,
     }
 }
 
