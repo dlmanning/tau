@@ -25,7 +25,7 @@ pub const MAX_AGENT_DEPTH: u32 = 3;
 pub const MAX_SUBAGENT_TURNS: u32 = 200;
 
 /// Agent type determines tool set and system prompt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentType {
     GeneralPurpose,
     Explore,
@@ -67,8 +67,10 @@ impl std::fmt::Display for AgentType {
     }
 }
 
-/// Factory function to create a depth-limited Agent tool.
-type AgentToolFactory = Arc<dyn Fn(u32, AgentHandle) -> BoxedTool + Send + Sync>;
+/// Factory function to create a depth-limited Agent tool for a given parent agent type.
+/// The parent type lets the factory enforce per-parent restrictions
+/// (e.g. Plan agents may only spawn read-only subagents).
+type AgentToolFactory = Arc<dyn Fn(u32, AgentHandle, AgentType) -> BoxedTool + Send + Sync>;
 
 /// Result from a completed subagent.
 #[derive(Debug)]
@@ -144,7 +146,7 @@ impl AgentManager {
     /// Set the factory for creating recursive agent tools.
     pub fn set_agent_tool_factory(
         &self,
-        factory: Arc<dyn Fn(u32, AgentHandle) -> BoxedTool + Send + Sync>,
+        factory: Arc<dyn Fn(u32, AgentHandle, AgentType) -> BoxedTool + Send + Sync>,
     ) {
         *self.agent_tool_factory.lock() = Some(factory);
     }
@@ -225,6 +227,76 @@ impl AgentManager {
         });
 
         agent_id
+    }
+
+    /// Spawn a subagent and return its handle for interactive use.
+    /// The caller drives the conversation by sending prompts via the handle.
+    /// No event forwarder is set up — the caller subscribes directly.
+    pub async fn spawn_interactive(
+        &self,
+        request: SpawnRequest,
+    ) -> crate::error::Result<(AgentHandle, String)> {
+        let agent_id = uuid::Uuid::new_v4().to_string();
+
+        let cwd = request
+            .cwd
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".into())
+            });
+
+        let mut agent_cfg = self.parent_config.clone();
+        agent_cfg.system_prompt = None;
+        agent_cfg.max_turns = Some(request.agent_type.max_turns());
+        agent_cfg.max_tokens = None;
+        agent_cfg.cache_scope = None;
+        agent_cfg.cache_ttl = None;
+        if let Some(ref model) = request.model {
+            agent_cfg.model = model.clone();
+        }
+
+        let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
+        builder.set_cwd(&cwd);
+
+        let factory = self.agent_tool_factory.lock().clone();
+        let agent_handle = builder.pre_handle();
+
+        let tools = build_tool_set(
+            &request.agent_type,
+            &self.tools,
+            request.depth,
+            &factory,
+            &agent_handle,
+        );
+        for tool in &tools {
+            builder.add_tool(tool.clone());
+        }
+
+        let tool_names = builder.tool_names();
+        let system_prompt = crate::prompts::build_subagent_prompt(
+            agent_type_suffix(&request.agent_type),
+            &tool_names,
+            &cwd,
+        );
+        builder.set_system_prompt(system_prompt);
+
+        let handle = builder.spawn();
+
+        // Track as running so find_agent() and send_to_running() work.
+        // Caller must call remove_interactive() when done.
+        self.running_handles.lock().await.insert(
+            agent_id.clone(),
+            (handle.clone(), request.description.clone()),
+        );
+
+        Ok((handle, agent_id))
+    }
+
+    /// Remove an interactive agent from the running handles.
+    pub async fn remove_interactive(&self, agent_id: &str) {
+        self.running_handles.lock().await.remove(agent_id);
     }
 
     /// Send a message to a previously stored agent (resume).
@@ -560,9 +632,11 @@ fn build_tool_set(
             .collect(),
     };
 
-    if matches!(agent_type, AgentType::GeneralPurpose) && depth + 1 < MAX_AGENT_DEPTH {
+    if matches!(agent_type, AgentType::GeneralPurpose | AgentType::Plan)
+        && depth + 1 < MAX_AGENT_DEPTH
+    {
         if let Some(factory) = agent_tool_factory {
-            tools.push(factory(depth + 1, handle.clone()));
+            tools.push(factory(depth + 1, handle.clone(), agent_type.clone()));
         }
     }
 
@@ -739,7 +813,7 @@ mod tests {
         let all = mock_tools();
         let handle = test_handle();
         let factory: AgentToolFactory =
-            Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
+            Arc::new(|_depth, _handle, _parent| Arc::new(MockTool { tool_name: "agent" }));
         let filtered = build_tool_set(&AgentType::GeneralPurpose, &all, 0, &Some(factory), &handle);
         let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"agent"), "factory should add agent tool");
@@ -750,7 +824,7 @@ mod tests {
         let all = mock_tools();
         let handle = test_handle();
         let factory: AgentToolFactory =
-            Arc::new(|_depth, _handle| Arc::new(MockTool { tool_name: "agent" }));
+            Arc::new(|_depth, _handle, _parent| Arc::new(MockTool { tool_name: "agent" }));
         let filtered = build_tool_set(
             &AgentType::GeneralPurpose,
             &all,

@@ -37,6 +37,8 @@ pub struct AgentTool {
     manager: Arc<AgentManager>,
     depth: u32,
     agent_handle: Option<AgentHandle>,
+    /// If set, only these agent types are allowed. None means no restriction.
+    allowed_types: Option<Vec<AgentType>>,
 }
 
 impl AgentTool {
@@ -45,11 +47,17 @@ impl AgentTool {
             manager,
             depth,
             agent_handle: None,
+            allowed_types: None,
         }
     }
 
     pub fn with_handle(mut self, handle: AgentHandle) -> Self {
         self.agent_handle = Some(handle);
+        self
+    }
+
+    pub fn with_allowed_types(mut self, types: Vec<AgentType>) -> Self {
+        self.allowed_types = Some(types);
         self
     }
 }
@@ -93,6 +101,18 @@ impl Tool for AgentTool {
             .as_deref()
             .and_then(AgentType::parse)
             .unwrap_or(AgentType::GeneralPurpose);
+
+        if let Some(ref allowed) = self.allowed_types
+            && !allowed.contains(&agent_type)
+        {
+            let allowed_names: Vec<String> =
+                allowed.iter().map(|t| t.to_string()).collect();
+            return ToolResult::error(format!(
+                "subagent_type '{}' not allowed here. Allowed: {}.",
+                agent_type,
+                allowed_names.join(", ")
+            ));
+        }
 
         let model = args
             .model

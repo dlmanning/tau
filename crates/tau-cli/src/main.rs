@@ -190,13 +190,22 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Create factory that makes AgentTools referencing this manager.
+    // Plan parents get a tool restricted to spawning read-only subagents
+    // so the read-only invariant the Plan prompt advertises is actually enforced.
     let mgr_for_factory = manager.clone();
-    manager.set_agent_tool_factory(Arc::new(move |depth, handle| {
-        let tool = tau_tools::AgentTool::new(mgr_for_factory.clone(), depth).with_handle(handle);
+    manager.set_agent_tool_factory(Arc::new(move |depth, handle, parent_type| {
+        let mut tool = tau_tools::AgentTool::new(mgr_for_factory.clone(), depth).with_handle(handle);
+        if matches!(parent_type, tau_agent::manager::AgentType::Plan) {
+            tool = tool.with_allowed_types(vec![
+                tau_agent::manager::AgentType::Explore,
+                tau_agent::manager::AgentType::Plan,
+            ]);
+        }
         Arc::new(tool)
     }));
 
     let mgr_for_send = manager.clone();
+    let mgr_for_commands = manager.clone();
     builder.add_tool(Arc::new(
         tau_tools::AgentTool::new(manager, 0).with_handle(agent_handle),
     ));
@@ -259,11 +268,11 @@ async fn main() -> anyhow::Result<()> {
     } else if use_tui {
         // TUI mode
         let available_models = get_available_models();
-        ui::run_tui(&handle, &available_models, interaction_rx).await
+        ui::run_tui(&handle, &available_models, interaction_rx, mgr_for_commands.clone()).await
     } else {
         // Interactive mode (simple stdin/stdout)
         let session = resumed_session.or_else(|| session::SessionManager::new(&model.id).ok());
-        interactive::run_interactive(&handle, session, interaction_rx).await
+        interactive::run_interactive(&handle, session, interaction_rx, mgr_for_commands).await
     };
 
     lsp_manager.shutdown_all().await;

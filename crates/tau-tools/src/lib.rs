@@ -7,6 +7,7 @@ mod edit;
 mod glob;
 mod grep;
 mod list;
+pub mod plan;
 mod read;
 mod send_message;
 mod web_fetch;

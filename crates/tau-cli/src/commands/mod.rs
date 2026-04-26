@@ -2,6 +2,7 @@
 
 mod branch;
 mod model;
+mod plan;
 mod session;
 mod thinking;
 
@@ -16,6 +17,8 @@ pub struct CommandContext<'a> {
     pub messages: &'a [Message],
     pub usage: &'a tau_ai::Usage,
     pub available_models: &'a [Model],
+    /// Whether a non-main agent is currently active (e.g. plan mode).
+    pub has_active_agent: bool,
 }
 
 /// Result of executing a slash command
@@ -40,6 +43,12 @@ pub enum CommandResult {
     BranchFrom(Option<usize>),
     /// Trigger manual context compaction
     Compact,
+    /// Enter plan mode — spawn a Plan subagent with the given description
+    PlanStart(String),
+    /// Approve the plan and return to the main agent
+    PlanApprove,
+    /// Exit plan mode without approving
+    PlanExit,
 }
 
 /// Trait for slash commands
@@ -68,6 +77,7 @@ fn all_commands() -> Vec<Box<dyn Command>> {
         Box::new(thinking::ThinkingCommand),
         Box::new(session::SessionCommand),
         Box::new(branch::BranchCommand),
+        Box::new(plan::PlanCommand),
         Box::new(CompactCommand),
     ]
 }

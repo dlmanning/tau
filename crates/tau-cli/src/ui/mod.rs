@@ -27,12 +27,23 @@ use state::TuiState;
 use types::PendingInteraction;
 pub use types::UiMessage;
 
+use std::sync::Arc;
+
 use crossterm::event::EventStream;
 use futures::StreamExt;
+use tau_agent::manager::AgentManager;
 use tau_agent::{AgentEvent, AgentHandle};
 use tau_ai::Model;
 use tokio::sync::mpsc;
 use widgets::{SelectorState, message_list::ChatMessage};
+
+/// A non-main agent that the user is currently interacting with.
+struct ActiveAgent {
+    handle: AgentHandle,
+    agent_id: String,
+    #[allow(dead_code)] // rendered via TuiState.plan_indicator (Phase 2.1)
+    description: String,
+}
 
 /// Apply a branch operation: create a branch session and truncate conversation state.
 async fn apply_branch(state: &mut TuiState, handle: &AgentHandle, branch_index: Option<usize>) {
@@ -74,6 +85,8 @@ async fn dispatch_ui_message(
     handle: &AgentHandle,
     available_models: &[Model],
     pending_prompt: &mut Option<String>,
+    active_agent: &mut Option<ActiveAgent>,
+    manager: &Arc<AgentManager>,
 ) -> bool {
     use crate::commands::{CommandContext, CommandResult, execute_command};
 
@@ -82,13 +95,14 @@ async fn dispatch_ui_message(
             *pending_prompt = Some(content);
         }
         UiMessage::Command(cmd) => {
-            let Some(config) = handle.config().await else {
+            let effective = active_agent.as_ref().map(|a| &a.handle).unwrap_or(handle);
+            let Some(config) = effective.config().await else {
                 return true;
             };
-            let Some(messages) = handle.messages().await else {
+            let Some(messages) = effective.messages().await else {
                 return true;
             };
-            let Some(conv_state) = handle.state().await else {
+            let Some(conv_state) = effective.state().await else {
                 return true;
             };
             let ctx = CommandContext {
@@ -97,6 +111,7 @@ async fn dispatch_ui_message(
                 messages: &messages,
                 usage: &conv_state.total_usage,
                 available_models,
+                has_active_agent: active_agent.is_some(),
             };
             if let Some(result) = execute_command(&cmd, &ctx) {
                 match result {
@@ -154,6 +169,85 @@ async fn dispatch_ui_message(
                     CommandResult::BranchFrom(branch_index) => {
                         apply_branch(state, handle, branch_index).await;
                     }
+                    CommandResult::PlanStart(description) => {
+                        state.show_system_message("Entering plan mode...");
+
+                        // Build context from main agent conversation
+                        let main_messages = handle.messages().await.unwrap_or_default();
+                        let main_state = handle.state().await;
+                        let prev_summary = main_state
+                            .as_ref()
+                            .and_then(|s| s.previous_summary.as_deref());
+                        let context =
+                            tau_tools::plan::build_context_summary(&main_messages, prev_summary);
+                        let prompt =
+                            tau_tools::plan::build_plan_prompt(&context, &description);
+
+                        // Spawn Plan subagent
+                        let request = tau_agent::manager::SpawnRequest {
+                            agent_type: tau_agent::manager::AgentType::Plan,
+                            prompt: String::new(), // sent via handle.prompt() below
+                            description: format!("Planning: {}", description),
+                            model: None,
+                            cwd: None,
+                            isolation: None,
+                            depth: 0,
+                        };
+
+                        match manager.spawn_interactive(request).await {
+                            Ok((plan_handle, agent_id)) => {
+                                let desc = format!("Planning: {}", description);
+                                *active_agent = Some(ActiveAgent {
+                                    handle: plan_handle,
+                                    agent_id,
+                                    description: desc.clone(),
+                                });
+                                state.show_system_message(&format!(
+                                    "Plan mode active: {}\nUse /plan approve when done, or /plan exit to cancel.",
+                                    description
+                                ));
+                                // Send context + task as the first prompt
+                                *pending_prompt = Some(prompt);
+                            }
+                            Err(e) => {
+                                state.show_system_message(&format!(
+                                    "Failed to start plan mode: {}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    CommandResult::PlanApprove => {
+                        if let Some(agent) = active_agent.as_ref() {
+                            let plan_text = agent
+                                .handle
+                                .messages()
+                                .await
+                                .map(|m| tau_tools::plan::extract_final_text(&m))
+                                .unwrap_or_default();
+                            if plan_text.trim().is_empty() {
+                                state.show_system_message(
+                                    "Plan agent has no plan to approve yet. Wait for it to respond, or use /plan exit to discard.",
+                                );
+                            } else {
+                                let agent = active_agent.take().unwrap();
+                                manager.remove_interactive(&agent.agent_id).await;
+                                handle.steer(tau_ai::Message::user(format!(
+                                    "Approved plan:\n\n{}\n\nProceed with implementation.",
+                                    plan_text
+                                )));
+                                state.show_system_message(
+                                    "Plan approved. Returned to main agent.",
+                                );
+                            }
+                        }
+                    }
+                    CommandResult::PlanExit => {
+                        if let Some(agent) = active_agent.take() {
+                            manager.remove_interactive(&agent.agent_id).await;
+                            state.show_system_message("Exited plan mode.");
+                        }
+                    }
                 }
             }
         }
@@ -170,7 +264,11 @@ async fn dispatch_ui_message(
             state.status = "Cleared".to_string();
         }
         UiMessage::Abort => {
-            handle.abort();
+            if let Some(ref agent) = *active_agent {
+                agent.handle.abort();
+            } else {
+                handle.abort();
+            }
         }
         UiMessage::Branch(branch_index) => {
             apply_branch(state, handle, branch_index).await;
@@ -185,6 +283,7 @@ pub async fn run_tui(
     handle: &AgentHandle,
     available_models: &[Model],
     mut interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
+    manager: Arc<AgentManager>,
 ) -> anyhow::Result<()> {
     use std::io;
 
@@ -224,22 +323,33 @@ pub async fn run_tui(
     ));
 
     let mut pending_prompt: Option<String> = None;
+    let mut active_agent: Option<ActiveAgent> = None;
 
     let result = 'outer: loop {
+        // Determine which handle receives prompts and events
+        let effective_handle = active_agent
+            .as_ref()
+            .map(|a| &a.handle)
+            .unwrap_or(handle);
+
         if let Some(content) = pending_prompt.take() {
+            // Re-subscribe to the effective handle's events for this prompt
+            agent_rx = effective_handle.subscribe();
+
             state.is_processing = true;
-            state.status = "Thinking...".to_string();
+            state.status = if active_agent.is_some() {
+                "Planning...".to_string()
+            } else {
+                "Thinking...".to_string()
+            };
             state.messages.push(ChatMessage::assistant_streaming(""));
             state.scroll_to_bottom();
 
-            if let Some(cfg) = handle.config().await {
+            if let Some(cfg) = effective_handle.config().await {
                 state.sync_from_config(&cfg);
             }
 
-            // Start the prompt — returns a receiver for the completion result.
-            // This is the key difference from the old &mut Agent pattern:
-            // the handle is &self, so we can keep using it freely.
-            let prompt_rx = match handle.prompt(&content).await {
+            let prompt_rx = match effective_handle.prompt(&content).await {
                 Ok(rx) => rx,
                 Err(e) => {
                     state.handle_agent_event(AgentEvent::Error {
@@ -282,7 +392,7 @@ pub async fn run_tui(
                     event = event_stream.next() => {
                         match event {
                             Some(Ok(ev)) => {
-                                if !state.handle_event_while_processing(ev, area_width, handle) {
+                                if !state.handle_event_while_processing(ev, area_width, effective_handle) {
                                     break 'outer Ok(());
                                 }
                             }
@@ -325,7 +435,7 @@ pub async fn run_tui(
             continue;
         }
 
-        if let Some(cfg) = handle.config().await {
+        if let Some(cfg) = effective_handle.config().await {
             state.sync_from_config(&cfg);
         }
         terminal.draw(|frame| state.render(frame))?;
@@ -365,11 +475,21 @@ pub async fn run_tui(
             msg = ui_rx.recv() => {
                 match msg {
                     Some(msg) => {
+                        let prev_id = active_agent.as_ref().map(|a| a.agent_id.clone());
                         if !dispatch_ui_message(
                             msg, &mut state, handle,
                             available_models, &mut pending_prompt,
+                            &mut active_agent, &manager,
                         ).await {
                             break Ok(());
+                        }
+                        let new_id = active_agent.as_ref().map(|a| a.agent_id.clone());
+                        if prev_id != new_id {
+                            let new_effective = active_agent
+                                .as_ref()
+                                .map(|a| &a.handle)
+                                .unwrap_or(handle);
+                            agent_rx = new_effective.subscribe();
                         }
                     }
                     None => break Ok(()),
