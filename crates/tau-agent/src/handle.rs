@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::ApprovalPolicy;
 use crate::command::{Command, PromptResult};
 use crate::compaction::{CompactionConfig, CompactionReason};
 use crate::config::AgentConfig;
@@ -121,6 +122,10 @@ impl AgentHandle {
 
     pub fn set_compaction_config(&self, config: CompactionConfig) {
         self.send_command(Command::SetCompactionConfig(config));
+    }
+
+    pub fn set_approval_policy(&self, policy: Arc<dyn ApprovalPolicy>) {
+        self.send_command(Command::SetApprovalPolicy(policy));
     }
 
     pub fn clear_messages(&self) {

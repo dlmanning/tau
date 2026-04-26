@@ -6,6 +6,7 @@ use std::{collections::VecDeque, process::Stdio};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tau_agent::approval::ToolRisk;
 use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -146,6 +147,10 @@ impl Tool for BashTool {
 
     fn concurrency(&self) -> Concurrency {
         Concurrency::Sequential
+    }
+
+    fn risk(&self, _arguments: &serde_json::Value) -> ToolRisk {
+        ToolRisk::Elevated
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

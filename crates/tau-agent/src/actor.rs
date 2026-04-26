@@ -4,17 +4,21 @@
 //! from the channel. During async operations (LLM calls, tool execution),
 //! it `select!`s on the command channel to handle queries and abort.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use tau_ai::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::{ApprovalDecision, ToolApprovalOutcome, ToolRisk};
 use crate::command::{Command, PromptResult};
 use crate::compaction::{self, CompactionReason};
 use crate::events::AgentEvent;
+use crate::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
 use crate::logic::{self, FollowUpAction, ResponseAction};
 use crate::overflow::is_context_overflow;
 use crate::state::{AgentState, ToolCall};
@@ -22,6 +26,10 @@ use crate::stream::{StreamOutcome, StreamReducer};
 use crate::tool::{ExecutionContext, ProgressSender, ToolResult, send_event};
 use crate::tool_executor::run_single_tool;
 use crate::transport::AgentEventStream;
+
+/// Future yielded by a pending approval gate.
+type GateFuture =
+    BoxFuture<'static, (usize, String, String, Result<InteractionResponse, oneshot::error::RecvError>)>;
 
 /// Phases of a single turn in the agent loop.
 enum StepPhase {
@@ -47,6 +55,19 @@ enum StepPhase {
         outcome: Box<StreamOutcome>,
         first_user_message: Option<Message>,
         pending: Vec<Message>,
+    },
+
+    /// Classifying tool calls and waiting on any pending approval gates.
+    AwaitingApproval {
+        tool_calls: Vec<ToolCall>,
+        groups: Vec<Vec<usize>>,
+        /// Pre-populated synth results for indices the policy rejected.
+        pre_results: HashMap<usize, (String, String, ToolResult)>,
+        /// Indices approved for dispatch (policy `Auto` + user `Approved`).
+        dispatch: HashSet<usize>,
+        /// Pending gate awaits, one per `Gate` decision.
+        pending_gates: FuturesUnordered<GateFuture>,
+        first_user_message: Option<Message>,
     },
 
     /// Executing tool calls concurrently.
@@ -196,15 +217,18 @@ pub(crate) async fn run_actor(
                         groups,
                         first_user_message,
                     } => {
-                        let mut remaining = groups;
-                        let first = remaining.remove(0);
-                        let join_set = spawn_group(&state, &tool_calls, &first, &prompt_cancel);
-                        StepPhase::AwaitingTools {
-                            join_set,
-                            remaining_groups: remaining,
-                            all_tool_calls: tool_calls,
-                            results_map: HashMap::new(),
-                            first_user_message,
+                        match classify_tool_calls(&state, &tool_calls, &prompt_cancel).await {
+                            Some((pre_results, dispatch, pending_gates)) => {
+                                StepPhase::AwaitingApproval {
+                                    tool_calls,
+                                    groups,
+                                    pre_results,
+                                    dispatch,
+                                    pending_gates,
+                                    first_user_message,
+                                }
+                            }
+                            None => StepPhase::Done(Ok(())),
                         }
                     }
                     ResponseAction::Compact {
@@ -224,6 +248,53 @@ pub(crate) async fn run_actor(
                             },
                         );
                         StepPhase::Done(Err(e))
+                    }
+                }
+            }
+
+            StepPhase::AwaitingApproval {
+                tool_calls,
+                groups,
+                mut pre_results,
+                mut dispatch,
+                mut pending_gates,
+                first_user_message,
+            } => {
+                loop {
+                    if pending_gates.is_empty() {
+                        break finalize_approval(
+                            &state,
+                            tool_calls,
+                            groups,
+                            pre_results,
+                            &dispatch,
+                            first_user_message,
+                            &prompt_cancel,
+                        );
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = prompt_cancel.cancelled() => {
+                            break StepPhase::Done(Ok(()));
+                        }
+                        Some(cmd) = urgent_rx.recv() => {
+                            handle_busy_command(&mut state, cmd);
+                        }
+                        Some(cmd) = normal_rx.recv() => {
+                            handle_busy_command(&mut state, cmd);
+                        }
+                        Some((idx, id, name, resp)) = pending_gates.next() => {
+                            apply_gate_response(
+                                &state,
+                                idx,
+                                id,
+                                name,
+                                resp,
+                                &tool_calls,
+                                &mut pre_results,
+                                &mut dispatch,
+                            );
+                        }
                     }
                 }
             }
@@ -483,6 +554,7 @@ fn handle_busy_command(state: &mut AgentState, cmd: Command) {
         Command::SetReasoning(l) => state.config.reasoning = l,
         Command::SetSystemPrompt(s) => state.config.system_prompt = Some(s),
         Command::SetCompactionConfig(c) => state.config.compaction = c,
+        Command::SetApprovalPolicy(p) => state.approval_policy = p,
 
         // Steer / follow-up
         Command::Steer(msg) => state.steering_queue.push(msg),
@@ -570,6 +642,226 @@ async fn prepare_turn(
                 StepPhase::Done(Err(crate::error::Error::Ai(e)))
             }
         }
+    }
+}
+
+// ─── Approval gate ──────────────────────────────────────────────────
+
+/// Synthesize an error tool result for a rejected call. Surfaced to the model
+/// so it can react instead of looping on a silently-dropped tool call.
+fn synth_rejection(tc: &ToolCall, reason: &str) -> (String, String, ToolResult) {
+    (
+        tc.id.clone(),
+        tc.name.clone(),
+        ToolResult::error(format!("Tool call rejected: {reason}")),
+    )
+}
+
+/// Classify each tool call against the configured policy. Sends `ConfirmTool`
+/// interaction requests for `Gate` decisions and returns the receivers.
+///
+/// Returns `None` if the prompt was cancelled while waiting to enqueue a
+/// `ConfirmTool` request on a saturated interaction channel — the caller
+/// should transition to `Done`.
+async fn classify_tool_calls(
+    state: &AgentState,
+    tool_calls: &[ToolCall],
+    cancel: &CancellationToken,
+) -> Option<(
+    HashMap<usize, (String, String, ToolResult)>,
+    HashSet<usize>,
+    FuturesUnordered<GateFuture>,
+)> {
+    let mut pre_results: HashMap<usize, (String, String, ToolResult)> = HashMap::new();
+    let mut dispatch: HashSet<usize> = HashSet::new();
+    let pending_gates: FuturesUnordered<GateFuture> = FuturesUnordered::new();
+
+    for (idx, tc) in tool_calls.iter().enumerate() {
+        let tool = state.tools.iter().find(|t| t.name() == tc.name).cloned();
+        let risk = tool
+            .as_ref()
+            .map(|t| t.risk(&tc.args))
+            .unwrap_or(ToolRisk::Local);
+        let activity = tool
+            .as_ref()
+            .map(|t| t.activity_description(&tc.args))
+            .unwrap_or_else(|| format!("Running {}", tc.name));
+
+        match state.approval_policy.classify(&tc.name, &tc.args, risk) {
+            ApprovalDecision::Auto => {
+                send_event(
+                    &state.event_tx,
+                    AgentEvent::ToolApprovalResolved {
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        outcome: ToolApprovalOutcome::AutoApproved,
+                    },
+                );
+                dispatch.insert(idx);
+            }
+            ApprovalDecision::Reject(reason) => {
+                send_event(
+                    &state.event_tx,
+                    AgentEvent::ToolApprovalResolved {
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        outcome: ToolApprovalOutcome::Rejected {
+                            reason: reason.clone(),
+                        },
+                    },
+                );
+                pre_results.insert(idx, synth_rejection(tc, &reason));
+            }
+            ApprovalDecision::Gate => {
+                let Some(ref interaction_tx) = state.interaction_tx else {
+                    let reason = "no interaction channel".to_string();
+                    send_event(
+                        &state.event_tx,
+                        AgentEvent::ToolApprovalResolved {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            outcome: ToolApprovalOutcome::Rejected {
+                                reason: reason.clone(),
+                            },
+                        },
+                    );
+                    pre_results.insert(idx, synth_rejection(tc, &reason));
+                    continue;
+                };
+
+                let (response_tx, response_rx) = oneshot::channel();
+                let request = InteractionRequest {
+                    agent_id: None,
+                    kind: InteractionKind::ConfirmTool {
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        arguments: tc.args.clone(),
+                        activity,
+                        risk,
+                    },
+                    response_tx,
+                };
+
+                let send_result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return None,
+                    res = interaction_tx.send(request) => res,
+                };
+                if send_result.is_err() {
+                    let reason = "interaction channel closed".to_string();
+                    send_event(
+                        &state.event_tx,
+                        AgentEvent::ToolApprovalResolved {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            outcome: ToolApprovalOutcome::Rejected {
+                                reason: reason.clone(),
+                            },
+                        },
+                    );
+                    pre_results.insert(idx, synth_rejection(tc, &reason));
+                    continue;
+                }
+
+                let id = tc.id.clone();
+                let name = tc.name.clone();
+                pending_gates.push(Box::pin(async move {
+                    let resp = response_rx.await;
+                    (idx, id, name, resp)
+                }));
+            }
+        }
+    }
+
+    Some((pre_results, dispatch, pending_gates))
+}
+
+/// Apply a single gate response: emit `ToolApprovalResolved`, then either add
+/// the index to `dispatch` or insert a synth error into `pre_results`.
+#[allow(clippy::too_many_arguments)]
+fn apply_gate_response(
+    state: &AgentState,
+    idx: usize,
+    id: String,
+    name: String,
+    resp: Result<InteractionResponse, oneshot::error::RecvError>,
+    tool_calls: &[ToolCall],
+    pre_results: &mut HashMap<usize, (String, String, ToolResult)>,
+    dispatch: &mut HashSet<usize>,
+) {
+    let outcome = match resp {
+        Ok(InteractionResponse::Approved) => Ok(()),
+        Ok(InteractionResponse::Rejected { reason }) => Err(reason),
+        Ok(InteractionResponse::Cancelled) => Err("cancelled".to_string()),
+        Ok(InteractionResponse::Answer(_)) | Ok(InteractionResponse::PlanApproved { .. }) => {
+            Err("unexpected response to ConfirmTool".to_string())
+        }
+        Err(_) => Err("interaction channel closed".to_string()),
+    };
+
+    match outcome {
+        Ok(()) => {
+            send_event(
+                &state.event_tx,
+                AgentEvent::ToolApprovalResolved {
+                    tool_call_id: id,
+                    tool_name: name,
+                    outcome: ToolApprovalOutcome::Approved,
+                },
+            );
+            dispatch.insert(idx);
+        }
+        Err(reason) => {
+            send_event(
+                &state.event_tx,
+                AgentEvent::ToolApprovalResolved {
+                    tool_call_id: id,
+                    tool_name: name,
+                    outcome: ToolApprovalOutcome::Rejected {
+                        reason: reason.clone(),
+                    },
+                },
+            );
+            pre_results.insert(idx, synth_rejection(&tool_calls[idx], &reason));
+        }
+    }
+}
+
+/// All gates resolved. Filter groups to only include dispatched indices and
+/// transition to the next phase. Returns either `AwaitingTools` (with the
+/// first non-empty filtered group spawned) or `ApplyToolResults` (when every
+/// call was rejected).
+fn finalize_approval(
+    state: &AgentState,
+    tool_calls: Vec<ToolCall>,
+    groups: Vec<Vec<usize>>,
+    pre_results: HashMap<usize, (String, String, ToolResult)>,
+    dispatch: &HashSet<usize>,
+    first_user_message: Option<Message>,
+    cancel: &CancellationToken,
+) -> StepPhase {
+    let mut filtered: Vec<Vec<usize>> = groups
+        .into_iter()
+        .map(|g| g.into_iter().filter(|i| dispatch.contains(i)).collect())
+        .filter(|g: &Vec<usize>| !g.is_empty())
+        .collect();
+
+    if filtered.is_empty() {
+        return StepPhase::ApplyToolResults {
+            tool_calls,
+            results_map: pre_results,
+            first_user_message,
+        };
+    }
+
+    let first = filtered.remove(0);
+    let join_set = spawn_group(state, &tool_calls, &first, cancel);
+    StepPhase::AwaitingTools {
+        join_set,
+        remaining_groups: filtered,
+        all_tool_calls: tool_calls,
+        results_map: pre_results,
+        first_user_message,
     }
 }
 

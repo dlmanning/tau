@@ -6,8 +6,10 @@ use std::time::Instant;
 
 use parking_lot::Mutex as ParkingMutex;
 use tau_ai::{Content, Message, Model, Usage};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+
+use crate::interaction::InteractionRequest;
 
 use crate::builder::AgentBuilder;
 use crate::config::AgentConfig;
@@ -83,6 +85,11 @@ pub struct SubagentResult {
     pub duration_ms: u64,
     pub worktree_path: Option<String>,
     pub worktree_branch: Option<String>,
+    /// Path to the JSONL transcript on disk, when transcript recording
+    /// succeeded. The parent agent can use this to read the subagent's
+    /// full investigation trace if it wants more detail than the textual
+    /// result provides. See [`SpawnRequest::include_transcript`].
+    pub transcript_path: Option<String>,
 }
 
 /// Lightweight request struct for spawning a subagent via AgentManager.
@@ -94,6 +101,16 @@ pub struct SpawnRequest {
     pub cwd: Option<String>,
     pub isolation: Option<String>,
     pub depth: u32,
+    /// Seed the new subagent with a stored agent's full message history,
+    /// then apply `prompt` as a follow-up user message. Useful for plan →
+    /// execute handoffs: the executor inherits the planner's investigation
+    /// and the approved plan as its own history.
+    ///
+    /// The named agent must already be stored (i.e., have terminated).
+    /// If lookup fails, spawn returns an error. Inherited tool_uses
+    /// reference tools the new agent may not have — Anthropic tolerates
+    /// this; OpenAI/Google may not.
+    pub inherit_history_from: Option<String>,
 }
 
 /// Whether an agent is currently executing or stored (idle).
@@ -111,6 +128,10 @@ pub struct AgentManager {
     tools: Vec<BoxedTool>,
     parent_config: AgentConfig,
     parent_event_tx: broadcast::Sender<AgentEvent>,
+    /// Parent's interaction sender. When set, each subagent gets a wrapping
+    /// channel that stamps `agent_id` on outgoing requests and forwards them
+    /// to this parent. When `None`, subagents have no interaction channel.
+    parent_interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
     agent_tool_factory: ParkingMutex<Option<AgentToolFactory>>,
     /// Handles for agents that are currently executing (keyed by agent_id).
     running_handles: Mutex<HashMap<String, (AgentHandle, String)>>,
@@ -138,9 +159,21 @@ impl AgentManager {
             tools,
             parent_config,
             parent_event_tx,
+            parent_interaction_tx: None,
             agent_tool_factory: ParkingMutex::new(None),
             running_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Forward subagent interaction requests to this parent channel,
+    /// stamping `agent_id` along the way. Without this, `submit_plan` and
+    /// `ask_user` from a subagent silently fail.
+    pub fn with_parent_interaction_sender(
+        mut self,
+        tx: mpsc::Sender<InteractionRequest>,
+    ) -> Self {
+        self.parent_interaction_tx = Some(tx);
+        self
     }
 
     /// Set the factory for creating recursive agent tools.
@@ -259,6 +292,12 @@ impl AgentManager {
 
         let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
         builder.set_cwd(&cwd);
+        // TODO(approval-inheritance): subagents auto-accept elevated tools
+        // until gap #6 wires real policy inheritance from the parent.
+        builder.set_approval_policy(Arc::new(crate::approval::AutoAcceptAllPolicy));
+        if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id.as_ref()) {
+            builder.set_interaction_sender(sub_tx);
+        }
 
         let factory = self.agent_tool_factory.lock().clone();
         let agent_handle = builder.pre_handle();
@@ -358,7 +397,9 @@ impl AgentManager {
 
         let text = extract_final_text(&messages);
 
-        record_transcript(id, &messages).await;
+        let transcript_path = record_transcript(id, &messages)
+            .await
+            .map(|p| p.display().to_string());
         entry.usage_at_pause = current_usage;
         entry.messages_at_pause = messages.len();
         self.agents.lock().await.push_back((id.to_string(), entry));
@@ -374,6 +415,7 @@ impl AgentManager {
             duration_ms: start.elapsed().as_millis() as u64,
             worktree_path: None,
             worktree_branch: None,
+            transcript_path,
         })
     }
 
@@ -415,6 +457,49 @@ impl AgentManager {
         } else {
             false
         }
+    }
+
+    /// Look up a stored agent by id and return a clone of its message log.
+    /// Used to seed an inheriting subagent's conversation. Errors when the
+    /// id isn't in the stored agents (still running, evicted, or never
+    /// spawned through this manager).
+    async fn fetch_stored_messages(&self, source_id: &str) -> crate::error::Result<Vec<Message>> {
+        let agents = self.agents.lock().await;
+        let entry = agents.iter().find(|(id, _)| id == source_id).ok_or_else(|| {
+            crate::error::Error::Other(format!(
+                "inherit_history_from: no stored agent with id '{source_id}' \
+                 (still running, evicted, or never spawned)"
+            ))
+        })?;
+        // Clone messages out from under the lock so we don't hold it across
+        // the await in `handle.messages()`.
+        let handle = entry.1.handle.clone();
+        drop(agents);
+        Ok(handle.messages().await.unwrap_or_default())
+    }
+
+    /// Build a per-subagent interaction sender that stamps `agent_id` and
+    /// forwards to this manager's parent channel. Returns `None` when no
+    /// parent channel is configured (subagent runs headless).
+    fn build_subagent_interaction_sender(
+        &self,
+        agent_id: &str,
+    ) -> Option<mpsc::Sender<InteractionRequest>> {
+        let parent_tx = self.parent_interaction_tx.as_ref()?.clone();
+        let agent_id = agent_id.to_string();
+        let (sub_tx, mut sub_rx) = mpsc::channel::<InteractionRequest>(8);
+        tokio::spawn(async move {
+            while let Some(mut req) = sub_rx.recv().await {
+                // Preserve a deeper subagent's id; only stamp if unset.
+                if req.agent_id.is_none() {
+                    req.agent_id = Some(agent_id.clone());
+                }
+                if parent_tx.send(req).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Some(sub_tx)
     }
 
     fn spawn_event_forwarder(
@@ -472,7 +557,9 @@ impl AgentManager {
         let (mut result, handle) = agent_result?;
 
         let messages = handle.messages().await.unwrap_or_default();
-        record_transcript(agent_id, &messages).await;
+        result.transcript_path = record_transcript(agent_id, &messages)
+            .await
+            .map(|p| p.display().to_string());
         result.worktree_path = wt_path;
         result.worktree_branch = wt_branch;
         result.duration_ms = start.elapsed().as_millis() as u64;
@@ -510,6 +597,12 @@ impl AgentManager {
 
         let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
         builder.set_cwd(&cwd);
+        // TODO(approval-inheritance): subagents auto-accept elevated tools
+        // until gap #6 wires real policy inheritance from the parent.
+        builder.set_approval_policy(Arc::new(crate::approval::AutoAcceptAllPolicy));
+        if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id.as_ref()) {
+            builder.set_interaction_sender(sub_tx);
+        }
 
         let factory = self.agent_tool_factory.lock().clone();
         // pre_handle() gives us a working handle connected to the same channel
@@ -528,12 +621,26 @@ impl AgentManager {
         }
 
         let tool_names = builder.tool_names();
-        let system_prompt = crate::prompts::build_subagent_prompt(
-            agent_type_suffix(&req.agent_type),
-            &tool_names,
-            &cwd,
-        );
+        let agent_prompt: String = if req.inherit_history_from.is_some() {
+            // Executor mode: append step-emission instructions so the model
+            // knows to mark step boundaries against the inherited plan.
+            format!(
+                "{}\n\n{}",
+                agent_type_suffix(&req.agent_type),
+                AGENT_EXECUTOR_PROMPT
+            )
+        } else {
+            agent_type_suffix(&req.agent_type).to_string()
+        };
+        let system_prompt =
+            crate::prompts::build_subagent_prompt(&agent_prompt, &tool_names, &cwd);
         builder.set_system_prompt(system_prompt);
+
+        // Seed inherited history before spawning if requested.
+        if let Some(ref source_id) = req.inherit_history_from {
+            let source_messages = self.fetch_stored_messages(source_id).await?;
+            builder.set_messages(source_messages);
+        }
 
         let handle = builder.spawn();
 
@@ -585,6 +692,8 @@ impl AgentManager {
             duration_ms: 0,
             worktree_path: None,
             worktree_branch: None,
+            // Filled in by `run_subagent` after `record_transcript`.
+            transcript_path: None,
         };
         Ok((result, handle))
     }
@@ -618,10 +727,17 @@ fn build_tool_set(
 ) -> Vec<BoxedTool> {
     let mut tools: Vec<BoxedTool> = match agent_type {
         AgentType::Explore | AgentType::Plan => {
+            // Plan also gets `submit_plan` so it can round-trip a structured
+            // plan through the host UI for approval.
+            let plan_extras = ["submit_plan"];
             let read_only = ["read", "glob", "grep", "list", "lsp"];
             all_tools
                 .iter()
-                .filter(|t| read_only.contains(&t.name()))
+                .filter(|t| {
+                    read_only.contains(&t.name())
+                        || (matches!(agent_type, AgentType::Plan)
+                            && plan_extras.contains(&t.name()))
+                })
                 .cloned()
                 .collect()
         }
@@ -646,6 +762,7 @@ fn build_tool_set(
 const AGENT_GENERAL_PROMPT: &str = include_str!("prompts/agent_general.md");
 const AGENT_EXPLORE_PROMPT: &str = include_str!("prompts/agent_explore.md");
 const AGENT_PLAN_PROMPT: &str = include_str!("prompts/agent_plan.md");
+const AGENT_EXECUTOR_PROMPT: &str = include_str!("prompts/agent_executor.md");
 
 fn agent_type_suffix(agent_type: &AgentType) -> &'static str {
     match agent_type {

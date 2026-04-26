@@ -1,5 +1,6 @@
 //! Agent event types
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tau_ai::{Message, Usage};
 
@@ -46,6 +47,14 @@ pub enum AgentEvent {
         is_error: bool,
     },
 
+    /// Approval gate decided how to handle a tool call. Emitted before the
+    /// tool runs (or, for rejected calls, in lieu of running it).
+    ToolApprovalResolved {
+        tool_call_id: String,
+        tool_name: String,
+        outcome: crate::approval::ToolApprovalOutcome,
+    },
+
     /// A turn completed
     TurnEnd {
         turn_number: u32,
@@ -78,6 +87,32 @@ pub enum AgentEvent {
         agent_id: String,
         description: String,
         event: Box<AgentEvent>,
+    },
+
+    /// A plan step started executing. Emitted by the `step_started` tool;
+    /// hosts pair with `PlanStepCompleted` by `step_id` to compute duration
+    /// and current-step state.
+    PlanStepStarted {
+        step_id: String,
+        activity: Option<String>,
+        started_at: DateTime<Utc>,
+    },
+
+    /// A plan step completed. The `summary` is whatever short note the
+    /// model wants to surface in the running view.
+    PlanStepCompleted {
+        step_id: String,
+        summary: Option<String>,
+        completed_at: DateTime<Utc>,
+    },
+
+    /// All plan steps completed. The agent may still emit a final summary
+    /// turn after this; the actual lifecycle terminator is `AgentEnd`. This
+    /// event is a UI milestone, not a stop signal — hosts should keep
+    /// listening for `AgentEnd` to know when the actor is idle.
+    PlanCompleted {
+        summary: String,
+        completed_at: DateTime<Utc>,
     },
 }
 

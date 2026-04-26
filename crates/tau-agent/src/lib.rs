@@ -5,6 +5,7 @@
 //! via channels (AgentHandle).
 
 pub(crate) mod actor;
+pub mod approval;
 pub mod builder;
 pub(crate) mod command;
 pub mod compaction;
@@ -18,6 +19,7 @@ pub mod interaction;
 pub(crate) mod logic;
 pub mod manager;
 pub(crate) mod overflow;
+pub mod plan;
 pub mod prompts;
 pub(crate) mod state;
 pub mod stream;
@@ -27,6 +29,10 @@ pub mod transcript;
 pub mod transport;
 pub(crate) mod worktree;
 
+pub use approval::{
+    ApprovalDecision, ApprovalPolicy, AutoAcceptAllPolicy, DefaultApprovalPolicy, RulePolicy,
+    ToolApprovalOutcome, ToolRisk, ToolRule,
+};
 pub use builder::AgentBuilder;
 pub use command::PromptResult;
 pub use compaction::{CompactionConfig, CompactionReason};
@@ -36,6 +42,7 @@ pub use error::Error;
 pub use events::AgentEvent;
 pub use handle::AgentHandle;
 pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
+pub use plan::{Plan, PlanFile, PlanFileOp, PlanFlag, PlanFlagSeverity, PlanStep};
 pub use tool::{
     BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
 };

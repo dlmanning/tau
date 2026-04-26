@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::run_actor;
+use crate::approval::{ApprovalPolicy, DefaultApprovalPolicy};
 use crate::config::AgentConfig;
 use crate::events::AgentEvent;
 use crate::handle::AgentHandle;
@@ -34,6 +35,7 @@ pub struct AgentBuilder {
     tools: Vec<BoxedTool>,
     server_tools: Vec<ServerTool>,
     interaction_tx: Option<mpsc::Sender<crate::interaction::InteractionRequest>>,
+    approval_policy: Arc<dyn ApprovalPolicy>,
     cwd: Option<PathBuf>,
     transform_context: Option<Arc<TransformContextFn>>,
     initial_messages: Vec<Message>,
@@ -65,6 +67,7 @@ impl AgentBuilder {
             tools: vec![],
             server_tools: vec![],
             interaction_tx: None,
+            approval_policy: Arc::new(DefaultApprovalPolicy),
             cwd: None,
             transform_context: None,
             initial_messages: vec![],
@@ -107,6 +110,11 @@ impl AgentBuilder {
         tx: mpsc::Sender<crate::interaction::InteractionRequest>,
     ) -> &mut Self {
         self.interaction_tx = Some(tx);
+        self
+    }
+
+    pub fn set_approval_policy(&mut self, policy: Arc<dyn ApprovalPolicy>) -> &mut Self {
+        self.approval_policy = policy;
         self
     }
 
@@ -213,6 +221,7 @@ impl AgentBuilder {
             cwd: self.cwd,
             file_access: Arc::new(ParkingMutex::new(crate::tool::FileAccessTracker::default())),
             interaction_tx: self.interaction_tx,
+            approval_policy: self.approval_policy,
             transform_context: self.transform_context,
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),

@@ -136,6 +136,51 @@ pub(crate) async fn handle_interaction_stdin(
 
                 let _ = request.response_tx.send(response);
             }
+            InteractionKind::SubmitPlan { plan } => {
+                println!("\nPlan submitted ({} step(s)):", plan.items.len());
+                for step in &plan.items {
+                    println!("  - {}: {}", step.id, step.title);
+                }
+                print!("Approve plan? [y/N]: ");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                let line = tokio::task::spawn_blocking(|| {
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input
+                })
+                .await
+                .unwrap_or_default();
+                let response = match line.trim().to_ascii_lowercase().as_str() {
+                    "y" | "yes" => InteractionResponse::PlanApproved { plan },
+                    _ => InteractionResponse::Rejected {
+                        reason: "User declined plan".into(),
+                    },
+                };
+                let _ = request.response_tx.send(response);
+            }
+            InteractionKind::ConfirmTool {
+                tool_name,
+                activity,
+                ..
+            } => {
+                println!("\nApproval required for {tool_name}: {activity}");
+                print!("Approve? [y/N]: ");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                let line = tokio::task::spawn_blocking(|| {
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input
+                })
+                .await
+                .unwrap_or_default();
+                let response = match line.trim().to_ascii_lowercase().as_str() {
+                    "y" | "yes" => InteractionResponse::Approved,
+                    _ => InteractionResponse::Rejected {
+                        reason: "User declined".into(),
+                    },
+                };
+                let _ = request.response_tx.send(response);
+            }
         }
     }
 }

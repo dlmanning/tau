@@ -1,8 +1,11 @@
 //! Internal command protocol between AgentHandle and the actor task.
 
+use std::sync::Arc;
+
 use tau_ai::{Content, Message, Model, ReasoningLevel};
 use tokio::sync::oneshot;
 
+use crate::approval::ApprovalPolicy;
 use crate::compaction::{CompactionConfig, CompactionReason};
 use crate::config::AgentConfig;
 use crate::conversation::Conversation;
@@ -27,6 +30,7 @@ pub(crate) enum Command {
     SetReasoning(ReasoningLevel),
     SetSystemPrompt(String),
     SetCompactionConfig(CompactionConfig),
+    SetApprovalPolicy(Arc<dyn ApprovalPolicy>),
 
     // === Conversation mutations (fire-and-forget) ===
     ClearMessages,

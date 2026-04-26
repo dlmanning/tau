@@ -3107,10 +3107,12 @@ dependencies = [
  "jsonschema",
  "parking_lot",
  "regex",
+ "schemars",
  "serde",
  "serde_json",
  "tau-agent",
  "tau-ai",
+ "tau-tools",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3184,6 +3186,7 @@ name = "tau-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "dirs",
  "futures",
  "glob",

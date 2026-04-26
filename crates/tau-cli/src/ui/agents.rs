@@ -211,7 +211,12 @@ impl TuiState {
                 }
                 _ => {}
             },
-            AgentEvent::TurnStart { .. } | AgentEvent::MessageStart { .. } => {}
+            AgentEvent::TurnStart { .. }
+            | AgentEvent::MessageStart { .. }
+            | AgentEvent::ToolApprovalResolved { .. }
+            | AgentEvent::PlanStepStarted { .. }
+            | AgentEvent::PlanStepCompleted { .. }
+            | AgentEvent::PlanCompleted { .. } => {}
         }
     }
 

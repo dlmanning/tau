@@ -10,6 +10,8 @@ mod list;
 pub mod plan;
 mod read;
 mod send_message;
+mod step;
+mod submit_plan;
 mod web_fetch;
 mod write;
 
@@ -22,6 +24,8 @@ pub use grep::GrepTool;
 pub use list::ListTool;
 pub use read::ReadTool;
 pub use send_message::SendMessageTool;
+pub use step::{PlanCompleteTool, StepCompletedTool, StepStartedTool};
+pub use submit_plan::SubmitPlanTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 

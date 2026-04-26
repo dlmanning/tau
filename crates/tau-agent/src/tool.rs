@@ -12,6 +12,7 @@ use tau_ai::{Content, Message};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::ToolRisk;
 use crate::events::AgentEvent;
 
 /// Send an event on a broadcast channel, ignoring errors (no receivers).
@@ -284,6 +285,18 @@ pub trait Tool: Send + Sync {
     /// Default: "Running {name}".
     fn activity_description(&self, _arguments: &Value) -> String {
         format!("Running {}", self.name())
+    }
+
+    /// Inherent risk of this invocation. The runtime feeds this to the
+    /// configured `ApprovalPolicy` to decide whether to auto-run, gate behind
+    /// user confirmation, or reject the call.
+    ///
+    /// Defaults to `Local` — file mutations and other locally-scoped side
+    /// effects. Override to `Safe` for read-only tools or `Elevated` for
+    /// tools whose effects extend beyond the local sandbox (shell, drafts,
+    /// network posts).
+    fn risk(&self, _arguments: &Value) -> ToolRisk {
+        ToolRisk::Local
     }
 
     /// Execute the tool with the given arguments and execution context.

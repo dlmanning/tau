@@ -323,6 +323,7 @@ pub(crate) async fn run_interactive(
                             cwd: None,
                             isolation: None,
                             depth: 0,
+                            inherit_history_from: None,
                         };
 
                         match manager.spawn_interactive(request).await {

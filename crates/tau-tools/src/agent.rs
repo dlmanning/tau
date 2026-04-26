@@ -30,6 +30,12 @@ struct AgentArgs {
     isolation: Option<String>,
     /// Run in background and return immediately
     run_in_background: Option<bool>,
+    /// Seed the new subagent with another stored agent's full message
+    /// history, then send `prompt` as a follow-up user message. Use this
+    /// for plan → execute handoffs: pass the plan subagent's id here so
+    /// the executor inherits the planner's investigation and the approved
+    /// plan as its own conversation history.
+    inherit_history_from: Option<String>,
 }
 
 /// Tool for spawning independent subagents.
@@ -76,7 +82,12 @@ impl Tool for AgentTool {
         "Spawn a subagent to handle a task independently, or send a message to a \
          previously spawned agent. The subagent makes its own API calls and has its \
          own tool set. Use for parallel work, codebase exploration, or isolating \
-         changes in a git worktree."
+         changes in a git worktree.\n\n\
+         To execute an approved plan with full context: spawn a `plan` subagent, \
+         note the `agent_id` from its result, then spawn a `general-purpose` \
+         subagent with `inherit_history_from: <plan_agent_id>` and a prompt like \
+         \"execute the approved plan.\" The executor sees the planner's \
+         investigation and the approved plan as its own history."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -129,6 +140,7 @@ impl Tool for AgentTool {
             cwd: args.cwd,
             isolation: args.isolation,
             depth: self.depth,
+            inherit_history_from: args.inherit_history_from,
         };
 
         if run_in_background {

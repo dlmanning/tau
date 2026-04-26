@@ -192,6 +192,7 @@ async fn dispatch_ui_message(
                             cwd: None,
                             isolation: None,
                             depth: 0,
+                            inherit_history_from: None,
                         };
 
                         match manager.spawn_interactive(request).await {
@@ -404,7 +405,7 @@ pub async fn run_tui(
 
                     request = interaction_rx.recv() => {
                         if let Some(request) = request {
-                            use tau_agent::interaction::InteractionKind;
+                            use tau_agent::interaction::{InteractionKind, InteractionResponse};
                             match request.kind {
                                 InteractionKind::AskQuestion { question, options } => {
                                     state.status = "Waiting for your choice...".to_string();
@@ -414,6 +415,24 @@ pub async fn run_tui(
                                         response_tx: request.response_tx,
                                         selector: SelectorState::default(),
                                     });
+                                }
+                                InteractionKind::ConfirmTool { tool_name, .. } => {
+                                    // Should not fire: main.rs installs AutoAcceptAllPolicy
+                                    // for the TUI until a confirm UI is built.
+                                    state.status =
+                                        format!("Unexpected ConfirmTool for {tool_name}");
+                                    let _ = request.response_tx.send(InteractionResponse::Rejected {
+                                        reason: "TUI confirm not implemented".into(),
+                                    });
+                                }
+                                InteractionKind::SubmitPlan { plan } => {
+                                    state.status = format!(
+                                        "Plan submitted ({} step(s)) — auto-approving (TUI plan UI not implemented)",
+                                        plan.items.len()
+                                    );
+                                    let _ = request
+                                        .response_tx
+                                        .send(InteractionResponse::PlanApproved { plan });
                                 }
                             }
                         }

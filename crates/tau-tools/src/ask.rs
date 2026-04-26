@@ -87,6 +87,7 @@ impl Tool for AskTool {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         let request = InteractionRequest {
+            agent_id: None,
             kind: InteractionKind::AskQuestion {
                 question: args.question,
                 options,
@@ -103,6 +104,7 @@ impl Tool for AskTool {
                 ToolResult::text(format!("User selected: {}", answer))
             }
             Ok(InteractionResponse::Cancelled) => ToolResult::error("User cancelled the question"),
+            Ok(_) => ToolResult::error("Unexpected interaction response"),
             Err(_) => ToolResult::error("Interaction channel closed"),
         }
     }

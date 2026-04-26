@@ -20,6 +20,7 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+chrono = { workspace = true }
 regex = { workspace = true }
 similar = { workspace = true }
 ignore = { workspace = true }

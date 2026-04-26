@@ -14,6 +14,7 @@ use tau_ai::Message;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::ApprovalPolicy;
 use crate::builder::TransformContextFn;
 use crate::config::AgentConfig;
 use crate::conversation::Conversation;
@@ -41,6 +42,7 @@ pub(crate) struct AgentState {
     pub cwd: Option<PathBuf>,
     pub file_access: Arc<Mutex<FileAccessTracker>>,
     pub interaction_tx: Option<mpsc::Sender<crate::interaction::InteractionRequest>>,
+    pub approval_policy: Arc<dyn ApprovalPolicy>,
     pub transform_context: Option<Arc<TransformContextFn>>,
     pub steering_queue: Vec<Message>,
     pub follow_up_queue: Vec<Message>,

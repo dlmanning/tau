@@ -457,6 +457,7 @@ mod tests {
             cwd: None,
             file_access: Arc::new(parking_lot::Mutex::new(FileAccessTracker::default())),
             interaction_tx: None,
+            approval_policy: Arc::new(crate::approval::DefaultApprovalPolicy),
             transform_context: None,
             steering_queue: vec![],
             follow_up_queue: vec![],
