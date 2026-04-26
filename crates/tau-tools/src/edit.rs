@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
+use tau_agent::events::AgentEvent;
 use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::fs;
 
@@ -117,6 +118,12 @@ impl Tool for EditTool {
 
         match fs::write(&path, &new_content).await {
             Ok(()) => {
+                ctx.progress.emit(AgentEvent::FileChanged {
+                    path: path.clone(),
+                    before: Some(content.clone()),
+                    after: Some(new_content.clone()),
+                    tool_call_id: ctx.progress.tool_call_id().to_string(),
+                });
                 let result = if replace_all && occurrences > 1 {
                     format!(
                         "Successfully replaced {} occurrences in {}.\n\nDiff:\n{}",

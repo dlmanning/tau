@@ -453,6 +453,7 @@ fn event_type_name(event: &AgentEvent) -> &'static str {
         AgentEvent::PlanStepStarted { .. } => "PlanStepStarted",
         AgentEvent::PlanStepCompleted { .. } => "PlanStepCompleted",
         AgentEvent::PlanCompleted { .. } => "PlanCompleted",
+        AgentEvent::FileChanged { .. } => "FileChanged",
         AgentEvent::TurnEnd { .. } => "TurnEnd",
         AgentEvent::AgentEnd { .. } => "AgentEnd",
         AgentEvent::CompactionStart { .. } => "CompactionStart",

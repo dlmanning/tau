@@ -216,7 +216,8 @@ impl TuiState {
             | AgentEvent::ToolApprovalResolved { .. }
             | AgentEvent::PlanStepStarted { .. }
             | AgentEvent::PlanStepCompleted { .. }
-            | AgentEvent::PlanCompleted { .. } => {}
+            | AgentEvent::PlanCompleted { .. }
+            | AgentEvent::FileChanged { .. } => {}
         }
     }
 

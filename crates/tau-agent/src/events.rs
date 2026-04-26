@@ -1,5 +1,7 @@
 //! Agent event types
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tau_ai::{Message, Usage};
@@ -113,6 +115,20 @@ pub enum AgentEvent {
     PlanCompleted {
         summary: String,
         completed_at: DateTime<Utc>,
+    },
+
+    /// A file-mutating tool reports a before/after snapshot. Hosts feed
+    /// these into a diff overlay (e.g. `tau_tools::diff::SessionDiffOverlay`)
+    /// to render the cumulative session diff. `before = None` means the file
+    /// did not exist (Add); `after = None` means it was removed (Delete).
+    /// Binary files are intentionally not reported.
+    FileChanged {
+        path: PathBuf,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        tool_call_id: String,
     },
 }
 

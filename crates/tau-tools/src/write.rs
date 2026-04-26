@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tau_agent::events::AgentEvent;
 use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::fs;
 
@@ -97,12 +98,34 @@ impl Tool for WriteTool {
             }
         }
 
+        // Snapshot the prior content (None only if the file did not exist)
+        // so we can emit a baseline-aware FileChanged event after the write.
+        // For other read errors (permissions, transient I/O) we skip the
+        // event entirely — emitting `before: None` would mislead the diff
+        // overlay into reporting an Add for what was actually a Modify with
+        // an unknown baseline.
+        let (before, emit_changed) = match fs::read_to_string(&path).await {
+            Ok(s) => (Some(s), true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
+            Err(_) => (None, false),
+        };
+
         match fs::write(&path, &args.content).await {
-            Ok(()) => ToolResult::text(format!(
-                "Successfully wrote {} bytes to {}",
-                args.content.len(),
-                args.path
-            )),
+            Ok(()) => {
+                if emit_changed {
+                    ctx.progress.emit(AgentEvent::FileChanged {
+                        path: path.clone(),
+                        before,
+                        after: Some(args.content.clone()),
+                        tool_call_id: ctx.progress.tool_call_id().to_string(),
+                    });
+                }
+                ToolResult::text(format!(
+                    "Successfully wrote {} bytes to {}",
+                    args.content.len(),
+                    args.path
+                ))
+            }
             Err(e) => ToolResult::error(format!("Failed to write file: {}", e)),
         }
     }

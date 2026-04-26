@@ -184,6 +184,17 @@ impl ProgressSender {
         }
     }
 
+    /// The id of the tool call this sender belongs to. Useful when a tool
+    /// emits an `AgentEvent` variant that needs to reference its own call.
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    /// The name of the tool this sender belongs to.
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
     /// Send a progress update.
     pub fn send(&self, content: impl Into<String>) {
         send_event(

@@ -3,6 +3,7 @@
 mod agent;
 mod ask;
 mod bash;
+pub mod diff;
 mod edit;
 mod glob;
 mod grep;
