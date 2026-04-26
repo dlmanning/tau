@@ -1,0 +1,32 @@
+[package]
+name = "tau-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Top-level session manager for tau-agent: persist, list, hibernate, resume"
+
+[dependencies]
+tau-ai = { workspace = true }
+tau-agent = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tau-agent = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

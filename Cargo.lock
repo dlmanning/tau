@@ -3182,6 +3182,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tau-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tau-agent",
+ "tau-ai",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tau-tools"
 version = "0.1.0"
 dependencies = [

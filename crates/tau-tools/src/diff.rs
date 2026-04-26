@@ -10,8 +10,14 @@
 //! **Live-session only.** `FileChanged` events live on the broadcast
 //! channel and are not stored in `conversation.messages`. A subscriber that
 //! attaches mid-session has no source of truth to backfill from, so its
-//! overlay starts empty. Session resume across a restart is gap #7's
-//! (`tau-session`) job — it persists events alongside the conversation.
+//! overlay starts empty.
+//!
+//! Session resume across a restart is partially supported by `tau-session`
+//! (gap #7) for messages, but `FileChanged` events are *not* persisted
+//! there yet — overlay state is lost across hibernate/activate. A future
+//! `file_changed.jsonl` side log in `tau-session` could replay events into
+//! the overlay on activation; until then, hosts re-derive cumulative diffs
+//! by re-reading the working tree against the project's git base.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

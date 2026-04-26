@@ -4,6 +4,7 @@ members = [
     "crates/tau-ai",
     "crates/tau-agent",
     "crates/tau-tools",
+    "crates/tau-session",
     "crates/tau-cli",
     "xtask",
 ]
@@ -65,3 +66,4 @@ parking_lot = "0.12"
 tau-ai = { path = "crates/tau-ai" }
 tau-agent = { path = "crates/tau-agent" }
 tau-tools = { path = "crates/tau-tools" }
+tau-session = { path = "crates/tau-session" }
