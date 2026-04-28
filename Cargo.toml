@@ -5,6 +5,7 @@ members = [
     "crates/tau-agent",
     "crates/tau-tools",
     "crates/tau-session",
+    "crates/tau-desk",
     "crates/tau-cli",
     "xtask",
 ]
@@ -21,6 +22,7 @@ rust-version = "1.85"
 tokio = { version = "1.51", features = ["full"] }
 tokio-stream = { version = "0.1.18", features = ["full"] }
 tokio-util = "0.7.18"
+cron = "0.16"
 futures = "0.3.32"
 async-stream = "0.3.6"
 async-trait = "0.1"
@@ -67,3 +69,4 @@ tau-ai = { path = "crates/tau-ai" }
 tau-agent = { path = "crates/tau-agent" }
 tau-tools = { path = "crates/tau-tools" }
 tau-session = { path = "crates/tau-session" }
+tau-desk = { path = "crates/tau-desk" }
