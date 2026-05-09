@@ -148,7 +148,7 @@ pub(crate) async fn handle_interaction_stdin(
             }
             InteractionKind::Typed { schema_id, payload } => match schema_id.as_str() {
                 "plan.submit" => {
-                    let plan: tau_agent::Plan = match serde_json::from_value(payload) {
+                    let plan: tau_tools::Plan = match serde_json::from_value(payload) {
                         Ok(p) => p,
                         Err(e) => {
                             let _ = request.response_tx.send(InteractionResponse::Rejected {

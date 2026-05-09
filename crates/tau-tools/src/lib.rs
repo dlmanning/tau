@@ -14,7 +14,6 @@ pub mod plan;
 mod read;
 mod send_message;
 mod subagent_report;
-mod submit_plan;
 mod web_fetch;
 mod write;
 
@@ -25,10 +24,10 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListTool;
+pub use plan::{Plan, PlanFile, PlanFileOp, PlanFlag, PlanFlagSeverity, PlanStep, SubmitPlanTool};
 pub use read::ReadTool;
 pub use send_message::SendMessageTool;
 pub use subagent_report::SubagentReportTool;
-pub use submit_plan::SubmitPlanTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 

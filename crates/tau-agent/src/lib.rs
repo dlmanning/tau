@@ -19,7 +19,6 @@ pub mod interaction;
 pub(crate) mod logic;
 pub mod manager;
 pub(crate) mod overflow;
-pub mod plan;
 pub mod prompts;
 pub(crate) mod state;
 pub mod stream;
@@ -42,7 +41,6 @@ pub use error::Error;
 pub use events::{AgentEvent, ConsoleLevel, ConsoleLine, DeferredOpKind, SubagentOutcome};
 pub use handle::AgentHandle;
 pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
-pub use plan::{Plan, PlanFile, PlanFileOp, PlanFlag, PlanFlagSeverity, PlanStep};
 pub use tool::{
     BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
 };

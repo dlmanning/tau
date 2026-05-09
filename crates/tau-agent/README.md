@@ -32,7 +32,9 @@ AgentHandle ──channels──▶ actor.rs (async I/O loop)
 | `AgentHandle` | `handle` | Clone + Send + Sync handle. All interaction goes through this. |
 | `AgentConfig` | `config` | Model, reasoning level, max turns, compaction settings. |
 | `Tool` | `tool` | Trait for tool implementations: name, schema, concurrency, execute. |
-| `AgentEvent` | `events` | 14-variant enum broadcast to subscribers (turns, messages, tools, compaction, errors, subagents). |
+| `AgentEvent` | `events` | Broadcast event enum (~21 variants): lifecycle, messages, tools, compaction, errors, subagents, file changes, deferred conversation ops. |
+| `InteractionRequest` | `interaction` | Tool → host UI round-trip. Two shapes: `AskQuestion` (untyped, returns `Answer`) and `Typed { schema_id, payload }` (host renders by `schema_id`, replies with `Approved { payload }` / `Rejected` / `Cancelled`). The runtime treats `payload` as opaque JSON; schemas (e.g. `plan.submit`) and their typed payload structs live with the tools that emit them (e.g. `tau_tools::Plan`). |
+| `ApprovalPolicy` | `approval` | Trait that classifies a pending tool call into `Auto` / `Gate` / `Reject`. Built-in policies: `DefaultApprovalPolicy`, `AutoAcceptAllPolicy`, `RulePolicy`. |
 | `AgentManager` | `manager` | Subagent lifecycle: spawn foreground/background, resume, evict. |
 | `Transport` | `transport` | Trait abstracting LLM calls. `ProviderTransport` handles Anthropic/OpenAI/Google. |
 
@@ -47,13 +49,15 @@ AgentHandle ──channels──▶ actor.rs (async I/O loop)
 
 ## Subagents
 
-`AgentManager` spawns independent agent instances, each with their own actor loop:
+`AgentManager` spawns independent agent instances, each with their own actor loop. Each subagent is itself a complete agent satisfying the same boundary contract as the root — events flow up to the parent's broadcast wrapped as `Subagent { event }`, alongside parent-timeline events (`SubagentStarted`, `SubagentCompleted`).
 
 - **Foreground** — blocks the parent until completion.
 - **Background** — returns immediately; posts a `FollowUp` message to the parent on completion.
 - **Resume** — rehydrate a stored idle agent with a new prompt via `send()`.
 
 Agent types: `GeneralPurpose`, `Explore` (read-only tools), `Plan` (read-only tools). Max nesting depth: 3. Max turns per subagent: 200.
+
+**Plan execution** uses the recursive-agent pattern: a `Plan` subagent investigates and submits a plan via the `plan.submit` typed interaction; the host approves (optionally editing the body); a `GeneralPurpose` subagent is spawned with `SpawnRequest::inherit_history_from = <planner_agent_id>` so it sees the planner's investigation and the approved plan as its own conversation history. There is no separate plan-execution mechanism in the runtime.
 
 ## Testing
 
@@ -84,6 +88,7 @@ Available mocks: `MockTransport`, `TextTransport`, `ToolCallTransport`, `SlowTra
 | Module | Visibility | Purpose |
 |--------|-----------|---------|
 | `actor` | crate | Async event loop, `StepPhase` state machine |
+| `approval` | pub | `ApprovalPolicy` trait, `ToolRisk`, `ApprovalDecision`, built-in policies |
 | `builder` | pub | `AgentBuilder` setup and spawn |
 | `command` | crate | `Command` enum (handle → actor protocol) |
 | `compaction` | pub | Context summarization and token management |
@@ -91,9 +96,9 @@ Available mocks: `MockTransport`, `TextTransport`, `ToolCallTransport`, `SlowTra
 | `context` | pub | Hierarchical context file loading (AGENTS.md / CLAUDE.md) |
 | `conversation` | pub | `Conversation` state container |
 | `error` | pub | Error types |
-| `events` | pub | `AgentEvent` enum (14 variants) |
+| `events` | pub | `AgentEvent` enum (broadcast events) |
 | `handle` | pub | `AgentHandle` — public API |
-| `interaction` | pub | Tool ↔ UI request/reply protocol |
+| `interaction` | pub | Tool ↔ UI request/reply protocol (`AskQuestion`, `Typed { schema_id, payload }`) |
 | `logic` | crate | Sync decision logic (no I/O) |
 | `manager` | pub | `AgentManager` — subagent lifecycle |
 | `overflow` | crate | Context overflow detection (30+ provider patterns) |

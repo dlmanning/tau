@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use tau_agent::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
 use tau_agent::test_utils::*;
-use tau_agent::{AgentBuilder, AgentEvent, BoxedTool, Plan, PlanFile, PlanFileOp, PlanStep};
+use tau_agent::{AgentBuilder, AgentEvent, BoxedTool};
 use tau_ai::Message;
-use tau_tools::SubmitPlanTool;
+use tau_tools::{Plan, PlanFile, PlanFileOp, PlanStep, SubmitPlanTool};
 
 fn sample_plan() -> Plan {
     Plan {
