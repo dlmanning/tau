@@ -21,7 +21,7 @@ use crate::events::AgentEvent;
 use crate::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
 use crate::logic::{self, FollowUpAction, ResponseAction};
 use crate::overflow::is_context_overflow;
-use crate::state::{AgentState, ToolCall};
+use crate::state::{AgentState, ConversationOp, ToolCall};
 use crate::stream::{StreamOutcome, StreamReducer};
 use crate::tool::{ExecutionContext, ProgressSender, ToolResult, send_event};
 use crate::tool_executor::run_single_tool;
@@ -115,9 +115,16 @@ pub(crate) async fn run_actor(
     let mut phase = StepPhase::Idle;
     let mut prompt_reply: Option<tokio::sync::oneshot::Sender<PromptResult>> = None;
     let mut turn_number: u32 = 0;
-    // Per-prompt cancellation token. Cloned from state.cancel at prompt start.
-    // handle.abort() cancels the token inside state.cancel, which is the same
-    // object the actor cloned from.
+    // Per-prompt cancellation token. Cloned from state.cancel at prompt start
+    // under the shared mutex (see handle_idle_command for Command::Prompt),
+    // so handle.abort() always cancels the same token the actor's local
+    // copy is watching. A post-run window remains: between a run's `AgentEnd`
+    // and the next prompt's token swap, the shared mutex still holds the
+    // previous run's (now-stale) token, and an abort issued in that window
+    // cancels nothing observable. Hosts that need to confirm an abort took
+    // effect should check whether the run's terminal event is `Error` (their
+    // abort was honoured) or `AgentEnd` (the run ended naturally; the abort,
+    // if any, was a no-op).
     let mut prompt_cancel = CancellationToken::new();
 
     loop {
@@ -469,6 +476,17 @@ pub(crate) async fn run_actor(
             StepPhase::Done(result) => {
                 state.is_running.store(false, Ordering::Release);
                 state.conversation.is_streaming = false;
+
+                // Drain any conversation mutations that arrived mid-prompt
+                // BEFORE emitting AgentEnd, so consumers reading messages()
+                // on AgentEnd see the post-drain state.
+                if !state.pending_conversation_ops.is_empty() {
+                    let ops = std::mem::take(&mut state.pending_conversation_ops);
+                    for op in ops {
+                        apply_conversation_op(&mut state, op);
+                    }
+                }
+
                 send_event(
                     &state.event_tx,
                     AgentEvent::AgentEnd {
@@ -500,10 +518,16 @@ fn handle_idle_command(
             *prompt_reply = Some(reply);
             state.is_running.store(true, Ordering::Release);
             // Replace the token inside the shared mutex with a fresh one.
-            // handle.abort() cancels this same token via Arc<Mutex<>>.
+            // handle.abort() cancels this same token via Arc<Mutex<>>. The
+            // local clone and the shared replacement happen under one lock
+            // hold so a concurrent abort can't slip in between them and
+            // cancel a token the actor's local never observes.
             let fresh = CancellationToken::new();
-            *prompt_cancel = fresh.clone();
-            *state.cancel.lock() = fresh;
+            {
+                let mut guard = state.cancel.lock();
+                *prompt_cancel = fresh.clone();
+                *guard = fresh;
+            }
             *turn_number = 0;
             state.conversation.is_streaming = true;
             state.conversation.error = None;
@@ -527,6 +551,20 @@ fn handle_idle_command(
                 reply: Some(reply),
                 resume_after: None,
             }
+        }
+
+        // Conversation mutations are safe at idle — apply immediately.
+        Command::ClearMessages => {
+            apply_conversation_op(state, ConversationOp::Clear);
+            StepPhase::Idle
+        }
+        Command::SetMessages(msgs) => {
+            apply_conversation_op(state, ConversationOp::Set(msgs));
+            StepPhase::Idle
+        }
+        Command::SetPreviousSummary(s) => {
+            apply_conversation_op(state, ConversationOp::SetPreviousSummary(s));
+            StepPhase::Idle
         }
 
         other => {
@@ -569,27 +607,70 @@ fn handle_busy_command(state: &mut AgentState, cmd: Command) {
             });
         }
 
-        // Conversation mutations
+        // Conversation mutations: BUFFER, don't apply.
+        //
+        // Mid-prompt clear/set would wipe the assistant message holding the
+        // in-flight tool_use blocks, leaving orphan tool_result messages
+        // that providers reject. Defer until the prompt finishes; the actor
+        // drains the queue in the `Done` arm before emitting `AgentEnd`.
         Command::ClearMessages => {
-            state.conversation.messages.clear();
-            state.conversation.total_usage = Default::default();
-            state.conversation.previous_summary = None;
-            state.file_access.lock().clear();
+            state.pending_conversation_ops.push(ConversationOp::Clear);
+            send_event(
+                &state.event_tx,
+                AgentEvent::ConversationOpDeferred {
+                    kind: crate::events::DeferredOpKind::Clear,
+                },
+            );
         }
         Command::SetMessages(msgs) => {
             state
-                .file_access
-                .lock()
-                .rebuild_from_messages(&msgs, &state.cwd);
-            state.conversation.messages = msgs;
+                .pending_conversation_ops
+                .push(ConversationOp::Set(msgs));
+            send_event(
+                &state.event_tx,
+                AgentEvent::ConversationOpDeferred {
+                    kind: crate::events::DeferredOpKind::SetMessages,
+                },
+            );
         }
-        Command::SetPreviousSummary(s) => state.conversation.previous_summary = s,
+        Command::SetPreviousSummary(s) => {
+            state
+                .pending_conversation_ops
+                .push(ConversationOp::SetPreviousSummary(s));
+            send_event(
+                &state.event_tx,
+                AgentEvent::ConversationOpDeferred {
+                    kind: crate::events::DeferredOpKind::SetPreviousSummary,
+                },
+            );
+        }
 
         Command::Compact { reply, .. } => {
             let _ = reply.send(PromptResult {
                 result: Err(crate::error::Error::Busy),
             });
         }
+    }
+}
+
+/// Apply a single conversation op to state. Used both at idle (immediate)
+/// and during the `Done` phase drain (deferred mid-prompt ops).
+fn apply_conversation_op(state: &mut AgentState, op: ConversationOp) {
+    match op {
+        ConversationOp::Clear => {
+            state.conversation.messages.clear();
+            state.conversation.total_usage = Default::default();
+            state.conversation.previous_summary = None;
+            state.file_access.lock().clear();
+        }
+        ConversationOp::Set(msgs) => {
+            state
+                .file_access
+                .lock()
+                .rebuild_from_messages(&msgs, &state.cwd);
+            state.conversation.messages = msgs;
+        }
+        ConversationOp::SetPreviousSummary(s) => state.conversation.previous_summary = s,
     }
 }
 
@@ -657,12 +738,13 @@ fn synth_rejection(tc: &ToolCall, reason: &str) -> (String, String, ToolResult) 
     )
 }
 
-/// Classify each tool call against the configured policy. Sends `ConfirmTool`
-/// interaction requests for `Gate` decisions and returns the receivers.
+/// Classify each tool call against the configured policy. Sends a
+/// `Typed { schema_id: "tool.confirm", .. }` interaction request for each
+/// `Gate` decision and returns the receivers.
 ///
 /// Returns `None` if the prompt was cancelled while waiting to enqueue a
-/// `ConfirmTool` request on a saturated interaction channel — the caller
-/// should transition to `Done`.
+/// confirm request on a saturated interaction channel — the caller should
+/// transition to `Done`.
 async fn classify_tool_calls(
     state: &AgentState,
     tool_calls: &[ToolCall],
@@ -732,12 +814,15 @@ async fn classify_tool_calls(
                 let (response_tx, response_rx) = oneshot::channel();
                 let request = InteractionRequest {
                     agent_id: None,
-                    kind: InteractionKind::ConfirmTool {
-                        tool_call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
-                        arguments: tc.args.clone(),
-                        activity,
-                        risk,
+                    kind: InteractionKind::Typed {
+                        schema_id: "tool.confirm".to_string(),
+                        payload: serde_json::json!({
+                            "tool_call_id": tc.id.clone(),
+                            "tool_name": tc.name.clone(),
+                            "arguments": tc.args.clone(),
+                            "activity": activity,
+                            "risk": risk,
+                        }),
                     },
                     response_tx,
                 };
@@ -790,11 +875,11 @@ fn apply_gate_response(
     dispatch: &mut HashSet<usize>,
 ) {
     let outcome = match resp {
-        Ok(InteractionResponse::Approved) => Ok(()),
+        Ok(InteractionResponse::Approved { .. }) => Ok(()),
         Ok(InteractionResponse::Rejected { reason }) => Err(reason),
         Ok(InteractionResponse::Cancelled) => Err("cancelled".to_string()),
-        Ok(InteractionResponse::Answer(_)) | Ok(InteractionResponse::PlanApproved { .. }) => {
-            Err("unexpected response to ConfirmTool".to_string())
+        Ok(InteractionResponse::Answer(_)) => {
+            Err("unexpected response to tool.confirm".to_string())
         }
         Err(_) => Err("interaction channel closed".to_string()),
     };

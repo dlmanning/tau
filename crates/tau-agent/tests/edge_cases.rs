@@ -128,7 +128,7 @@ async fn follow_up_during_tool_execution() {
     let rx = handle.prompt("go").await.unwrap();
 
     // Immediately post a follow-up (it will arrive while tools execute or during DrainFollowUps)
-    handle.follow_up(Message::user("follow-up message"));
+    handle.follow_up(Message::user("follow-up message")).await.unwrap();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
     assert!(result.is_ok());
@@ -147,8 +147,8 @@ async fn dequeue_mode_one_at_a_time() {
     let handle = AgentBuilder::new(cfg, TextTransport::create("ok")).spawn();
 
     // Queue up 2 follow-ups, then prompt
-    handle.follow_up(Message::user("fu1"));
-    handle.follow_up(Message::user("fu2"));
+    handle.follow_up(Message::user("fu1")).await.unwrap();
+    handle.follow_up(Message::user("fu2")).await.unwrap();
     handle.expect_follow_up();
     handle.expect_follow_up();
 
@@ -181,7 +181,7 @@ async fn steer_while_idle_is_not_lost() {
     let handle = builder.spawn();
 
     // Steer while idle — the message should be queued
-    handle.steer(Message::user("pre-steer"));
+    handle.steer(Message::user("pre-steer")).await.unwrap();
     // Now prompt — DrainFollowUps should pick up the steering message
     handle.prompt_and_wait("hello").await.unwrap();
 

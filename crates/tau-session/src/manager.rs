@@ -461,18 +461,6 @@ async fn handle_event(
                 info: Box::new(info),
             });
         }
-        AgentEvent::PlanStepStarted { step_id, .. } => {
-            let mut info = storage.read_info(id).await?;
-            info.current_step = Some(step_id.clone());
-            info.last_activity = Utc::now();
-            storage.write_info(&info).await?;
-        }
-        AgentEvent::PlanStepCompleted { .. } | AgentEvent::PlanCompleted { .. } => {
-            let mut info = storage.read_info(id).await?;
-            info.current_step = None;
-            info.last_activity = Utc::now();
-            storage.write_info(&info).await?;
-        }
         AgentEvent::AgentStart => {
             let mut info = storage.read_info(id).await?;
             info.status = SessionStatus::Running;

@@ -19,7 +19,15 @@ pub(crate) async fn run_command(
 
     let event_handle = tokio::spawn(async move {
         let mut last_text_len = 0;
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "command-mode event stream lagged");
+                    continue;
+                }
+            };
             match event {
                 AgentEvent::MessageUpdate { message } => {
                     let text = message.text();
@@ -138,51 +146,71 @@ pub(crate) async fn handle_interaction_stdin(
 
                 let _ = request.response_tx.send(response);
             }
-            InteractionKind::SubmitPlan { plan } => {
-                println!("\nPlan submitted ({} step(s)):", plan.items.len());
-                for step in &plan.items {
-                    println!("  - {}: {}", step.id, step.title);
+            InteractionKind::Typed { schema_id, payload } => match schema_id.as_str() {
+                "plan.submit" => {
+                    let plan: tau_agent::Plan = match serde_json::from_value(payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = request.response_tx.send(InteractionResponse::Rejected {
+                                reason: format!("Invalid plan payload: {e}"),
+                            });
+                            continue;
+                        }
+                    };
+                    println!("\nPlan submitted ({} step(s)):", plan.items.len());
+                    for step in &plan.items {
+                        println!("  - {}: {}", step.id, step.title);
+                    }
+                    print!("Approve plan? [y/N]: ");
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    let line = tokio::task::spawn_blocking(|| {
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).ok();
+                        input
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let response = match line.trim().to_ascii_lowercase().as_str() {
+                        "y" | "yes" => InteractionResponse::Approved { payload: None },
+                        _ => InteractionResponse::Rejected {
+                            reason: "User declined plan".into(),
+                        },
+                    };
+                    let _ = request.response_tx.send(response);
                 }
-                print!("Approve plan? [y/N]: ");
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-                let line = tokio::task::spawn_blocking(|| {
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    input
-                })
-                .await
-                .unwrap_or_default();
-                let response = match line.trim().to_ascii_lowercase().as_str() {
-                    "y" | "yes" => InteractionResponse::PlanApproved { plan },
-                    _ => InteractionResponse::Rejected {
-                        reason: "User declined plan".into(),
-                    },
-                };
-                let _ = request.response_tx.send(response);
-            }
-            InteractionKind::ConfirmTool {
-                tool_name,
-                activity,
-                ..
-            } => {
-                println!("\nApproval required for {tool_name}: {activity}");
-                print!("Approve? [y/N]: ");
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-                let line = tokio::task::spawn_blocking(|| {
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    input
-                })
-                .await
-                .unwrap_or_default();
-                let response = match line.trim().to_ascii_lowercase().as_str() {
-                    "y" | "yes" => InteractionResponse::Approved,
-                    _ => InteractionResponse::Rejected {
-                        reason: "User declined".into(),
-                    },
-                };
-                let _ = request.response_tx.send(response);
-            }
+                "tool.confirm" => {
+                    let tool_name = payload
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let activity = payload
+                        .get("activity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    println!("\nApproval required for {tool_name}: {activity}");
+                    print!("Approve? [y/N]: ");
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    let line = tokio::task::spawn_blocking(|| {
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).ok();
+                        input
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let response = match line.trim().to_ascii_lowercase().as_str() {
+                        "y" | "yes" => InteractionResponse::Approved { payload: None },
+                        _ => InteractionResponse::Rejected {
+                            reason: "User declined".into(),
+                        },
+                    };
+                    let _ = request.response_tx.send(response);
+                }
+                other => {
+                    let _ = request.response_tx.send(InteractionResponse::Rejected {
+                        reason: format!("Unknown typed interaction schema: {other}"),
+                    });
+                }
+            },
         }
     }
 }

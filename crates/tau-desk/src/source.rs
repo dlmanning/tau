@@ -88,9 +88,20 @@ impl SourceRegistry {
         if let Some(mut rx) = source.watch() {
             let tx = self.watch_tx.clone();
             tokio::spawn(async move {
-                while let Ok(notice) = rx.recv().await {
-                    if tx.send(notice).is_err() {
-                        break;
+                loop {
+                    match rx.recv().await {
+                        Ok(notice) => {
+                            if tx.send(notice).is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                dropped = n,
+                                "source watch stream lagged; some change notices were not forwarded"
+                            );
+                        }
                     }
                 }
             });

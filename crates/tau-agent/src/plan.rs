@@ -2,11 +2,13 @@
 //!
 //! Producers (the `submit_plan` tool) build a [`Plan`] and round-trip it
 //! through the [`InteractionRequest`](crate::interaction::InteractionRequest)
-//! channel as [`InteractionKind::SubmitPlan`](crate::interaction::InteractionKind::SubmitPlan).
-//! The host renders, optionally edits, and replies with
-//! [`InteractionResponse::PlanApproved`](crate::interaction::InteractionResponse::PlanApproved)
-//! carrying the (possibly-edited) body, or [`InteractionResponse::Rejected`]
-//! with a reason the model can revise against.
+//! channel as a `Typed { schema_id: "plan.submit", payload }` request whose
+//! payload is the serialized `Plan`. The host renders, optionally edits, and
+//! replies with
+//! [`InteractionResponse::Approved`](crate::interaction::InteractionResponse::Approved)
+//! — `payload: Some(value)` carrying the edited body, or `None` to accept
+//! the original — or [`InteractionResponse::Rejected`] with a reason the
+//! model can revise against.
 //!
 //! [`InteractionResponse::Rejected`]: crate::interaction::InteractionResponse::Rejected
 

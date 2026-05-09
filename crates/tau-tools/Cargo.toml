@@ -25,6 +25,8 @@ regex = { workspace = true }
 similar = { workspace = true }
 ignore = { workspace = true }
 glob = { workspace = true }
+itertools = { workspace = true }
+strsim = { workspace = true }
 htmd = { workspace = true }
 dirs = { workspace = true }
 reqwest = { workspace = true }

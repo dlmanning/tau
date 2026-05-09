@@ -93,15 +93,19 @@ impl Tool for AgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent to handle a task independently, or send a message to a \
-         previously spawned agent. The subagent makes its own API calls and has its \
-         own tool set. Use for parallel work, codebase exploration, or isolating \
-         changes in a git worktree.\n\n\
-         To execute an approved plan with full context: spawn a `plan` subagent, \
-         note the `agent_id` from its result, then spawn a `general-purpose` \
-         subagent with `inherit_history_from: <plan_agent_id>` and a prompt like \
+        "Spawn a subagent (or follow up with a previously spawned one). This is \
+         also the only mechanism for executing an approved plan: there is no \
+         separate plan-execution tool. Plans are executed by spawning an \
+         executor subagent that inherits the planner's history.\n\n\
+         To execute an approved plan: take the `agent_id` of the `plan` \
+         subagent that produced it, spawn a `general-purpose` subagent with \
+         `inherit_history_from: <plan_agent_id>` and a prompt such as \
          \"execute the approved plan.\" The executor sees the planner's \
-         investigation and the approved plan as its own history."
+         investigation, the approved plan, and the user's intent as its own \
+         conversation history.\n\n\
+         Use cases beyond plan execution: parallel work that benefits from \
+         isolated contexts, codebase exploration that would otherwise pollute \
+         the parent's context, or running edits in a git worktree."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

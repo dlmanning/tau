@@ -134,7 +134,7 @@ async fn config_mutation_during_streaming_takes_effect_next_turn() {
     let handle = AgentBuilder::new(test_config(), SlowTransport::create(100)).spawn();
     let rx = handle.prompt("go").await.unwrap();
 
-    handle.set_reasoning(tau_ai::ReasoningLevel::High);
+    handle.set_reasoning(tau_ai::ReasoningLevel::High).await.unwrap();
     let _ = rx.await;
 
     let cfg = handle.config().await.unwrap();
@@ -217,7 +217,7 @@ async fn steer_arrives_during_slow_stream() {
     // The steer (urgent channel) should be queued and processed after
     // the first turn completes — triggering a second transport call.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    handle.steer(Message::user("urgent redirect"));
+    handle.steer(Message::user("urgent redirect")).await.unwrap();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
     assert!(result.is_ok(), "should complete");

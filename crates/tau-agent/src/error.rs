@@ -20,6 +20,18 @@ pub enum Error {
     #[error("Agent is busy processing another prompt")]
     Busy,
 
+    /// The actor task panicked. The string carries the panic payload (or a
+    /// best-effort description if it was not a string).
+    #[error("Actor panicked: {0}")]
+    ActorPanic(String),
+
+    /// A non-blocking `try_X` send was rejected because the command channel
+    /// was full. Distinct from `ActorPanic` / `Other` (channel closed):
+    /// callers can retry a `ChannelFull` after a brief delay or fall back
+    /// to the awaiting `X.await` variant.
+    #[error("Command channel `{channel}` is full")]
+    ChannelFull { channel: &'static str },
+
     /// A generic agent error
     #[error("{0}")]
     Other(String),

@@ -6,9 +6,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::ApprovalPolicy;
@@ -37,6 +38,14 @@ pub struct AgentHandle {
     pub(crate) cancel: Arc<Mutex<CancellationToken>>,
     pub(crate) is_running: Arc<AtomicBool>,
     pub(crate) pending_follow_ups: Arc<AtomicU32>,
+    /// Set by the actor's catch_unwind wrapper if the actor task panics.
+    /// `None` while the actor is alive or after a clean shutdown.
+    pub(crate) shutdown_reason: Arc<Mutex<Option<String>>>,
+    /// Notified by the actor's catch_unwind wrapper after writing
+    /// `shutdown_reason`. Used by `dead_actor_error` to bound a small wait
+    /// closing the race between channel-close (visible to the handle as
+    /// `SendError`) and the panic reason being recorded.
+    pub(crate) shutdown_signaled: Arc<Notify>,
 }
 
 impl AgentHandle {
@@ -55,13 +64,17 @@ impl AgentHandle {
         content: Vec<tau_ai::Content>,
     ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.normal_tx
+        if self
+            .normal_tx
             .send(Command::Prompt {
                 content,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| crate::error::Error::Other("Agent task has shut down".into()))?;
+            .is_err()
+        {
+            return Err(self.dead_actor_error("Agent task has shut down").await);
+        }
         Ok(reply_rx)
     }
 
@@ -70,10 +83,48 @@ impl AgentHandle {
         let rx = self.prompt(input).await?;
         match rx.await {
             Ok(result) => result.result,
-            Err(_) => Err(crate::error::Error::Other(
-                "Agent task dropped without responding".into(),
-            )),
+            Err(_) => Err(self
+                .dead_actor_error("Agent task dropped without responding")
+                .await),
         }
+    }
+
+    /// Async build of the dead-actor error. Briefly waits (≤100 ms) for the
+    /// catch_unwind wrapper to record a panic reason, since the channel
+    /// closes during unwind *before* the reason is written. Without this
+    /// wait, the first post-panic send would race and surface `Error::Other`
+    /// instead of `Error::ActorPanic`.
+    async fn dead_actor_error(&self, fallback: &str) -> crate::error::Error {
+        // Create the Notified future *before* reading the reason so we can't
+        // miss a notification fired between the read and the await.
+        let notified = self.shutdown_signaled.notified();
+        if let Some(reason) = self.shutdown_reason() {
+            return crate::error::Error::ActorPanic(reason);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(100), notified).await;
+        match self.shutdown_reason() {
+            Some(reason) => crate::error::Error::ActorPanic(reason),
+            None => crate::error::Error::Other(fallback.into()),
+        }
+    }
+
+    /// Sync best-effort version for `try_X` paths that cannot await. May
+    /// return `Error::Other` if the panic reason hasn't been recorded yet,
+    /// even when one is in flight. Callers wanting the precise reason
+    /// should use the async send variants.
+    fn dead_actor_error_sync(&self, fallback: &str) -> crate::error::Error {
+        if let Some(reason) = self.shutdown_reason() {
+            crate::error::Error::ActorPanic(reason)
+        } else {
+            crate::error::Error::Other(fallback.into())
+        }
+    }
+
+    /// Reason the actor task is no longer alive, if known. `Some(reason)`
+    /// indicates a panic; `None` means either the actor is alive or shut down
+    /// cleanly (e.g. all handles dropped).
+    pub fn shutdown_reason(&self) -> Option<String> {
+        self.shutdown_reason.lock().clone()
     }
 
     /// Subscribe to the event stream.
@@ -86,58 +137,163 @@ impl AgentHandle {
         self.event_tx.clone()
     }
 
-    // === Fire-and-forget mutations ===
+    // === Mutations ===
+    //
+    // Each mutation comes in two flavors:
+    //   * `try_<op>(...)` — sync, non-blocking. Returns
+    //     `Err(Error::ChannelFull { channel })` if the channel is full
+    //     (caller may retry) or `Err(Error::ActorPanic(_) | Error::Other(_))`
+    //     if the actor is dead. Use from sync contexts (UI event handlers)
+    //     where you cannot await.
+    //   * `<op>(...).await` — async, awaits channel space. Returns
+    //     `Err(Error::ActorPanic(...))` or `Err(Error::Other(...))` only if
+    //     the actor is dead. Use from async contexts; preferred for
+    //     correctness-critical commands (Steer, FollowUp, config setters).
 
-    /// Route a command to the correct channel based on urgency.
-    fn send_command(&self, cmd: Command) {
-        let (tx, label) = if cmd.is_urgent() {
-            (&self.urgent_tx, "urgent")
+    /// Pick the right channel for `cmd`.
+    fn channel_for(&self, cmd: &Command) -> &mpsc::Sender<Command> {
+        if cmd.is_urgent() {
+            &self.urgent_tx
         } else {
-            (&self.normal_tx, "normal")
-        };
-        if let Err(e) = tx.try_send(cmd) {
-            tracing::warn!("Failed to send command on {label} channel: {e}");
+            &self.normal_tx
         }
     }
 
-    pub fn steer(&self, message: tau_ai::Message) {
-        self.send_command(Command::Steer(message));
+    /// Sync, non-blocking send. Returns `Error::ChannelFull` (retryable) or
+    /// `Error::ActorPanic`/`Error::Other` (terminal) so callers can
+    /// distinguish backpressure from a dead actor.
+    fn try_send_command(&self, cmd: Command) -> crate::error::Result<()> {
+        let label: &'static str = if cmd.is_urgent() { "urgent" } else { "normal" };
+        let tx = self.channel_for(&cmd);
+        match tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Command channel `{label}` is full; command dropped");
+                Err(crate::error::Error::ChannelFull { channel: label })
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(self.dead_actor_error_sync("Agent task has shut down"))
+            }
+        }
     }
 
-    pub fn follow_up(&self, message: tau_ai::Message) {
-        self.send_command(Command::FollowUp(message));
+    /// Async send that awaits channel space. Only fails if the actor is dead.
+    async fn send_command(&self, cmd: Command) -> crate::error::Result<()> {
+        let tx = self.channel_for(&cmd);
+        if tx.send(cmd).await.is_err() {
+            return Err(self.dead_actor_error("Agent task has shut down").await);
+        }
+        Ok(())
     }
 
-    pub fn set_model(&self, model: tau_ai::Model) {
-        self.send_command(Command::SetModel(model));
+    // --- Steer / FollowUp (urgent channel) ---
+
+    pub fn try_steer(&self, message: tau_ai::Message) -> crate::error::Result<()> {
+        self.try_send_command(Command::Steer(message))
     }
 
-    pub fn set_reasoning(&self, level: tau_ai::ReasoningLevel) {
-        self.send_command(Command::SetReasoning(level));
+    pub async fn steer(&self, message: tau_ai::Message) -> crate::error::Result<()> {
+        self.send_command(Command::Steer(message)).await
     }
 
-    pub fn set_system_prompt(&self, prompt: String) {
-        self.send_command(Command::SetSystemPrompt(prompt));
+    pub fn try_follow_up(&self, message: tau_ai::Message) -> crate::error::Result<()> {
+        self.try_send_command(Command::FollowUp(message))
     }
 
-    pub fn set_compaction_config(&self, config: CompactionConfig) {
-        self.send_command(Command::SetCompactionConfig(config));
+    pub async fn follow_up(&self, message: tau_ai::Message) -> crate::error::Result<()> {
+        self.send_command(Command::FollowUp(message)).await
     }
 
-    pub fn set_approval_policy(&self, policy: Arc<dyn ApprovalPolicy>) {
-        self.send_command(Command::SetApprovalPolicy(policy));
+    // --- Config mutations (normal channel) ---
+
+    pub fn try_set_model(&self, model: tau_ai::Model) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetModel(model))
     }
 
-    pub fn clear_messages(&self) {
-        self.send_command(Command::ClearMessages);
+    pub async fn set_model(&self, model: tau_ai::Model) -> crate::error::Result<()> {
+        self.send_command(Command::SetModel(model)).await
     }
 
-    pub fn set_messages(&self, messages: Vec<tau_ai::Message>) {
-        self.send_command(Command::SetMessages(messages));
+    pub fn try_set_reasoning(&self, level: tau_ai::ReasoningLevel) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetReasoning(level))
     }
 
-    pub fn set_previous_summary(&self, summary: Option<String>) {
-        self.send_command(Command::SetPreviousSummary(summary));
+    pub async fn set_reasoning(
+        &self,
+        level: tau_ai::ReasoningLevel,
+    ) -> crate::error::Result<()> {
+        self.send_command(Command::SetReasoning(level)).await
+    }
+
+    pub fn try_set_system_prompt(&self, prompt: String) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetSystemPrompt(prompt))
+    }
+
+    pub async fn set_system_prompt(&self, prompt: String) -> crate::error::Result<()> {
+        self.send_command(Command::SetSystemPrompt(prompt)).await
+    }
+
+    pub fn try_set_compaction_config(&self, config: CompactionConfig) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetCompactionConfig(config))
+    }
+
+    pub async fn set_compaction_config(
+        &self,
+        config: CompactionConfig,
+    ) -> crate::error::Result<()> {
+        self.send_command(Command::SetCompactionConfig(config))
+            .await
+    }
+
+    pub fn try_set_approval_policy(
+        &self,
+        policy: Arc<dyn ApprovalPolicy>,
+    ) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetApprovalPolicy(policy))
+    }
+
+    pub async fn set_approval_policy(
+        &self,
+        policy: Arc<dyn ApprovalPolicy>,
+    ) -> crate::error::Result<()> {
+        self.send_command(Command::SetApprovalPolicy(policy)).await
+    }
+
+    // --- Conversation mutations (normal channel) ---
+    //
+    // If issued mid-prompt, these are buffered and applied after the
+    // current prompt's `Done` phase, before `AgentEnd`; the host receives
+    // an [`AgentEvent::ConversationOpDeferred`] when buffering happens.
+    // **Buffered ops are best-effort:** if the actor terminates (panic,
+    // cancellation, all handles released) before reaching `Done`, the
+    // queued mutation is dropped. Hosts that need durability should
+    // persist the mutation themselves before issuing it.
+
+    pub fn try_clear_messages(&self) -> crate::error::Result<()> {
+        self.try_send_command(Command::ClearMessages)
+    }
+
+    pub async fn clear_messages(&self) -> crate::error::Result<()> {
+        self.send_command(Command::ClearMessages).await
+    }
+
+    pub fn try_set_messages(&self, messages: Vec<tau_ai::Message>) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetMessages(messages))
+    }
+
+    pub async fn set_messages(&self, messages: Vec<tau_ai::Message>) -> crate::error::Result<()> {
+        self.send_command(Command::SetMessages(messages)).await
+    }
+
+    pub fn try_set_previous_summary(&self, summary: Option<String>) -> crate::error::Result<()> {
+        self.try_send_command(Command::SetPreviousSummary(summary))
+    }
+
+    pub async fn set_previous_summary(
+        &self,
+        summary: Option<String>,
+    ) -> crate::error::Result<()> {
+        self.send_command(Command::SetPreviousSummary(summary)).await
     }
 
     // === Abort ===
@@ -199,13 +355,17 @@ impl AgentHandle {
         reason: CompactionReason,
     ) -> crate::error::Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.normal_tx
+        if self
+            .normal_tx
             .send(Command::Compact {
                 reason,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| crate::error::Error::Other("Agent task has shut down".into()))?;
+            .is_err()
+        {
+            return Err(self.dead_actor_error("Agent task has shut down").await);
+        }
         Ok(reply_rx)
     }
 

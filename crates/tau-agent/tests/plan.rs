@@ -46,7 +46,7 @@ async fn submit_plan_round_trips_with_user_edit() {
         .with_tool_call_response("submit_plan", "c1", plan_args)
         .with_text_response("plan acknowledged");
 
-    // Host receives SubmitPlan, returns PlanApproved with an *edited* plan.
+    // Host receives plan.submit, returns Approved with an *edited* plan body.
     let (interaction_tx, mut interaction_rx) =
         tokio::sync::mpsc::channel::<InteractionRequest>(8);
     let captured: Arc<tokio::sync::Mutex<Option<Plan>>> =
@@ -54,11 +54,15 @@ async fn submit_plan_round_trips_with_user_edit() {
     let captured_clone = captured.clone();
     let _handler = tokio::spawn(async move {
         if let Some(req) = interaction_rx.recv().await {
-            if let InteractionKind::SubmitPlan { plan } = req.kind {
-                *captured_clone.lock().await = Some(plan);
-                let _ = req.response_tx.send(InteractionResponse::PlanApproved {
-                    plan: plan_with_extra_step(),
-                });
+            if let InteractionKind::Typed { schema_id, payload } = req.kind {
+                if schema_id == "plan.submit" {
+                    let plan: Plan = serde_json::from_value(payload).unwrap();
+                    *captured_clone.lock().await = Some(plan);
+                    let edited = serde_json::to_value(plan_with_extra_step()).unwrap();
+                    let _ = req.response_tx.send(InteractionResponse::Approved {
+                        payload: Some(edited),
+                    });
+                }
             }
         }
     });
@@ -162,13 +166,17 @@ async fn submit_plan_rejection_then_revision_succeeds() {
         let mut call = 0u32;
         while let Some(req) = interaction_rx.recv().await {
             call += 1;
-            if let InteractionKind::SubmitPlan { plan } = req.kind {
+            if let InteractionKind::Typed { schema_id, .. } = &req.kind {
+                if schema_id != "plan.submit" {
+                    continue;
+                }
                 let resp = if call == 1 {
                     InteractionResponse::Rejected {
                         reason: "needs migration step".into(),
                     }
                 } else {
-                    InteractionResponse::PlanApproved { plan }
+                    // Accept the original payload by replying with `None`.
+                    InteractionResponse::Approved { payload: None }
                 };
                 let _ = req.response_tx.send(resp);
             }
@@ -307,8 +315,12 @@ async fn subagent_interaction_is_stamped_with_agent_id() {
     let _handler = tokio::spawn(async move {
         if let Some(req) = interaction_rx.recv().await {
             *captured.lock().await = req.agent_id.clone();
-            if let InteractionKind::SubmitPlan { plan } = req.kind {
-                let _ = req.response_tx.send(InteractionResponse::PlanApproved { plan });
+            if let InteractionKind::Typed { schema_id, .. } = &req.kind {
+                if schema_id == "plan.submit" {
+                    let _ = req
+                        .response_tx
+                        .send(InteractionResponse::Approved { payload: None });
+                }
             }
         }
     });

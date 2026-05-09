@@ -1,11 +1,13 @@
 //! AgentBuilder — setup phase, consumed by spawn().
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
-use tokio::sync::{broadcast, mpsc};
+use futures::FutureExt;
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::run_actor;
@@ -22,6 +24,14 @@ use tau_ai::{Message, ServerTool};
 
 /// Type alias for the transform context callback.
 pub(crate) type TransformContextFn = dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync;
+
+/// Default capacity of the urgent (Steer/FollowUp) command channel. Sized
+/// for fan-in from many background subagents and bursty user steering.
+pub const DEFAULT_URGENT_CAPACITY: usize = 256;
+
+/// Default capacity of the normal command channel (config setters, queries,
+/// prompt requests). Smaller because volume is naturally bounded.
+pub const DEFAULT_NORMAL_CAPACITY: usize = 64;
 
 /// Setup phase. Configure the agent, then call spawn() to start the actor.
 ///
@@ -50,16 +60,40 @@ pub struct AgentBuilder {
     cancel: Arc<ParkingMutex<CancellationToken>>,
     is_running: Arc<AtomicBool>,
     pending_follow_ups: Arc<AtomicU32>,
+    /// Written by the actor's catch_unwind wrapper on panic.
+    shutdown_reason: Arc<ParkingMutex<Option<String>>>,
+    /// Notified after `shutdown_reason` is written.
+    shutdown_signaled: Arc<Notify>,
 }
 
 impl AgentBuilder {
     pub fn new(config: AgentConfig, transport: Arc<dyn Transport>) -> Self {
+        Self::with_channel_capacities(
+            config,
+            transport,
+            DEFAULT_URGENT_CAPACITY,
+            DEFAULT_NORMAL_CAPACITY,
+        )
+    }
+
+    /// Build a new `AgentBuilder` with custom command channel capacities.
+    /// Use this when expected steering or follow-up volume exceeds the
+    /// defaults — for example, ambient agents that fan in many background
+    /// subagent completions.
+    pub fn with_channel_capacities(
+        config: AgentConfig,
+        transport: Arc<dyn Transport>,
+        urgent_capacity: usize,
+        normal_capacity: usize,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        let (urgent_tx, urgent_rx) = mpsc::channel(64);
-        let (normal_tx, normal_rx) = mpsc::channel(32);
+        let (urgent_tx, urgent_rx) = mpsc::channel(urgent_capacity);
+        let (normal_tx, normal_rx) = mpsc::channel(normal_capacity);
         let cancel = Arc::new(ParkingMutex::new(CancellationToken::new()));
         let is_running = Arc::new(AtomicBool::new(false));
         let pending_follow_ups = Arc::new(AtomicU32::new(0));
+        let shutdown_reason = Arc::new(ParkingMutex::new(None));
+        let shutdown_signaled = Arc::new(Notify::new());
 
         Self {
             config,
@@ -80,6 +114,8 @@ impl AgentBuilder {
             cancel,
             is_running,
             pending_follow_ups,
+            shutdown_reason,
+            shutdown_signaled,
         }
     }
 
@@ -174,6 +210,8 @@ impl AgentBuilder {
             cancel: self.cancel.clone(),
             is_running: self.is_running.clone(),
             pending_follow_ups: self.pending_follow_ups.clone(),
+            shutdown_reason: self.shutdown_reason.clone(),
+            shutdown_signaled: self.shutdown_signaled.clone(),
         }
     }
 
@@ -225,13 +263,48 @@ impl AgentBuilder {
             transform_context: self.transform_context,
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),
+            pending_conversation_ops: Vec::new(),
             pending_follow_ups: self.pending_follow_ups.clone(),
             is_running: self.is_running.clone(),
             cancel: self.cancel.clone(),
         };
 
-        // Spawn the actor task
-        tokio::spawn(run_actor(state, urgent_rx, normal_rx));
+        // Wrap the actor future in catch_unwind so we record the panic
+        // reason from *inside* the actor task, before tokio drops the spawn.
+        // This closes the race where a handle's send returns `Closed` (from
+        // receivers dropping during unwind) before the supervisor would have
+        // had a chance to write `shutdown_reason`. Handles call
+        // `shutdown_signaled.notified()` to bound a small wait for that
+        // write to land.
+        let event_tx_for_supervisor = self.event_tx.clone();
+        let shutdown_reason = self.shutdown_reason.clone();
+        let shutdown_signaled = self.shutdown_signaled.clone();
+        tokio::spawn(async move {
+            let actor_future = AssertUnwindSafe(run_actor(state, urgent_rx, normal_rx));
+            match actor_future.catch_unwind().await {
+                Ok(()) => {
+                    // Clean shutdown — leave shutdown_reason as None.
+                    // Still signal so any concurrent dead_actor_error wakes
+                    // (it will fall through to the `Other` fallback).
+                    shutdown_signaled.notify_waiters();
+                }
+                Err(payload) => {
+                    let reason = payload
+                        .downcast_ref::<&'static str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    tracing::error!(reason = %reason, "agent actor task panicked");
+                    *shutdown_reason.lock() = Some(reason.clone());
+                    shutdown_signaled.notify_waiters();
+                    // Best-effort: broadcast an Error event for any subscribed
+                    // consumers. Ignored if there are no subscribers.
+                    let _ = event_tx_for_supervisor.send(AgentEvent::Error {
+                        message: format!("Actor panicked: {reason}"),
+                    });
+                }
+            }
+        });
 
         AgentHandle {
             urgent_tx: self.urgent_tx,
@@ -240,6 +313,8 @@ impl AgentBuilder {
             cancel: self.cancel,
             is_running: self.is_running,
             pending_follow_ups: self.pending_follow_ups,
+            shutdown_reason: self.shutdown_reason,
+            shutdown_signaled: self.shutdown_signaled,
         }
     }
 }

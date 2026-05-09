@@ -174,7 +174,7 @@ async fn model_change_reflected_in_subsequent_calls() {
 
     let mut new_model = test_config().model;
     new_model.id = "changed-model".into();
-    handle.set_model(new_model);
+    handle.set_model(new_model).await.unwrap();
 
     handle.prompt_and_wait("second").await.unwrap();
 
@@ -274,7 +274,7 @@ async fn steering_during_tools_does_not_duplicate_tool_results() {
 
     // Wait for slow tool to start, then steer
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    handle.steer(Message::user("redirect"));
+    handle.steer(Message::user("redirect")).await.unwrap();
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
 

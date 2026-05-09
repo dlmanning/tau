@@ -89,10 +89,6 @@ pub struct SessionInfo {
     pub status: SessionStatus,
     pub message_count: usize,
     pub total_usage: Usage,
-    /// Manager-derived from `PlanStepStarted`/`Completed` events (gap #3).
-    /// Not part of agent state; transient.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_step: Option<String>,
 }
 
 impl SessionInfo {
@@ -108,7 +104,6 @@ impl SessionInfo {
             status: SessionStatus::Idle,
             message_count: 0,
             total_usage: Usage::default(),
-            current_step: None,
         }
     }
 }

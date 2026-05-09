@@ -292,7 +292,6 @@ impl DeskAgent {
             project: Some(s.project.path),
             branch: s.project.branch,
             paused_at: s.last_activity,
-            next_step: s.current_step,
             // diff_summary requires walking the session's message log
             // for `FileChanged` events (gap #4 overlay). Deferred.
             diff_summary: None,

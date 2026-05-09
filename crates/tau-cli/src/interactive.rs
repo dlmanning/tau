@@ -35,7 +35,15 @@ async fn run_prompt_and_stream(
     let is_tty = std::io::IsTerminal::is_terminal(&io::stdout());
     let event_handle = tokio::spawn(async move {
         let mut last_text_len = 0;
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "interactive event stream lagged");
+                    continue;
+                }
+            };
             match event {
                 AgentEvent::MessageUpdate { message } => {
                     let text = message.text();
@@ -235,7 +243,7 @@ pub(crate) async fn run_interactive(
             if let Some(result) = commands::execute_command(input, &ctx) {
                 match result {
                     commands::CommandResult::Clear => {
-                        handle.clear_messages();
+                        let _ = handle.clear_messages().await;
                         println!("Cleared conversation.");
                     }
                     commands::CommandResult::Exit => {
@@ -250,11 +258,11 @@ pub(crate) async fn run_interactive(
                             new_model.id,
                             new_model.provider.name()
                         );
-                        handle.set_model(new_model);
+                        let _ = handle.set_model(new_model).await;
                     }
                     commands::CommandResult::ChangeReasoning(level) => {
                         println!("Reasoning level set to: {:?}", level);
-                        handle.set_reasoning(level);
+                        let _ = handle.set_reasoning(level).await;
                     }
                     commands::CommandResult::Unknown(cmd) => {
                         println!("Unknown command: /{}", cmd);
@@ -362,10 +370,12 @@ pub(crate) async fn run_interactive(
                             } else {
                                 let (_, agent_id) = active_agent.take().unwrap();
                                 manager.remove_interactive(&agent_id).await;
-                                handle.steer(tau_ai::Message::user(format!(
-                                    "Approved plan:\n\n{}\n\nProceed with implementation.",
-                                    plan_text
-                                )));
+                                let _ = handle
+                                    .steer(tau_ai::Message::user(format!(
+                                        "Approved plan:\n\n{}\n\nProceed with implementation.",
+                                        plan_text
+                                    )))
+                                    .await;
                                 println!("Plan approved. Returned to main agent.");
                             }
                         } else {
@@ -396,9 +406,9 @@ pub(crate) async fn run_interactive(
                                 if let Some(idx) = branch_index {
                                     let truncated: Vec<_> =
                                         messages.iter().take(idx + 1).cloned().collect();
-                                    handle.set_messages(truncated);
+                                    let _ = handle.set_messages(truncated).await;
                                 } else {
-                                    handle.clear_messages();
+                                    let _ = handle.clear_messages().await;
                                 }
                                 session = Some(new_session);
                                 println!("Continue from this point with a fresh context.");

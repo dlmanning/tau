@@ -34,6 +34,7 @@ use futures::StreamExt;
 use tau_agent::manager::AgentManager;
 use tau_agent::{AgentEvent, AgentHandle};
 use tau_ai::Model;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use widgets::{SelectorState, message_list::ChatMessage};
 
@@ -63,10 +64,10 @@ async fn apply_branch(state: &mut TuiState, handle: &AgentHandle, branch_index: 
             ));
             if let Some(idx) = branch_index {
                 let truncated: Vec<_> = messages.iter().take(idx + 1).cloned().collect();
-                handle.set_messages(truncated);
+                let _ = handle.set_messages(truncated).await;
                 state.messages.truncate(idx + 1);
             } else {
-                handle.clear_messages();
+                let _ = handle.clear_messages().await;
                 state.messages.clear();
             }
             state.reset_stats();
@@ -119,18 +120,18 @@ async fn dispatch_ui_message(
                         state.show_system_message(&msg);
                     }
                     CommandResult::Clear => {
-                        handle.clear_messages();
+                        let _ = handle.clear_messages().await;
                         state.messages.clear();
                         state.reset_stats();
                         state.status = "Cleared".to_string();
                     }
                     CommandResult::ChangeModel(new_model) => {
                         state.show_system_message(&format!("Switched to: {}", new_model.id));
-                        handle.set_model(new_model);
+                        let _ = handle.set_model(new_model).await;
                     }
                     CommandResult::ChangeReasoning(level) => {
                         state.show_system_message(&format!("Reasoning: {:?}", level));
-                        handle.set_reasoning(level);
+                        let _ = handle.set_reasoning(level).await;
                     }
                     CommandResult::Exit => return false,
                     CommandResult::Unknown(cmd) => {
@@ -234,10 +235,12 @@ async fn dispatch_ui_message(
                             } else {
                                 let agent = active_agent.take().unwrap();
                                 manager.remove_interactive(&agent.agent_id).await;
-                                handle.steer(tau_ai::Message::user(format!(
-                                    "Approved plan:\n\n{}\n\nProceed with implementation.",
-                                    plan_text
-                                )));
+                                let _ = handle
+                                    .steer(tau_ai::Message::user(format!(
+                                        "Approved plan:\n\n{}\n\nProceed with implementation.",
+                                        plan_text
+                                    )))
+                                    .await;
                                 state.show_system_message(
                                     "Plan approved. Returned to main agent.",
                                 );
@@ -256,11 +259,11 @@ async fn dispatch_ui_message(
         UiMessage::ChangeModel(index) => {
             if let Some(new_model) = available_models.get(index) {
                 state.show_system_message(&format!("Switched to: {}", new_model.id));
-                handle.set_model(new_model.clone());
+                let _ = handle.set_model(new_model.clone()).await;
             }
         }
         UiMessage::Clear => {
-            handle.clear_messages();
+            let _ = handle.clear_messages().await;
             state.messages.clear();
             state.reset_stats();
             state.status = "Cleared".to_string();
@@ -386,8 +389,12 @@ pub async fn run_tui(
                     }
 
                     event = agent_rx.recv() => {
-                        if let Ok(agent_event) = event {
-                            state.handle_agent_event(agent_event);
+                        match event {
+                            Ok(ev) => state.handle_agent_event(ev),
+                            Err(RecvError::Lagged(n)) => {
+                                tracing::warn!(lagged = n, "TUI event subscriber lagged; {n} agent event(s) dropped");
+                            }
+                            Err(RecvError::Closed) => break,
                         }
                     }
 
@@ -417,24 +424,40 @@ pub async fn run_tui(
                                         selector: SelectorState::default(),
                                     });
                                 }
-                                InteractionKind::ConfirmTool { tool_name, .. } => {
-                                    // Should not fire: main.rs installs AutoAcceptAllPolicy
-                                    // for the TUI until a confirm UI is built.
-                                    state.status =
-                                        format!("Unexpected ConfirmTool for {tool_name}");
-                                    let _ = request.response_tx.send(InteractionResponse::Rejected {
-                                        reason: "TUI confirm not implemented".into(),
-                                    });
-                                }
-                                InteractionKind::SubmitPlan { plan } => {
-                                    state.status = format!(
-                                        "Plan submitted ({} step(s)) — auto-approving (TUI plan UI not implemented)",
-                                        plan.items.len()
-                                    );
-                                    let _ = request
-                                        .response_tx
-                                        .send(InteractionResponse::PlanApproved { plan });
-                                }
+                                InteractionKind::Typed { schema_id, payload } => match schema_id.as_str() {
+                                    "tool.confirm" => {
+                                        // Should not fire: main.rs installs AutoAcceptAllPolicy
+                                        // for the TUI until a confirm UI is built.
+                                        let tool_name = payload
+                                            .get("tool_name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        state.status =
+                                            format!("Unexpected tool.confirm for {tool_name}");
+                                        let _ = request.response_tx.send(InteractionResponse::Rejected {
+                                            reason: "TUI confirm not implemented".into(),
+                                        });
+                                    }
+                                    "plan.submit" => {
+                                        let step_count = payload
+                                            .get("items")
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| a.len())
+                                            .unwrap_or(0);
+                                        state.status = format!(
+                                            "Plan submitted ({step_count} step(s)) — auto-approving (TUI plan UI not implemented)"
+                                        );
+                                        let _ = request
+                                            .response_tx
+                                            .send(InteractionResponse::Approved { payload: None });
+                                    }
+                                    other => {
+                                        state.status = format!("Unknown typed interaction: {other}");
+                                        let _ = request.response_tx.send(InteractionResponse::Rejected {
+                                            reason: format!("Unknown schema: {other}"),
+                                        });
+                                    }
+                                },
                             }
                         }
                     }
@@ -466,8 +489,12 @@ pub async fn run_tui(
             biased;
 
             event = agent_rx.recv() => {
-                if let Ok(agent_event) = event {
-                    state.handle_agent_event(agent_event);
+                match event {
+                    Ok(ev) => state.handle_agent_event(ev),
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "TUI event subscriber lagged; {n} agent event(s) dropped");
+                    }
+                    Err(RecvError::Closed) => break Ok(()),
                 }
             }
 

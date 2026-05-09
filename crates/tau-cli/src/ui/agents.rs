@@ -218,14 +218,12 @@ impl TuiState {
             AgentEvent::TurnStart { .. }
             | AgentEvent::MessageStart { .. }
             | AgentEvent::ToolApprovalResolved { .. }
-            | AgentEvent::PlanStepStarted { .. }
-            | AgentEvent::PlanStepCompleted { .. }
-            | AgentEvent::PlanCompleted { .. }
             | AgentEvent::FileChanged { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentResumed { .. }
             | AgentEvent::SubagentCompleted { .. }
-            | AgentEvent::SubagentReport { .. } => {}
+            | AgentEvent::SubagentReport { .. }
+            | AgentEvent::ConversationOpDeferred { .. } => {}
         }
     }
 

@@ -43,7 +43,7 @@ impl Tool for ElevatedTool {
     }
 }
 
-/// Spawn a one-shot interaction handler that resolves every `ConfirmTool`
+/// Spawn a one-shot interaction handler that resolves every `tool.confirm`
 /// request with the given response.
 fn handle_confirm_with(
     mut rx: tokio::sync::mpsc::Receiver<InteractionRequest>,
@@ -51,8 +51,10 @@ fn handle_confirm_with(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
-            if matches!(req.kind, InteractionKind::ConfirmTool { .. }) {
-                let _ = req.response_tx.send(response());
+            if let InteractionKind::Typed { schema_id, .. } = &req.kind {
+                if schema_id == "tool.confirm" {
+                    let _ = req.response_tx.send(response());
+                }
             }
         }
     })
@@ -184,7 +186,8 @@ async fn elevated_with_user_approval_dispatches() {
         .with_text_response("done");
 
     let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(8);
-    let _handler = handle_confirm_with(interaction_rx, || InteractionResponse::Approved);
+    let _handler =
+        handle_confirm_with(interaction_rx, || InteractionResponse::Approved { payload: None });
 
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
@@ -320,11 +323,17 @@ async fn mixed_approval_preserves_tool_call_order() {
     let _handler = tokio::spawn(async move {
         while let Some(req) = interaction_rx.recv().await {
             let id = match &req.kind {
-                InteractionKind::ConfirmTool { tool_call_id, .. } => tool_call_id.clone(),
+                InteractionKind::Typed { schema_id, payload } if schema_id == "tool.confirm" => {
+                    payload
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                }
                 _ => continue,
             };
             let resp = if id == "call_a" {
-                InteractionResponse::Approved
+                InteractionResponse::Approved { payload: None }
             } else {
                 InteractionResponse::Rejected {
                     reason: "denied".into(),
@@ -389,7 +398,7 @@ async fn set_approval_policy_takes_effect_for_subsequent_prompt() {
     handle.prompt_and_wait("first").await.unwrap();
     assert_eq!(invocations.load(Ordering::SeqCst), 0, "rejected on first");
 
-    handle.set_approval_policy(Arc::new(AutoAcceptAllPolicy));
+    handle.set_approval_policy(Arc::new(AutoAcceptAllPolicy)).await.unwrap();
     // Sync: send a noop query to ensure the SetApprovalPolicy command was processed.
     let _ = handle.config().await;
 
@@ -447,7 +456,7 @@ async fn abort_during_pending_gate_terminates_cleanly() {
     }
     assert!(
         captured.lock().await.is_some(),
-        "ConfirmTool never reached the host"
+        "tool.confirm interaction never reached the host"
     );
 
     handle.abort();

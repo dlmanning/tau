@@ -450,9 +450,6 @@ fn event_type_name(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecutionUpdate { .. } => "ToolExecutionUpdate",
         AgentEvent::ToolExecutionEnd { .. } => "ToolExecutionEnd",
         AgentEvent::ToolApprovalResolved { .. } => "ToolApprovalResolved",
-        AgentEvent::PlanStepStarted { .. } => "PlanStepStarted",
-        AgentEvent::PlanStepCompleted { .. } => "PlanStepCompleted",
-        AgentEvent::PlanCompleted { .. } => "PlanCompleted",
         AgentEvent::FileChanged { .. } => "FileChanged",
         AgentEvent::SubagentStarted { .. } => "SubagentStarted",
         AgentEvent::SubagentResumed { .. } => "SubagentResumed",
@@ -463,6 +460,7 @@ fn event_type_name(event: &AgentEvent) -> &'static str {
         AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionEnd { .. } => "CompactionEnd",
         AgentEvent::Error { .. } => "Error",
+        AgentEvent::ConversationOpDeferred { .. } => "ConversationOpDeferred",
         AgentEvent::Subagent { .. } => "Subagent",
     }
 }
@@ -537,6 +535,64 @@ impl Tool for FailTool {
 
     async fn execute(&self, _arguments: Value, _ctx: ExecutionContext) -> ToolResult {
         ToolResult::error("intentional failure")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PanicTool — panics inside execute, used for actor-supervisor tests
+// ---------------------------------------------------------------------------
+
+/// A tool that panics in `execute`. Used to verify that tool-level panics
+/// are caught by the actor's `JoinSet` (they are — see `actor.rs`).
+/// **Does not** kill the actor; for that, use [`PanicTransport`].
+pub struct PanicTool;
+
+#[async_trait]
+impl Tool for PanicTool {
+    fn name(&self) -> &str {
+        "panic"
+    }
+
+    fn description(&self) -> &str {
+        "Panics inside execute"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _arguments: Value, _ctx: ExecutionContext) -> ToolResult {
+        panic!("intentional panic in tool");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PanicTransport — panics inside `run`, on the actor task itself
+// ---------------------------------------------------------------------------
+
+/// A transport that panics in `run`. Unlike `PanicTool`, this propagates the
+/// panic to the actor task, killing it. Used to test the supervisor's
+/// `shutdown_reason` recording and `Error::ActorPanic` mapping.
+pub struct PanicTransport;
+
+impl PanicTransport {
+    pub fn create() -> Arc<dyn Transport> {
+        Arc::new(Self)
+    }
+}
+
+#[async_trait]
+impl Transport for PanicTransport {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _config: &AgentRunConfig,
+        _cancel: CancellationToken,
+    ) -> tau_ai::Result<AgentEventStream> {
+        panic!("intentional panic in transport");
     }
 }
 

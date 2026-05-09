@@ -2,9 +2,10 @@
 //! the host UI for review/approval.
 //!
 //! The tool's `parameters_schema` is the JSON Schema for [`Plan`]. Its
-//! `execute` body sends an [`InteractionKind::SubmitPlan`] request, awaits
-//! the response, and returns the (possibly-edited) approved plan as a JSON
-//! tool result. On rejection, returns an error result the model can revise
+//! `execute` body sends a `Typed { schema_id: "plan.submit", payload }`
+//! interaction request whose payload is the serialized [`Plan`], awaits the
+//! response, and returns the (possibly-edited) approved plan as a JSON tool
+//! result. On rejection, returns an error result the model can revise
 //! against.
 
 use async_trait::async_trait;
@@ -66,10 +67,18 @@ impl Tool for SubmitPlanTool {
             None => return ToolResult::error("No interactive session available for plan review"),
         };
 
+        let payload = match serde_json::to_value(&plan) {
+            Ok(v) => v,
+            Err(e) => return ToolResult::error(format!("Failed to serialize plan: {e}")),
+        };
+
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = InteractionRequest {
             agent_id: None,
-            kind: InteractionKind::SubmitPlan { plan },
+            kind: InteractionKind::Typed {
+                schema_id: "plan.submit".to_string(),
+                payload,
+            },
             response_tx,
         };
 
@@ -78,8 +87,19 @@ impl Tool for SubmitPlanTool {
         }
 
         match response_rx.await {
-            Ok(InteractionResponse::PlanApproved { plan }) => {
-                match serde_json::to_string_pretty(&plan) {
+            Ok(InteractionResponse::Approved { payload }) => {
+                let approved_plan = match payload {
+                    Some(value) => match serde_json::from_value::<Plan>(value) {
+                        Ok(edited) => edited,
+                        Err(e) => {
+                            return ToolResult::error(format!(
+                                "Edited plan failed to deserialize: {e}"
+                            ));
+                        }
+                    },
+                    None => plan,
+                };
+                match serde_json::to_string_pretty(&approved_plan) {
                     Ok(json) => ToolResult::text(format!("Plan approved:\n{json}")),
                     Err(e) => ToolResult::error(format!("Failed to serialize approved plan: {e}")),
                 }
@@ -88,7 +108,9 @@ impl Tool for SubmitPlanTool {
                 ToolResult::error(format!("Plan rejected: {reason}"))
             }
             Ok(InteractionResponse::Cancelled) => ToolResult::error("Plan review cancelled"),
-            Ok(_) => ToolResult::error("Unexpected response to plan submission"),
+            Ok(InteractionResponse::Answer(_)) => {
+                ToolResult::error("Unexpected response to plan submission")
+            }
             Err(_) => ToolResult::error("Interaction channel closed"),
         }
     }

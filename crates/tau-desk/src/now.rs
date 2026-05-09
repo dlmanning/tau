@@ -26,9 +26,6 @@ pub struct PickUpView {
     pub project: Option<PathBuf>,
     pub branch: Option<String>,
     pub paused_at: DateTime<Utc>,
-    /// Derived from gap #3 step events captured during the paused
-    /// session. May be `None` if no plan was active.
-    pub next_step: Option<String>,
     /// Derived from gap #4 file-change overlay. `None` if no diff.
     pub diff_summary: Option<String>,
 }

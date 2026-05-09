@@ -125,37 +125,23 @@ pub enum AgentEvent {
     /// Error occurred
     Error { message: String },
 
+    /// A conversation mutation (clear / set messages / set summary) was
+    /// issued mid-prompt. The runtime buffered it and will apply it after
+    /// the current prompt finishes, before broadcasting `AgentEnd`. Hosts
+    /// can surface "queued — applies when this turn ends" if they want.
+    ///
+    /// **Delivery is best-effort.** Buffered ops live in the actor's
+    /// in-memory state and are dropped if the actor terminates (panic,
+    /// cancellation, or all handles released) before reaching the next
+    /// `Done` phase. Hosts that need the mutation to survive a crash
+    /// should persist it themselves before issuing the command.
+    ConversationOpDeferred { kind: DeferredOpKind },
+
     /// Event from a subagent, wrapped with identity.
     Subagent {
         agent_id: String,
         description: String,
         event: Box<AgentEvent>,
-    },
-
-    /// A plan step started executing. Emitted by the `step_started` tool;
-    /// hosts pair with `PlanStepCompleted` by `step_id` to compute duration
-    /// and current-step state.
-    PlanStepStarted {
-        step_id: String,
-        activity: Option<String>,
-        started_at: DateTime<Utc>,
-    },
-
-    /// A plan step completed. The `summary` is whatever short note the
-    /// model wants to surface in the running view.
-    PlanStepCompleted {
-        step_id: String,
-        summary: Option<String>,
-        completed_at: DateTime<Utc>,
-    },
-
-    /// All plan steps completed. The agent may still emit a final summary
-    /// turn after this; the actual lifecycle terminator is `AgentEnd`. This
-    /// event is a UI milestone, not a stop signal — hosts should keep
-    /// listening for `AgentEnd` to know when the actor is idle.
-    PlanCompleted {
-        summary: String,
-        completed_at: DateTime<Utc>,
     },
 
     /// A single line of streamed tool output, classified for UI styling.
@@ -176,18 +162,25 @@ pub enum AgentEvent {
         tool_call_id: String,
     },
 
-    /// A subagent began executing (fresh spawn). Bracketed by
-    /// `SubagentCompleted` with the same `agent_id`. Hosts can render an
-    /// expandable subagent block from `SubagentStarted` and update its
-    /// status when `SubagentCompleted` arrives. The intermediate
-    /// `Subagent { event }` wrapping continues to forward each child event.
+    /// The parent dispatched a subagent spawn. Emitted synchronously by the
+    /// parent's manager *before the child actor task exists*; bracketed by
+    /// `SubagentCompleted` with the same `agent_id`.
     ///
-    /// **Canonical start signal.** The forwarded child `AgentStart` arrives
-    /// shortly after as `Subagent { event: AgentStart }`. Hosts should pick
-    /// `SubagentStarted` for rendering the bracket — it carries the
-    /// metadata (agent_type, prompt, started_at) and is guaranteed to fire
-    /// once per subagent run. Treat the wrapped `AgentStart` as a
-    /// duplicate.
+    /// This event lives on the **parent's timeline**: it records an action
+    /// the parent took, analogous to how `ToolExecutionStart` records a
+    /// parent-side tool dispatch. It carries metadata only the parent
+    /// knows — `agent_type`, the request `prompt`, and the parent-side
+    /// `started_at` — none of which the child can supply.
+    ///
+    /// The child's own intrinsic lifecycle (`AgentStart` → … →
+    /// `AgentEnd`) arrives separately on the **child's timeline**,
+    /// forwarded onto the parent's stream as
+    /// `Subagent { agent_id, event: AgentStart }`, etc. The two are not
+    /// duplicates — they describe different things. A host rendering the
+    /// parent's actions watches for `SubagentStarted`; a host rendering
+    /// child progress (tool calls, turns, completion) watches the
+    /// forwarded child events. Both fire exactly once per fresh spawn,
+    /// with `SubagentStarted` first.
     SubagentStarted {
         agent_id: String,
         agent_type: String,
@@ -234,6 +227,16 @@ pub enum AgentEvent {
         tag: Option<String>,
         summary: String,
     },
+}
+
+/// Kind of deferred conversation mutation, surfaced to hosts via
+/// [`AgentEvent::ConversationOpDeferred`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeferredOpKind {
+    Clear,
+    SetMessages,
+    SetPreviousSummary,
 }
 
 /// How a subagent terminated.

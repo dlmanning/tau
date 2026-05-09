@@ -4,8 +4,8 @@
 //! call into one of three buckets:
 //!
 //! - [`ApprovalDecision::Auto`] — dispatch immediately.
-//! - [`ApprovalDecision::Gate`] — send a `ConfirmTool` interaction request and
-//!   wait for the host to approve or reject.
+//! - [`ApprovalDecision::Gate`] — send a `Typed { schema_id: "tool.confirm" }`
+//!   interaction request and wait for the host to approve or reject.
 //! - [`ApprovalDecision::Reject`] — synthesize an error result; never run.
 //!
 //! Tools self-report their inherent risk via [`crate::tool::Tool::risk`].
@@ -36,7 +36,7 @@ pub enum ToolRisk {
 pub enum ApprovalDecision {
     /// Run the tool without asking.
     Auto,
-    /// Ask the host to confirm via `ConfirmTool`.
+    /// Ask the host to confirm via `Typed { schema_id: "tool.confirm" }`.
     Gate,
     /// Refuse the call. The reason is surfaced to the model as the tool's
     /// error result.

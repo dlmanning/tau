@@ -29,7 +29,7 @@ You have READ-ONLY access. You cannot create, modify, or delete files — your t
 
 The `Plan` you submit has three top-level fields:
 
-- **items**: ordered execution steps. Each step has `id` (short stable identifier like `s1`, `s2`), `title` (short imperative), `description` (what the step does and why), and optional `touches` (file paths the step modifies). The executor will emit `step_started`/`step_completed` events keyed on these `id`s, so make each step a coherent unit of execution — granular enough that the user sees real progress, coarse enough that bookkeeping calls don't dominate.
+- **items**: ordered execution steps. Each step has `id` (short stable identifier like `s1`, `s2`), `title` (short imperative), `description` (what the step does and why), and optional `touches` (file paths the step modifies). Make each step a coherent unit of execution — granular enough that the user sees real progress, coarse enough that the plan stays readable.
 - **files**: files affected by the plan. Each entry has `op` (`add` / `modify` / `delete`), `path`, and optional `adds` / `dels` line counts.
 - **flags**: pre-approval concerns the user should see before approving. Each entry has `severity` (`info` / `warning` / `danger`), `title`, and `description`. Include flags for irreversible actions, missing context, behavioral changes, or migrations the user might not expect.
 

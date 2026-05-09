@@ -4,12 +4,28 @@
 //! channel on [`ExecutionContext`](crate::tool::ExecutionContext) and await
 //! the [`InteractionResponse`] on the embedded oneshot. The UI layer
 //! (TUI, CLI, tests) handles the other end.
+//!
+//! There are two shapes of interaction:
+//!
+//! - [`InteractionKind::AskQuestion`] — a generic question with a list of
+//!   options. The host returns [`InteractionResponse::Answer`] with the
+//!   chosen label, or [`InteractionResponse::Cancelled`].
+//! - [`InteractionKind::Typed`] — a schema-keyed structured payload. The host
+//!   maintains a renderer table keyed on `schema_id`; tools and hosts agree
+//!   on the JSON shape of `payload` per schema. The host replies with
+//!   [`InteractionResponse::Approved`] (optionally carrying an edited
+//!   payload), [`InteractionResponse::Rejected`], or
+//!   [`InteractionResponse::Cancelled`].
+//!
+//! Two `schema_id` values are defined in this crate:
+//!
+//! - `"tool.confirm"` — emitted by the approval gate before running a Gated
+//!   tool. Payload: `{ tool_call_id, tool_name, arguments, activity, risk }`.
+//! - `"plan.submit"` — emitted by the `submit_plan` tool. Payload: a `Plan`
+//!   (see [`crate::plan`]).
 
 use serde_json::Value;
 use tokio::sync::oneshot;
-
-use crate::approval::ToolRisk;
-use crate::plan::Plan;
 
 /// A request from a tool (or the runtime) to the UI layer.
 pub struct InteractionRequest {
@@ -23,24 +39,20 @@ pub struct InteractionRequest {
 
 /// What the tool (or runtime) is asking for.
 pub enum InteractionKind {
-    /// Present a question with a set of options.
+    /// Present a question with a set of options. Replied with
+    /// [`InteractionResponse::Answer`] or [`InteractionResponse::Cancelled`].
     AskQuestion {
         question: String,
         options: Vec<QuestionOption>,
     },
-    /// Confirm execution of a tool call before it runs. Emitted by the
-    /// approval gate, not by tools themselves.
-    ConfirmTool {
-        tool_call_id: String,
-        tool_name: String,
-        arguments: Value,
-        activity: String,
-        risk: ToolRisk,
+    /// A schema-keyed structured interaction. Hosts dispatch on `schema_id`
+    /// to a per-schema renderer. The reply is one of
+    /// [`InteractionResponse::Approved`], [`InteractionResponse::Rejected`],
+    /// or [`InteractionResponse::Cancelled`].
+    Typed {
+        schema_id: String,
+        payload: Value,
     },
-    /// Submit a structured plan for review. The host renders, optionally
-    /// edits, and replies with `PlanApproved { plan }` (carrying the edited
-    /// body) or `Rejected { reason }`.
-    SubmitPlan { plan: Plan },
 }
 
 /// A single option in a question.
@@ -53,14 +65,13 @@ pub struct QuestionOption {
 pub enum InteractionResponse {
     /// User picked an option (the label string). Reply to `AskQuestion`.
     Answer(String),
+    /// User approved a `Typed` request. `payload` is `Some(value)` if the
+    /// host edited the body before approving (the tool deserializes it as
+    /// the schema dictates); `None` if the original payload should be used.
+    Approved { payload: Option<Value> },
+    /// User rejected a `Typed` request, with a reason that will be surfaced
+    /// to the model as the tool's error result.
+    Rejected { reason: String },
     /// User cancelled the interaction.
     Cancelled,
-    /// User approved a `ConfirmTool` request.
-    Approved,
-    /// User rejected a `ConfirmTool` or `SubmitPlan` request, with a reason
-    /// that will be surfaced to the model as the tool's error result.
-    Rejected { reason: String },
-    /// User approved a `SubmitPlan` request. The body is the (possibly-edited)
-    /// plan; `submit_plan` returns it to the model as the tool result.
-    PlanApproved { plan: Plan },
 }

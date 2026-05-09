@@ -173,9 +173,6 @@ async fn main() -> anyhow::Result<()> {
     builder.add_tool(Arc::new(tau_tools::ListTool::new()));
     builder.add_tool(Arc::new(tau_tools::WebFetchTool::new()));
     builder.add_tool(Arc::new(tau_tools::SubmitPlanTool::new()));
-    builder.add_tool(Arc::new(tau_tools::StepStartedTool::new()));
-    builder.add_tool(Arc::new(tau_tools::StepCompletedTool::new()));
-    builder.add_tool(Arc::new(tau_tools::PlanCompleteTool::new()));
     builder.add_tool(Arc::new(tau_tools::SubagentReportTool::new()));
 
     let lsp_manager = Arc::new(lsp::LspManager::new(std::env::current_dir()?).await);
@@ -278,12 +275,12 @@ async fn main() -> anyhow::Result<()> {
     let result = if let Some(command) = args.command {
         run_command::run_command(&handle, &command, interaction_rx).await
     } else if use_tui {
-        // TODO(approval-ui): until the TUI renders ConfirmTool prompts,
+        // TODO(approval-ui): until the TUI renders `tool.confirm` prompts,
         // auto-accept all elevated calls so bash etc. don't get rejected.
         // Same override is applied to the subagent manager so spawned
         // subagents inherit the same policy.
         let auto = Arc::new(tau_agent::AutoAcceptAllPolicy);
-        handle.set_approval_policy(auto.clone());
+        handle.set_approval_policy(auto.clone()).await?;
         mgr_for_commands.set_default_approval_policy(auto);
         // TUI mode
         let available_models = get_available_models();

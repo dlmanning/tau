@@ -274,26 +274,30 @@ impl AgentManager {
                         .store(subresult.agent_id.clone(), handle, desc.clone())
                         .await;
 
-                    parent_handle.follow_up(Message::subagent_completed(
-                        &subresult.agent_id,
-                        &desc,
-                        format!(
-                            "{}\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms]",
-                            subresult.text,
-                            subresult.agent_id,
-                            subresult.input_tokens,
-                            subresult.output_tokens,
-                            subresult.tool_use_count,
-                            subresult.duration_ms,
-                        ),
-                    ));
+                    let _ = parent_handle
+                        .follow_up(Message::subagent_completed(
+                            &subresult.agent_id,
+                            &desc,
+                            format!(
+                                "{}\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms]",
+                                subresult.text,
+                                subresult.agent_id,
+                                subresult.input_tokens,
+                                subresult.output_tokens,
+                                subresult.tool_use_count,
+                                subresult.duration_ms,
+                            ),
+                        ))
+                        .await;
                 }
                 Err(e) => {
-                    parent_handle.follow_up(Message::subagent_failed(
-                        &aid,
-                        &desc,
-                        format!("Error: {}", e),
-                    ));
+                    let _ = parent_handle
+                        .follow_up(Message::subagent_failed(
+                            &aid,
+                            &desc,
+                            format!("Error: {}", e),
+                        ))
+                        .await;
                 }
             }
         });
@@ -542,8 +546,14 @@ impl AgentManager {
 
     /// Send a message to a currently running agent via steering.
     pub async fn send_to_running(&self, id: &str, message: Message) -> bool {
-        if let Some((handle, _)) = self.running_handles.lock().await.get(id) {
-            handle.steer(message);
+        // Clone the handle out from under the lock so we don't hold the
+        // running_handles mutex across the steer().await.
+        let handle = {
+            let guard = self.running_handles.lock().await;
+            guard.get(id).map(|(h, _)| h.clone())
+        };
+        if let Some(handle) = handle {
+            let _ = handle.steer(message).await;
             true
         } else {
             false
@@ -603,12 +613,24 @@ impl AgentManager {
         let agent_id = agent_id.to_string();
         let desc = description.to_string();
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                let _ = tx.send(AgentEvent::Subagent {
-                    agent_id: agent_id.clone(),
-                    description: desc.clone(),
-                    event: Box::new(event),
-                });
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        let _ = tx.send(AgentEvent::Subagent {
+                            agent_id: agent_id.clone(),
+                            description: desc.clone(),
+                            event: Box::new(event),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            dropped = n,
+                            "subagent event stream lagged; dropped events will not reach the parent"
+                        );
+                    }
+                }
             }
         })
     }
@@ -1279,5 +1301,65 @@ mod tests {
         }
 
         assert!(!received.is_empty(), "should have forwarded events");
+    }
+
+    #[tokio::test]
+    async fn test_event_forwarder_survives_lagged() {
+        let manager = make_test_manager(20);
+
+        // Tiny child capacity so we can force Lagged: subscribe the
+        // forwarder, then overrun before it gets to poll.
+        let (child_tx, _keep_alive) = tokio::sync::broadcast::channel::<AgentEvent>(2);
+        let mut parent_rx = manager.parent_event_tx.subscribe();
+
+        // Subscribe the forwarder's receiver up front so the channel has
+        // an active subscriber for sends to land.
+        let forwarder_rx = child_tx.subscribe();
+
+        // Pre-fill beyond capacity. The forwarder is not running yet — it
+        // will see Lagged on its first poll.
+        for i in 0..5 {
+            child_tx
+                .send(AgentEvent::ToolExecutionStart {
+                    tool_call_id: format!("c{i}"),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                    activity: format!("Running bash {i}"),
+                })
+                .unwrap();
+        }
+
+        let task = manager.spawn_event_forwarder(forwarder_rx, "agent-lag", "lag test");
+
+        // After Lagged is observed, send another event the forwarder must
+        // still deliver. Give it a moment to drain the buffer first.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        child_tx
+            .send(AgentEvent::ToolExecutionStart {
+                tool_call_id: "c-after-lag".into(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({}),
+                activity: "after lag".into(),
+            })
+            .unwrap();
+
+        drop(child_tx);
+        let _ = task.await;
+
+        let mut saw_post_lag_event = false;
+        while let Ok(event) = parent_rx.try_recv() {
+            if let AgentEvent::Subagent { event, .. } = event {
+                if let AgentEvent::ToolExecutionStart { tool_call_id, .. } = *event {
+                    if tool_call_id == "c-after-lag" {
+                        saw_post_lag_event = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_post_lag_event,
+            "forwarder should keep delivering events after Lagged"
+        );
     }
 }

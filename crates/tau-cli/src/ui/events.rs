@@ -197,7 +197,10 @@ impl TuiState {
                                 id: None,
                             });
                             self.scroll_to_bottom();
-                            agent_handle.steer(tau_ai::Message::user(&content));
+                            if let Err(e) = agent_handle.try_steer(tau_ai::Message::user(&content))
+                            {
+                                self.status = format!("Steer dropped: {e}");
+                            }
                         }
                     }
                     _ => {

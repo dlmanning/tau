@@ -22,7 +22,7 @@ async fn follow_up_processed_after_prompt() {
     let h2 = handle.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        h2.follow_up(Message::user("background result"));
+        h2.follow_up(Message::user("background result")).await.unwrap();
         h2.consume_follow_up();
     });
 
@@ -111,7 +111,7 @@ async fn steering_during_tool_execution_skips_remaining() {
 
     // Wait for the slow tool to start, then steer
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    handle.steer(Message::user("new direction"));
+    handle.steer(Message::user("new direction")).await.unwrap();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx).await;
     assert!(result.is_ok());
