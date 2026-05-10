@@ -346,6 +346,18 @@ impl AgentHandle {
         self.agent_id.get().map(String::as_str)
     }
 
+    /// Clone of the inner `Arc<OnceLock<String>>` carrying this agent's
+    /// id. Tools that need to refer to their owning agent without holding
+    /// a full `AgentHandle` (which forms a tools→handle→channel→actor
+    /// cycle preventing the actor from exiting on eviction) capture this
+    /// shared cell and call `.get()` at use time. The cell is populated
+    /// when the manager stamps an id (via spawn or `adopt`), so capturing
+    /// it pre-spawn from `pre_handle()` and reading it at execute time
+    /// works.
+    pub fn agent_id_arc(&self) -> Arc<OnceLock<String>> {
+        self.agent_id.clone()
+    }
+
     // === Respec ===
     //
     // Spec changes are new agents, full stop. The runtime treats every

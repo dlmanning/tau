@@ -1,7 +1,7 @@
 //! Agent tool — spawn subagents for parallel work
 use crate::cached_schema;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -47,23 +47,33 @@ struct AgentArgs {
 }
 
 /// Tool for spawning independent subagents.
+///
+/// **Reference shape (avoids actor leaks)**: this tool deliberately holds
+/// `Weak<AgentManager>` and an `Arc<OnceLock<String>>` of its owning
+/// agent's id, *not* `Arc<AgentManager>` or `AgentHandle`. The strong
+/// versions would form two cycles —
+/// `manager → agent_specs → AgentSpec → tools → AgentTool → manager`,
+/// and `actor task → AgentState.tools → AgentTool → AgentHandle →
+/// channel → actor` — preventing the actor from exiting on eviction. By
+/// holding only weak references, eviction lets the actor see its
+/// channels close and the loop exit cleanly. The live handle is fetched
+/// on demand via [`AgentManager::handle_for`].
 pub struct AgentTool {
-    manager: Arc<AgentManager>,
+    manager: Weak<AgentManager>,
     /// Depth this tool sits at in the recursive spawn tree. `0` for a
     /// root agent's own AgentTool; the host's resolver bumps it by 1
     /// when constructing each child's spec.
     depth: u32,
-    /// Handle of the agent that *owns* this tool, captured via
-    /// [`Tool::bind_to_agent`] when the runtime spawns its agent.
-    /// `with_handle` pre-populates it for the root agent that's built
-    /// directly via `AgentBuilder` (and therefore bypasses
-    /// `bind_to_agent`).
+    /// Shared id-cell of the agent that *owns* this tool. Captured via
+    /// [`Tool::bind_to_agent`] (or `with_handle` for the root) by cloning
+    /// the handle's inner `Arc<OnceLock<String>>`. We share the cell, so
+    /// when the manager later stamps the id on the handle, this tool
+    /// sees it without holding the handle itself.
     ///
-    /// `Arc<OnceLock<...>>` so the value can be filled in *after*
-    /// construction (the new agent's handle doesn't exist yet when the
-    /// resolver builds the spec) while still being shared across all
-    /// clones of this tool Arc.
-    agent_handle: Arc<OnceLock<AgentHandle>>,
+    /// Outer `OnceLock` records "we have been bound to a handle." Inner
+    /// `Arc<OnceLock<String>>` is the handle's id-cell, populated by the
+    /// manager when it spawns or `adopt`s.
+    agent_id_ref: OnceLock<Arc<OnceLock<String>>>,
     /// If set, only these spec names are allowed. None means no restriction.
     allowed_specs: Option<Vec<String>>,
     /// Resolves a `subagent_type` string to a fully-built [`AgentSpec`].
@@ -80,9 +90,9 @@ pub struct AgentTool {
 impl AgentTool {
     pub fn new(manager: Arc<AgentManager>, depth: u32) -> Self {
         Self {
-            manager,
+            manager: Arc::downgrade(&manager),
             depth,
-            agent_handle: Arc::new(OnceLock::new()),
+            agent_id_ref: OnceLock::new(),
             allowed_specs: None,
             spec_resolver: None,
             inherited_policy: None,
@@ -94,8 +104,13 @@ impl AgentTool {
     /// [`Tool::bind_to_agent`]. For subagent tools assembled by a
     /// resolver, leave this unset and let the manager's spawn flow bind
     /// it via the trait hook.
+    ///
+    /// The handle itself is *not* retained — only its `agent_id_arc()`
+    /// is. The cell may be empty at call time (e.g. a `pre_handle()`
+    /// from the builder); it gets populated when the manager `adopt`s
+    /// the spawned handle.
     pub fn with_handle(self, handle: AgentHandle) -> Self {
-        let _ = self.agent_handle.set(handle);
+        let _ = self.agent_id_ref.set(handle.agent_id_arc());
         self
     }
 
@@ -114,6 +129,15 @@ impl AgentTool {
     pub fn with_inherited_policy(mut self, policy: Arc<dyn ApprovalPolicy>) -> Self {
         self.inherited_policy = Some(policy);
         self
+    }
+
+    /// Best-effort lookup of the owning agent's id. Returns `None` if
+    /// the tool was never bound or the id hasn't been stamped yet.
+    fn owning_agent_id(&self) -> Option<String> {
+        self.agent_id_ref
+            .get()
+            .and_then(|cell| cell.get())
+            .cloned()
     }
 }
 
@@ -150,17 +174,28 @@ impl Tool for AgentTool {
     fn bind_to_agent(&self, handle: &AgentHandle) {
         // First-write-wins; ignore if already pre-bound via `with_handle`
         // (the root case) or already bound for this agent.
-        let _ = self.agent_handle.set(handle.clone());
+        let _ = self.agent_id_ref.set(handle.agent_id_arc());
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
+        // Upgrade once at the top — if the manager has been dropped,
+        // there's no spawning to do regardless of which branch we'd take.
+        let manager = match self.manager.upgrade() {
+            Some(m) => m,
+            None => {
+                return ToolResult::error(
+                    "AgentTool: parent AgentManager has been dropped; cannot spawn",
+                );
+            }
+        };
+
         let args: AgentArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
 
         if let Some(ref agent_id) = args.to {
-            return match self.manager.send(agent_id, &args.prompt, ctx.cancel).await {
+            return match manager.send(agent_id, &args.prompt, ctx.cancel).await {
                 Ok(result) => ToolResult::text(format_result(&result)),
                 Err(e) => ToolResult::error(format!("Resume failed: {}", e)),
             };
@@ -215,20 +250,37 @@ impl Tool for AgentTool {
         };
 
         if run_in_background {
-            if let Some(handle) = self.agent_handle.get() {
-                let agent_id = self
-                    .manager
-                    .spawn_background(spec, args.prompt, opts, handle.clone(), ctx.cancel)
-                    .await;
-                ToolResult::text(format!(
-                    "Agent launched in background ({}): {}",
-                    agent_id, args.description
-                ))
-            } else {
-                ToolResult::error("Cannot run background agent: no parent handle")
-            }
+            // spawn_background needs a live parent handle to post the
+            // FollowUp on completion. Look it up via running_handles —
+            // the parent must be running, since this tool is firing
+            // mid-prompt on its behalf.
+            let parent_id = match self.owning_agent_id() {
+                Some(id) => id,
+                None => {
+                    return ToolResult::error(
+                        "Cannot run background agent: this AgentTool was never bound to an owning agent",
+                    );
+                }
+            };
+            let parent_handle = match manager.handle_for(&parent_id).await {
+                Some(h) => h,
+                None => {
+                    return ToolResult::error(format!(
+                        "Cannot run background agent: parent agent '{}' not found in running handles \
+                         (evicted or not yet registered)",
+                        parent_id
+                    ));
+                }
+            };
+            let agent_id = manager
+                .spawn_background(spec, args.prompt, opts, parent_handle, ctx.cancel)
+                .await;
+            ToolResult::text(format!(
+                "Agent launched in background ({}): {}",
+                agent_id, args.description
+            ))
         } else {
-            match self.manager.spawn(spec, args.prompt, opts, ctx.cancel).await {
+            match manager.spawn(spec, args.prompt, opts, ctx.cancel).await {
                 Ok(result) => ToolResult::text(format_result(&result)),
                 Err(e) => ToolResult::error(format!("Agent failed: {}", e)),
             }
@@ -255,4 +307,68 @@ fn format_result(result: &tau_agent::manager::SubagentResult) -> String {
     meta.push(']');
     output.push_str(&meta);
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tau_agent::manager::AgentManager;
+    use tau_agent::test_utils::{MockTransport, make_test_config};
+    use tau_agent::AgentEvent;
+    use tokio::sync::broadcast;
+
+    fn make_manager() -> Arc<AgentManager> {
+        let (tx, _) = broadcast::channel::<AgentEvent>(16);
+        let transport = Arc::new(MockTransport::new()) as Arc<dyn tau_agent::Transport>;
+        Arc::new(AgentManager::new(tx, make_test_config(), transport, 4))
+    }
+
+    /// Regression: an AgentTool inside an AgentSpec must not pin the
+    /// manager. The cycle `manager → agent_specs → AgentSpec → tools →
+    /// AgentTool → manager` was a strong cycle when AgentTool held
+    /// `Arc<AgentManager>`; switching to `Weak<AgentManager>` breaks it,
+    /// so dropping the host's manager Arc actually frees the manager.
+    #[test]
+    fn agent_tool_holds_weak_manager() {
+        let manager = make_manager();
+        let tool = AgentTool::new(Arc::clone(&manager), 0);
+        let weak_manager = Arc::downgrade(&manager);
+        // Drop the host's strong reference. The tool still references the
+        // manager, but only via Weak — so the strong count is now 0 and
+        // the manager is freed.
+        drop(manager);
+        assert!(
+            weak_manager.upgrade().is_none(),
+            "AgentTool holds a strong reference to AgentManager — registry cycle leaks"
+        );
+        // Tool itself is still usable as a value (would error on
+        // execute, but doesn't crash on construction or drop).
+        drop(tool);
+    }
+
+    /// Regression: `bind_to_agent` must not retain the AgentHandle. The
+    /// cycle `actor task → AgentState.tools → AgentTool → AgentHandle →
+    /// channel sender → actor` would otherwise prevent the actor from
+    /// exiting when external handles drop.
+    #[test]
+    fn bind_to_agent_does_not_retain_handle() {
+        use tau_agent::AgentBuilder;
+
+        let manager = make_manager();
+        let tool = AgentTool::new(Arc::clone(&manager), 0);
+
+        // Build a handle to bind against.
+        let builder = AgentBuilder::new(make_test_config(), Arc::new(MockTransport::new()) as Arc<dyn tau_agent::Transport>);
+        let handle = builder.pre_handle();
+
+        // Bind. AgentTool should now know its owning agent's id-cell, but
+        // not hold the handle itself.
+        tool.bind_to_agent(&handle);
+
+        // The agent_id_ref OnceLock now holds a clone of the handle's
+        // inner Arc<OnceLock<String>>. We can verify this by setting an
+        // id on the handle and reading it back through the tool.
+        let _ = handle.agent_id_arc().set("test-id".to_string());
+        assert_eq!(tool.owning_agent_id().as_deref(), Some("test-id"));
+    }
 }

@@ -1,7 +1,7 @@
 //! SendMessage tool — send a message to a running or idle agent.
 use crate::cached_schema;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -17,13 +17,20 @@ struct SendMessageArgs {
     message: String,
 }
 
+/// Tool for sending messages between agents. Holds a `Weak<AgentManager>`
+/// for the same reason as `AgentTool`: a strong `Arc<AgentManager>` here
+/// would form a `manager → agent_specs → AgentSpec → tools →
+/// SendMessageTool → manager` cycle that prevents the manager from
+/// dropping when the host releases its reference.
 pub struct SendMessageTool {
-    manager: Arc<AgentManager>,
+    manager: Weak<AgentManager>,
 }
 
 impl SendMessageTool {
     pub fn new(manager: Arc<AgentManager>) -> Self {
-        Self { manager }
+        Self {
+            manager: Arc::downgrade(&manager),
+        }
     }
 }
 
@@ -45,6 +52,15 @@ impl Tool for SendMessageTool {
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
+        let manager = match self.manager.upgrade() {
+            Some(m) => m,
+            None => {
+                return ToolResult::error(
+                    "SendMessageTool: parent AgentManager has been dropped",
+                );
+            }
+        };
+
         let args: SendMessageArgs = match serde_json::from_value(arguments) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
@@ -53,7 +69,7 @@ impl Tool for SendMessageTool {
         let to = &args.to;
         let message = &args.message;
 
-        let (agent_id, description, status) = match self.manager.find_agent(to).await {
+        let (agent_id, description, status) = match manager.find_agent(to).await {
             Some(found) => found,
             None => {
                 return ToolResult::error(format!(
@@ -69,7 +85,7 @@ impl Tool for SendMessageTool {
 
         match status {
             AgentStatus::Running => {
-                self.manager
+                manager
                     .send_to_running(&agent_id, tau_ai::Message::user(&wrapped))
                     .await;
                 ToolResult::text(format!(
@@ -77,7 +93,7 @@ impl Tool for SendMessageTool {
                     description, agent_id
                 ))
             }
-            AgentStatus::Idle => match self.manager.send(&agent_id, &wrapped, ctx.cancel).await {
+            AgentStatus::Idle => match manager.send(&agent_id, &wrapped, ctx.cancel).await {
                 Ok(result) => ToolResult::text(format!(
                     "{}\n[Agent {} resumed | {} in + {} out tokens | {} tool calls | {}ms]",
                     result.text,

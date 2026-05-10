@@ -376,6 +376,18 @@ impl AgentManager {
         None
     }
 
+    /// Look up the live `AgentHandle` for a currently-running agent by
+    /// id. Returns `None` if the agent isn't running (idle, evicted, or
+    /// never spawned). Tools that hold a `Weak<AgentManager>` + agent id
+    /// (rather than a strong handle) reach the live handle through this.
+    pub async fn handle_for(&self, agent_id: &str) -> Option<AgentHandle> {
+        self.running_handles
+            .lock()
+            .await
+            .get(agent_id)
+            .map(|(h, _)| h.clone())
+    }
+
     /// Send a message to a currently running agent via steering.
     pub async fn send_to_running(&self, id: &str, message: Message) -> bool {
         let handle = {

@@ -32,3 +32,6 @@ dirs = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tau-agent = { workspace = true, features = ["test-utils"] }
