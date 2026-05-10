@@ -28,14 +28,8 @@ pub(crate) enum Command {
     // === Config mutations (fire-and-forget) ===
     SetModel(Model),
     SetReasoning(ReasoningLevel),
-    SetSystemPrompt(String),
     SetCompactionConfig(CompactionConfig),
     SetApprovalPolicy(Arc<dyn ApprovalPolicy>),
-
-    // === Conversation mutations (fire-and-forget) ===
-    ClearMessages,
-    SetMessages(Vec<Message>),
-    SetPreviousSummary(Option<String>),
 
     // === Queries (request-reply via oneshot) ===
     GetConfig(oneshot::Sender<AgentConfig>),

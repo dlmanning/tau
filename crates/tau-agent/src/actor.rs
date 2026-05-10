@@ -21,7 +21,7 @@ use crate::events::AgentEvent;
 use crate::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
 use crate::logic::{self, FollowUpAction, ResponseAction};
 use crate::overflow::is_context_overflow;
-use crate::state::{AgentState, ConversationOp, ToolCall};
+use crate::state::{AgentState, ToolCall};
 use crate::stream::{StreamOutcome, StreamReducer};
 use crate::tool::{ExecutionContext, ProgressSender, ToolResult, send_event};
 use crate::tool_executor::run_single_tool;
@@ -477,16 +477,6 @@ pub(crate) async fn run_actor(
                 state.is_running.store(false, Ordering::Release);
                 state.conversation.is_streaming = false;
 
-                // Drain any conversation mutations that arrived mid-prompt
-                // BEFORE emitting AgentEnd, so consumers reading messages()
-                // on AgentEnd see the post-drain state.
-                if !state.pending_conversation_ops.is_empty() {
-                    let ops = std::mem::take(&mut state.pending_conversation_ops);
-                    for op in ops {
-                        apply_conversation_op(&mut state, op);
-                    }
-                }
-
                 send_event(
                     &state.event_tx,
                     AgentEvent::AgentEnd {
@@ -553,20 +543,6 @@ fn handle_idle_command(
             }
         }
 
-        // Conversation mutations are safe at idle — apply immediately.
-        Command::ClearMessages => {
-            apply_conversation_op(state, ConversationOp::Clear);
-            StepPhase::Idle
-        }
-        Command::SetMessages(msgs) => {
-            apply_conversation_op(state, ConversationOp::Set(msgs));
-            StepPhase::Idle
-        }
-        Command::SetPreviousSummary(s) => {
-            apply_conversation_op(state, ConversationOp::SetPreviousSummary(s));
-            StepPhase::Idle
-        }
-
         other => {
             handle_busy_command(state, other);
             StepPhase::Idle
@@ -590,7 +566,6 @@ fn handle_busy_command(state: &mut AgentState, cmd: Command) {
         // Config mutations
         Command::SetModel(m) => state.config.model = m,
         Command::SetReasoning(l) => state.config.reasoning = l,
-        Command::SetSystemPrompt(s) => state.config.system_prompt = Some(s),
         Command::SetCompactionConfig(c) => state.config.compaction = c,
         Command::SetApprovalPolicy(p) => state.approval_policy = p,
 
@@ -607,70 +582,11 @@ fn handle_busy_command(state: &mut AgentState, cmd: Command) {
             });
         }
 
-        // Conversation mutations: BUFFER, don't apply.
-        //
-        // Mid-prompt clear/set would wipe the assistant message holding the
-        // in-flight tool_use blocks, leaving orphan tool_result messages
-        // that providers reject. Defer until the prompt finishes; the actor
-        // drains the queue in the `Done` arm before emitting `AgentEnd`.
-        Command::ClearMessages => {
-            state.pending_conversation_ops.push(ConversationOp::Clear);
-            send_event(
-                &state.event_tx,
-                AgentEvent::ConversationOpDeferred {
-                    kind: crate::events::DeferredOpKind::Clear,
-                },
-            );
-        }
-        Command::SetMessages(msgs) => {
-            state
-                .pending_conversation_ops
-                .push(ConversationOp::Set(msgs));
-            send_event(
-                &state.event_tx,
-                AgentEvent::ConversationOpDeferred {
-                    kind: crate::events::DeferredOpKind::SetMessages,
-                },
-            );
-        }
-        Command::SetPreviousSummary(s) => {
-            state
-                .pending_conversation_ops
-                .push(ConversationOp::SetPreviousSummary(s));
-            send_event(
-                &state.event_tx,
-                AgentEvent::ConversationOpDeferred {
-                    kind: crate::events::DeferredOpKind::SetPreviousSummary,
-                },
-            );
-        }
-
         Command::Compact { reply, .. } => {
             let _ = reply.send(PromptResult {
                 result: Err(crate::error::Error::Busy),
             });
         }
-    }
-}
-
-/// Apply a single conversation op to state. Used both at idle (immediate)
-/// and during the `Done` phase drain (deferred mid-prompt ops).
-fn apply_conversation_op(state: &mut AgentState, op: ConversationOp) {
-    match op {
-        ConversationOp::Clear => {
-            state.conversation.messages.clear();
-            state.conversation.total_usage = Default::default();
-            state.conversation.previous_summary = None;
-            state.file_access.lock().clear();
-        }
-        ConversationOp::Set(msgs) => {
-            state
-                .file_access
-                .lock()
-                .rebuild_from_messages(&msgs, &state.cwd);
-            state.conversation.messages = msgs;
-        }
-        ConversationOp::SetPreviousSummary(s) => state.conversation.previous_summary = s,
     }
 }
 

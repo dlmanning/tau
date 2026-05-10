@@ -285,7 +285,7 @@ async fn subagent_interaction_is_stamped_with_agent_id() {
     // Build a fake "subagent" by directly calling submit_plan from a tool
     // execution context that has the wrapped sender — easiest end-to-end
     // check is just to verify the wrapper stamping logic via the manager.
-    use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
+    use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
     use tau_agent::transport::Transport;
 
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AgentEvent>(64);
@@ -302,9 +302,9 @@ async fn subagent_interaction_is_stamped_with_agent_id() {
             .with_text_response("plan handled"),
     );
 
-    let tools: Vec<BoxedTool> = vec![Arc::new(SubmitPlanTool::new())];
+    let plan_tools: Vec<BoxedTool> = vec![Arc::new(SubmitPlanTool::new())];
     let manager = Arc::new(
-        AgentManager::new(event_tx, tools, test_config(), transport, 4)
+        AgentManager::new(event_tx, test_config(), transport, 4)
             .with_parent_interaction_sender(interaction_tx),
     );
 
@@ -326,18 +326,21 @@ async fn subagent_interaction_is_stamped_with_agent_id() {
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let request = SpawnRequest {
-        agent_type: AgentType::Plan,
-        prompt: "plan it".into(),
-        description: "plan run".into(),
-        model: None,
-        cwd: None,
-        isolation: None,
-        depth: 0,
-        inherit_history_from: None,
-        approval_policy: None,
+    let spec = AgentSpec {
+        system_prompt: String::new(),
+        tools: plan_tools,
+        max_turns: 200,
+        allows_worktree: false,
+        allowed_subagent_specs: None,
     };
-    let result = manager.spawn(request, cancel).await.expect("spawn");
+    let opts = SpawnOpts {
+        description: "plan run".into(),
+        ..Default::default()
+    };
+    let result = manager
+        .spawn(spec, "plan it".to_string(), opts, cancel)
+        .await
+        .expect("spawn");
 
     let stamped = captured_id
         .lock()
@@ -363,7 +366,7 @@ async fn subagent_interaction_is_stamped_with_agent_id() {
 
 #[tokio::test]
 async fn inherit_history_from_seeds_executor_with_planner_messages() {
-    use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
+    use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
     use tau_agent::transport::{AgentEventStream, AgentRunConfig, Transport};
 
     // Capturing transport: each call records the messages it received.
@@ -407,32 +410,34 @@ async fn inherit_history_from_seeds_executor_with_planner_messages() {
     });
     let transport_dyn: Arc<dyn Transport> = transport.clone();
 
-    let tools: Vec<BoxedTool> = vec![];
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AgentEvent>(64);
     let manager = Arc::new(AgentManager::new(
         event_tx,
-        tools,
         test_config(),
         transport_dyn,
-        4,
-    ));
+        4));
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    // Step 1: spawn a "planner" subagent. It runs one turn and terminates.
-    let plan_req = SpawnRequest {
-        agent_type: AgentType::Plan,
-        prompt: "design module X".into(),
-        description: "planner".into(),
-        model: None,
-        cwd: None,
-        isolation: None,
-        depth: 0,
-        inherit_history_from: None,
-        approval_policy: None,
+    let bare_spec = || AgentSpec {
+        system_prompt: String::new(),
+        tools: vec![],
+        max_turns: 200,
+        allows_worktree: false,
+        allowed_subagent_specs: None,
     };
+
+    // Step 1: spawn a "planner" subagent. It runs one turn and terminates.
     let plan_result = manager
-        .spawn(plan_req, cancel.clone())
+        .spawn(
+            bare_spec(),
+            "design module X".to_string(),
+            SpawnOpts {
+                description: "planner".into(),
+                ..Default::default()
+            },
+            cancel.clone(),
+        )
         .await
         .expect("planner spawn");
     let planner_id = plan_result.agent_id.clone();
@@ -442,18 +447,19 @@ async fn inherit_history_from_seeds_executor_with_planner_messages() {
     assert!(calls_after_planner >= 1, "planner ran at least one turn");
 
     // Step 2: spawn an "executor" with inherit_history_from = planner_id.
-    let exec_req = SpawnRequest {
-        agent_type: AgentType::GeneralPurpose,
-        prompt: "execute the approved plan".into(),
-        description: "executor".into(),
-        model: None,
-        cwd: None,
-        isolation: None,
-        depth: 0,
-        inherit_history_from: Some(planner_id.clone()),
-        approval_policy: None,
-    };
-    manager.spawn(exec_req, cancel).await.expect("executor spawn");
+    manager
+        .spawn(
+            bare_spec(),
+            "execute the approved plan".to_string(),
+            SpawnOpts {
+                description: "executor".into(),
+                inherit_history_from: Some(planner_id.clone()),
+                ..Default::default()
+            },
+            cancel,
+        )
+        .await
+        .expect("executor spawn");
 
     // Inspect the executor's first transport call: it should include the
     // planner's user prompt (proving the seed) AND the executor's new prompt.
@@ -482,11 +488,11 @@ async fn inherit_history_from_seeds_executor_with_planner_messages() {
 }
 
 #[tokio::test]
-async fn executor_prompt_appended_only_when_inheriting() {
-    // CapturingTransport records the system_prompt the agent runs with.
-    // Spawn one fresh GeneralPurpose subagent and one inheriting the
-    // first's history; only the second should see the executor fragment.
-    use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
+async fn host_supplied_system_prompt_reaches_subagent_run() {
+    // The runtime no longer auto-appends an executor fragment for
+    // inherit_history_from spawns; that's a host concern. Verify that the
+    // spec's `system_prompt` is what the LLM sees.
+    use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
     use tau_agent::transport::Transport;
 
     let transport = CapturingTransport::create("ack");
@@ -494,98 +500,182 @@ async fn executor_prompt_appended_only_when_inheriting() {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AgentEvent>(64);
     let manager = Arc::new(AgentManager::new(
         event_tx,
-        vec![],
         test_config(),
         transport_dyn,
         4,
     ));
 
     let cancel = tokio_util::sync::CancellationToken::new();
-
-    let first = manager
-        .spawn(
-            SpawnRequest {
-                agent_type: AgentType::GeneralPurpose,
-                prompt: "do thing".into(),
-                description: "first".into(),
-                model: None,
-                cwd: None,
-                isolation: None,
-                depth: 0,
-                inherit_history_from: None,
-                approval_policy: None,
-            },
-            cancel.clone(),
-        )
-        .await
-        .expect("first spawn");
-
+    let spec = AgentSpec {
+        system_prompt: "HOST_MARKER_PLAN_EXEC".to_string(),
+        tools: vec![],
+        max_turns: 200,
+        allows_worktree: false,
+        allowed_subagent_specs: None,
+    };
     manager
         .spawn(
-            SpawnRequest {
-                agent_type: AgentType::GeneralPurpose,
-                prompt: "now execute".into(),
-                description: "executor".into(),
-                model: None,
-                cwd: None,
-                isolation: None,
-                depth: 0,
-                inherit_history_from: Some(first.agent_id),
-                approval_policy: None,
+            spec,
+            "go".to_string(),
+            SpawnOpts {
+                description: "with marker".into(),
+                ..Default::default()
             },
             cancel,
         )
         .await
-        .expect("executor spawn");
+        .expect("spawn");
 
     let calls = transport.calls();
     let prompts: Vec<String> = calls
         .iter()
         .filter_map(|c| c.system_prompt.clone())
         .collect();
-    let with_marker = prompts
-        .iter()
-        .filter(|p| p.contains("Plan Executor Mode"))
-        .count();
-    let without_marker = prompts
-        .iter()
-        .filter(|p| !p.contains("Plan Executor Mode"))
-        .count();
     assert!(
-        with_marker >= 1,
-        "executor's prompt contains the executor fragment"
+        prompts.iter().any(|p| p.contains("HOST_MARKER_PLAN_EXEC")),
+        "spec.system_prompt reaches the transport"
+    );
+}
+
+#[tokio::test]
+async fn seed_messages_overrides_inherit_history_from() {
+    // When SpawnOpts carries both seed_messages and inherit_history_from,
+    // the explicit seed wins and no source-id lookup happens. Used by
+    // /branch to spawn a fresh agent with a truncated message vector.
+    use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
+    use tau_agent::transport::{AgentEventStream, AgentRunConfig, Transport};
+
+    struct CapturingTransport {
+        captured: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl Transport for CapturingTransport {
+        async fn run(
+            &self,
+            messages: Vec<Message>,
+            _config: &AgentRunConfig,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> tau_ai::Result<AgentEventStream> {
+            self.captured.lock().unwrap().push(messages);
+            let msg = tau_ai::Message::Assistant {
+                content: vec![tau_ai::Content::text("ok")],
+                metadata: tau_ai::AssistantMetadata::default(),
+            };
+            let events = vec![
+                AgentEvent::TurnStart { turn_number: 1 },
+                AgentEvent::MessageEnd { message: msg.clone() },
+                AgentEvent::TurnEnd {
+                    turn_number: 1,
+                    message: msg,
+                    usage: tau_ai::Usage::default(),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+    let transport = Arc::new(CapturingTransport {
+        captured: std::sync::Mutex::new(vec![]),
+    });
+    let transport_dyn: Arc<dyn Transport> = transport.clone();
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+    let manager = Arc::new(AgentManager::new(event_tx, test_config(), transport_dyn, 4));
+
+    let bare_spec = || AgentSpec {
+        system_prompt: String::new(),
+        tools: vec![],
+        max_turns: 200,
+        allows_worktree: false,
+        allowed_subagent_specs: None,
+    };
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    // Spawn one agent so we have a stored id we could (but won't) inherit.
+    let stored = manager
+        .spawn(
+            bare_spec(),
+            "stored prompt".into(),
+            SpawnOpts { description: "stored".into(), ..Default::default() },
+            cancel.clone(),
+        )
+        .await
+        .expect("stored");
+    let calls_before = transport.captured.lock().unwrap().len();
+
+    // Now spawn with seed_messages set AND inherit_history_from set.
+    // seed_messages must win — the executor should see exactly the
+    // explicit seed plus its own user prompt.
+    let seed = vec![Message::user("explicit-seed-marker")];
+    manager
+        .spawn(
+            bare_spec(),
+            "follow up".into(),
+            SpawnOpts {
+                description: "branch".into(),
+                seed_messages: Some(seed),
+                inherit_history_from: Some(stored.agent_id.clone()),
+                ..Default::default()
+            },
+            cancel,
+        )
+        .await
+        .expect("branch spawn");
+
+    let calls = transport.captured.lock().unwrap();
+    let branch_call = &calls[calls_before];
+    let texts: Vec<String> = branch_call
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content, .. } => {
+                Some(content.iter().filter_map(|c| c.as_text()).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("explicit-seed-marker")),
+        "explicit seed reaches the transport: {texts:?}"
     );
     assert!(
-        without_marker >= 1,
-        "first agent's prompt does NOT contain the executor fragment"
+        !texts.iter().any(|t| t.contains("stored prompt")),
+        "stored agent's history was NOT inherited: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("follow up")),
+        "the new prompt is appended: {texts:?}"
     );
 }
 
 #[tokio::test]
 async fn inherit_history_from_unknown_id_errors() {
-    use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
+    use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
     use tau_agent::transport::Transport;
 
     let transport: Arc<dyn Transport> = Arc::new(
         MockTransport::new().with_text_response("never reached"),
     );
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AgentEvent>(16);
-    let manager = Arc::new(AgentManager::new(event_tx, vec![], test_config(), transport, 4));
+    let manager = Arc::new(AgentManager::new(event_tx, test_config(), transport, 4));
 
-    let req = SpawnRequest {
-        agent_type: AgentType::GeneralPurpose,
-        prompt: "go".into(),
+    let spec = AgentSpec {
+        system_prompt: String::new(),
+        tools: vec![],
+        max_turns: 200,
+        allows_worktree: false,
+        allowed_subagent_specs: None,
+    };
+    let opts = SpawnOpts {
         description: "exec".into(),
-        model: None,
-        cwd: None,
-        isolation: None,
-        depth: 0,
         inherit_history_from: Some("nonexistent-id".into()),
-        approval_policy: None,
+        ..Default::default()
     };
 
     let err = manager
-        .spawn(req, tokio_util::sync::CancellationToken::new())
+        .spawn(
+            spec,
+            "go".to_string(),
+            opts,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .expect_err("should fail when source id missing");
     assert!(

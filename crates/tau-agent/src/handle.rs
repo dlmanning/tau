@@ -4,7 +4,7 @@
 //! Fire-and-forget methods use `try_send`. Abort cancels the shared
 //! `CancellationToken` inside `Arc<Mutex<>>`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use crate::compaction::{CompactionConfig, CompactionReason};
 use crate::config::AgentConfig;
 use crate::conversation::Conversation;
 use crate::events::AgentEvent;
+use crate::manager::{AgentManager, AgentSpec};
 
 /// Cloneable handle to a running agent. All methods take `&self`.
 /// This is the only way external code interacts with the agent.
@@ -46,6 +47,15 @@ pub struct AgentHandle {
     /// closing the race between channel-close (visible to the handle as
     /// `SendError`) and the panic reason being recorded.
     pub(crate) shutdown_signaled: Arc<Notify>,
+    /// Manager-assigned id, set when the handle was produced by the
+    /// `AgentManager` (or registered with one). `None` for builder-spawned
+    /// root agents that never met a manager — those can't `respec`.
+    pub(crate) agent_id: Arc<OnceLock<String>>,
+    /// Weak reference back to the `AgentManager` that owns this agent.
+    /// `respec` / `with_system_prompt` / `with_tools` need this to look up
+    /// the current spec and dispatch a fresh-agent spawn. `None` for
+    /// unmanaged handles.
+    pub(crate) manager: Arc<OnceLock<Weak<AgentManager>>>,
 }
 
 impl AgentHandle {
@@ -225,14 +235,6 @@ impl AgentHandle {
         self.send_command(Command::SetReasoning(level)).await
     }
 
-    pub fn try_set_system_prompt(&self, prompt: String) -> crate::error::Result<()> {
-        self.try_send_command(Command::SetSystemPrompt(prompt))
-    }
-
-    pub async fn set_system_prompt(&self, prompt: String) -> crate::error::Result<()> {
-        self.send_command(Command::SetSystemPrompt(prompt)).await
-    }
-
     pub fn try_set_compaction_config(&self, config: CompactionConfig) -> crate::error::Result<()> {
         self.try_send_command(Command::SetCompactionConfig(config))
     }
@@ -257,43 +259,6 @@ impl AgentHandle {
         policy: Arc<dyn ApprovalPolicy>,
     ) -> crate::error::Result<()> {
         self.send_command(Command::SetApprovalPolicy(policy)).await
-    }
-
-    // --- Conversation mutations (normal channel) ---
-    //
-    // If issued mid-prompt, these are buffered and applied after the
-    // current prompt's `Done` phase, before `AgentEnd`; the host receives
-    // an [`AgentEvent::ConversationOpDeferred`] when buffering happens.
-    // **Buffered ops are best-effort:** if the actor terminates (panic,
-    // cancellation, all handles released) before reaching `Done`, the
-    // queued mutation is dropped. Hosts that need durability should
-    // persist the mutation themselves before issuing it.
-
-    pub fn try_clear_messages(&self) -> crate::error::Result<()> {
-        self.try_send_command(Command::ClearMessages)
-    }
-
-    pub async fn clear_messages(&self) -> crate::error::Result<()> {
-        self.send_command(Command::ClearMessages).await
-    }
-
-    pub fn try_set_messages(&self, messages: Vec<tau_ai::Message>) -> crate::error::Result<()> {
-        self.try_send_command(Command::SetMessages(messages))
-    }
-
-    pub async fn set_messages(&self, messages: Vec<tau_ai::Message>) -> crate::error::Result<()> {
-        self.send_command(Command::SetMessages(messages)).await
-    }
-
-    pub fn try_set_previous_summary(&self, summary: Option<String>) -> crate::error::Result<()> {
-        self.try_send_command(Command::SetPreviousSummary(summary))
-    }
-
-    pub async fn set_previous_summary(
-        &self,
-        summary: Option<String>,
-    ) -> crate::error::Result<()> {
-        self.send_command(Command::SetPreviousSummary(summary)).await
     }
 
     // === Abort ===
@@ -372,5 +337,82 @@ impl AgentHandle {
     /// Whether the agent is currently executing a prompt.
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
+    }
+
+    /// Manager-assigned agent id, when this handle came from (or was
+    /// registered with) an `AgentManager`. `None` for builder-spawned
+    /// root agents.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.get().map(String::as_str)
+    }
+
+    // === Respec ===
+    //
+    // Spec changes are new agents, full stop. The runtime treats every
+    // `AgentSpec` as immutable for the agent's lifetime. To change one,
+    // call `respec` (or one of the `with_*` convenience wrappers): the
+    // manager spawns a fresh agent inheriting this agent's history under
+    // the new spec and returns the new handle. The host then drives the
+    // returned handle.
+
+    /// Continue this conversation under a new spec. Requires the agent
+    /// to be idle and to have been produced by an `AgentManager`. The
+    /// returned handle is for the new agent; the old idle entry is
+    /// dropped (see [`AgentManager::respec`]).
+    pub async fn respec(
+        self,
+        new_spec: impl Into<std::sync::Arc<AgentSpec>>,
+    ) -> crate::error::Result<AgentHandle> {
+        let (mgr, id) = self.manager_and_id()?;
+        mgr.respec(&id, new_spec).await
+    }
+
+    /// Convenience: respec, changing only the system prompt.
+    pub async fn with_system_prompt(
+        self,
+        prompt: String,
+    ) -> crate::error::Result<AgentHandle> {
+        let (mgr, id) = self.manager_and_id()?;
+        let spec = mgr.spec_for(&id).await.ok_or_else(|| {
+            crate::error::Error::Other(format!(
+                "with_system_prompt: no spec recorded for agent '{id}'"
+            ))
+        })?;
+        // Reuse the buffer when we hold the only reference; otherwise
+        // pay one deep clone. The registry holds a clone, so this almost
+        // always clones — but it's the *only* clone in the path.
+        let mut spec = Arc::unwrap_or_clone(spec);
+        spec.system_prompt = prompt;
+        mgr.respec(&id, spec).await
+    }
+
+    /// Convenience: respec, changing only the tool set.
+    pub async fn with_tools(
+        self,
+        tools: Vec<crate::tool::BoxedTool>,
+    ) -> crate::error::Result<AgentHandle> {
+        let (mgr, id) = self.manager_and_id()?;
+        let spec = mgr.spec_for(&id).await.ok_or_else(|| {
+            crate::error::Error::Other(format!(
+                "with_tools: no spec recorded for agent '{id}'"
+            ))
+        })?;
+        let mut spec = Arc::unwrap_or_clone(spec);
+        spec.tools = tools;
+        mgr.respec(&id, spec).await
+    }
+
+    fn manager_and_id(&self) -> crate::error::Result<(Arc<AgentManager>, String)> {
+        let id = self
+            .agent_id
+            .get()
+            .cloned()
+            .ok_or_else(|| crate::error::Error::Unmanaged)?;
+        let mgr = self
+            .manager
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| crate::error::Error::Unmanaged)?;
+        Ok((mgr, id))
     }
 }

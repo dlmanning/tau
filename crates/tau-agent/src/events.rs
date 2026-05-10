@@ -125,18 +125,6 @@ pub enum AgentEvent {
     /// Error occurred
     Error { message: String },
 
-    /// A conversation mutation (clear / set messages / set summary) was
-    /// issued mid-prompt. The runtime buffered it and will apply it after
-    /// the current prompt finishes, before broadcasting `AgentEnd`. Hosts
-    /// can surface "queued — applies when this turn ends" if they want.
-    ///
-    /// **Delivery is best-effort.** Buffered ops live in the actor's
-    /// in-memory state and are dropped if the actor terminates (panic,
-    /// cancellation, or all handles released) before reaching the next
-    /// `Done` phase. Hosts that need the mutation to survive a crash
-    /// should persist it themselves before issuing the command.
-    ConversationOpDeferred { kind: DeferredOpKind },
-
     /// Event from a subagent, wrapped with identity.
     Subagent {
         agent_id: String,
@@ -183,7 +171,12 @@ pub enum AgentEvent {
     /// with `SubagentStarted` first.
     SubagentStarted {
         agent_id: String,
-        agent_type: String,
+        /// Host-supplied spec name (e.g. "general-purpose", "plan").
+        /// Optional because the runtime spawns by `AgentSpec`, not by
+        /// name; hosts populate this via [`crate::manager::SpawnOpts::spec_name`]
+        /// when they want UI to render per-spec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spec_name: Option<String>,
         description: String,
         prompt: String,
         started_at: DateTime<Utc>,
@@ -227,16 +220,6 @@ pub enum AgentEvent {
         tag: Option<String>,
         summary: String,
     },
-}
-
-/// Kind of deferred conversation mutation, surfaced to hosts via
-/// [`AgentEvent::ConversationOpDeferred`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeferredOpKind {
-    Clear,
-    SetMessages,
-    SetPreviousSummary,
 }
 
 /// How a subagent terminated.

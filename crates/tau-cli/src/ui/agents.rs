@@ -222,8 +222,7 @@ impl TuiState {
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentResumed { .. }
             | AgentEvent::SubagentCompleted { .. }
-            | AgentEvent::SubagentReport { .. }
-            | AgentEvent::ConversationOpDeferred { .. } => {}
+            | AgentEvent::SubagentReport { .. } => {}
         }
     }
 

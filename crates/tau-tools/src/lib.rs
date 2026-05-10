@@ -17,7 +17,7 @@ mod subagent_report;
 mod web_fetch;
 mod write;
 
-pub use agent::AgentTool;
+pub use agent::{AgentTool, SpecResolver};
 pub use ask::AskTool;
 pub use bash::BashTool;
 pub use edit::EditTool;

@@ -32,6 +32,13 @@ pub enum Error {
     #[error("Command channel `{channel}` is full")]
     ChannelFull { channel: &'static str },
 
+    /// The handle is not associated with an `AgentManager`, so spec-
+    /// changing operations (`respec`, `with_system_prompt`, `with_tools`)
+    /// can't dispatch. Builder-spawned root handles are unmanaged unless
+    /// the host explicitly registers them with a manager.
+    #[error("handle is not associated with an AgentManager; cannot respec")]
+    Unmanaged,
+
     /// A generic agent error
     #[error("{0}")]
     Other(String),

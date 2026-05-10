@@ -460,7 +460,6 @@ mod tests {
             approval_policy: Arc::new(crate::approval::DefaultApprovalPolicy),
             transform_context: None,
             steering_queue: vec![],
-            pending_conversation_ops: vec![],
             follow_up_queue: vec![],
             pending_follow_ups: Arc::new(AtomicU32::new(0)),
             is_running: Arc::new(AtomicBool::new(false)),

@@ -38,9 +38,10 @@ pub use compaction::{CompactionConfig, CompactionReason};
 pub use config::{AgentConfig, DequeueMode};
 pub use conversation::Conversation;
 pub use error::Error;
-pub use events::{AgentEvent, ConsoleLevel, ConsoleLine, DeferredOpKind, SubagentOutcome};
+pub use events::{AgentEvent, ConsoleLevel, ConsoleLine, SubagentOutcome};
 pub use handle::AgentHandle;
 pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
+pub use manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts, SubagentResult};
 pub use tool::{
     BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
 };

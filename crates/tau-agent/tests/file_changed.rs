@@ -118,7 +118,7 @@ async fn write_then_edit_accumulates_in_overlay() {
 
 #[tokio::test]
 async fn subagent_file_change_reaches_parent_overlay() {
-    use tau_agent::manager::{AgentManager, AgentType, SpawnRequest};
+    use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
     use tau_agent::transport::Transport;
 
     let dir = tmpdir("subagent-edit");
@@ -141,25 +141,26 @@ async fn subagent_file_change_reaches_parent_overlay() {
         tokio::sync::broadcast::channel::<AgentEvent>(64);
     let manager = Arc::new(AgentManager::new(
         parent_event_tx,
-        tools,
         test_config(),
         sub_transport,
-        4,
-    ));
+        4));
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let req = SpawnRequest {
-        agent_type: AgentType::GeneralPurpose,
-        prompt: "go".into(),
-        description: "subagent writer".into(),
-        model: None,
-        cwd: None,
-        isolation: None,
-        depth: 0,
-        inherit_history_from: None,
-        approval_policy: None,
+    let spec = AgentSpec {
+        system_prompt: String::new(),
+        tools,
+        max_turns: 200,
+        allows_worktree: false,
+        allowed_subagent_specs: None,
     };
-    let _result = manager.spawn(req, cancel).await.expect("spawn");
+    let opts = SpawnOpts {
+        description: "subagent writer".into(),
+        ..Default::default()
+    };
+    let _result = manager
+        .spawn(spec, "go".to_string(), opts, cancel)
+        .await
+        .expect("spawn");
 
     // Drain parent's events into the overlay.
     let mut overlay = SessionDiffOverlay::new();

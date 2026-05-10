@@ -30,17 +30,6 @@ pub(crate) struct ToolCall {
     pub args: serde_json::Value,
 }
 
-/// A conversation mutation queued for application after the current prompt
-/// finishes. Issued mid-prompt, these would otherwise wipe the assistant
-/// message that contained the in-flight `tool_use` blocks, leaving orphan
-/// `tool_result` messages that providers reject.
-#[derive(Debug)]
-pub(crate) enum ConversationOp {
-    Clear,
-    Set(Vec<Message>),
-    SetPreviousSummary(Option<String>),
-}
-
 /// All mutable state the agent needs. Owned exclusively by the actor task.
 pub(crate) struct AgentState {
     pub config: AgentConfig,
@@ -57,10 +46,6 @@ pub(crate) struct AgentState {
     pub transform_context: Option<Arc<TransformContextFn>>,
     pub steering_queue: Vec<Message>,
     pub follow_up_queue: Vec<Message>,
-    /// Conversation mutations issued mid-prompt that must wait until the
-    /// current prompt finishes (drained in the actor's `Done` arm). Idle-time
-    /// mutations bypass this queue and apply immediately.
-    pub pending_conversation_ops: Vec<ConversationOp>,
     /// Shared with AgentHandle. External code (AgentManager) increments via handle.expect_follow_up().
     pub pending_follow_ups: Arc<AtomicU32>,
     /// Shared with AgentHandle.

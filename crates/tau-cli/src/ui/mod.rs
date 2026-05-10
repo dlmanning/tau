@@ -47,7 +47,12 @@ struct ActiveAgent {
 }
 
 /// Apply a branch operation: create a branch session and truncate conversation state.
-async fn apply_branch(state: &mut TuiState, handle: &AgentHandle, branch_index: Option<usize>) {
+async fn apply_branch(
+    state: &mut TuiState,
+    handle: &mut AgentHandle,
+    manager: &Arc<AgentManager>,
+    branch_index: Option<usize>,
+) {
     let Some(config) = handle.config().await else {
         return;
     };
@@ -57,20 +62,49 @@ async fn apply_branch(state: &mut TuiState, handle: &AgentHandle, branch_index: 
     match crate::session::SessionManager::branch_from(&messages, branch_index, &config.model.id) {
         Ok(new_session) => {
             let msg_count = branch_index.map(|i| i + 1).unwrap_or(0);
-            state.show_system_message(&format!(
-                "Created branch: {} ({} messages)\nContinue from this point with a fresh context.",
-                new_session.id(),
-                msg_count
-            ));
-            if let Some(idx) = branch_index {
-                let truncated: Vec<_> = messages.iter().take(idx + 1).cloned().collect();
-                let _ = handle.set_messages(truncated).await;
-                state.messages.truncate(idx + 1);
-            } else {
-                let _ = handle.clear_messages().await;
-                state.messages.clear();
+            // Respawn the parent with the truncated history.
+            let old_id = handle.agent_id().map(str::to_string);
+            let spec = match old_id.as_deref() {
+                Some(id) => manager.spec_for(id).await,
+                None => None,
+            };
+            let truncated: Vec<_> = match branch_index {
+                Some(idx) => messages.iter().take(idx + 1).cloned().collect(),
+                None => Vec::new(),
+            };
+            match spec {
+                Some(spec) => {
+                    handle.abort();
+                    let opts = tau_agent::SpawnOpts {
+                        description: "main".into(),
+                        seed_messages: Some(truncated),
+                        ..Default::default()
+                    };
+                    match manager.spawn_interactive(spec, opts).await {
+                        Ok((new_handle, _)) => {
+                            if let Some(id) = old_id {
+                                manager.remove_interactive(&id).await;
+                            }
+                            *handle = new_handle;
+                            state.messages.truncate(branch_index.map(|i| i + 1).unwrap_or(0));
+                            state.reset_stats();
+                            state.show_system_message(&format!(
+                                "Created branch: {} ({} messages). Continuing from branch point.",
+                                new_session.id(),
+                                msg_count,
+                            ));
+                        }
+                        Err(e) => {
+                            state.show_system_message(&format!("/branch failed: {e}"))
+                        }
+                    }
+                }
+                None => state.show_system_message(&format!(
+                    "/branch unavailable: parent agent has no recorded spec; \
+                     restart with --resume {} instead.",
+                    new_session.id()
+                )),
             }
-            state.reset_stats();
         }
         Err(e) => {
             state.show_system_message(&format!("Failed to create branch: {}", e));
@@ -83,11 +117,12 @@ async fn apply_branch(state: &mut TuiState, handle: &AgentHandle, branch_index: 
 async fn dispatch_ui_message(
     msg: UiMessage,
     state: &mut TuiState,
-    handle: &AgentHandle,
+    handle: &mut AgentHandle,
     available_models: &[Model],
     pending_prompt: &mut Option<String>,
     active_agent: &mut Option<ActiveAgent>,
     manager: &Arc<AgentManager>,
+    spec_resolver: &tau_tools::SpecResolver,
 ) -> bool {
     use crate::commands::{CommandContext, CommandResult, execute_command};
 
@@ -96,7 +131,7 @@ async fn dispatch_ui_message(
             *pending_prompt = Some(content);
         }
         UiMessage::Command(cmd) => {
-            let effective = active_agent.as_ref().map(|a| &a.handle).unwrap_or(handle);
+            let effective = active_agent.as_ref().map(|a| &a.handle).unwrap_or(&handle);
             let Some(config) = effective.config().await else {
                 return true;
             };
@@ -120,10 +155,37 @@ async fn dispatch_ui_message(
                         state.show_system_message(&msg);
                     }
                     CommandResult::Clear => {
-                        let _ = handle.clear_messages().await;
-                        state.messages.clear();
-                        state.reset_stats();
-                        state.status = "Cleared".to_string();
+                        let old_id = handle.agent_id().map(str::to_string);
+                        let spec = match old_id.as_deref() {
+                            Some(id) => manager.spec_for(id).await,
+                            None => None,
+                        };
+                        match spec {
+                            Some(spec) => {
+                                handle.abort();
+                                let opts = tau_agent::SpawnOpts {
+                                    description: "main".into(),
+                                    ..Default::default()
+                                };
+                                match manager.spawn_interactive(spec, opts).await {
+                                    Ok((new_handle, _new_id)) => {
+                                        if let Some(id) = old_id {
+                                            manager.remove_interactive(&id).await;
+                                        }
+                                        *handle = new_handle;
+                                        state.messages.clear();
+                                        state.reset_stats();
+                                        state.status = "Cleared".to_string();
+                                    }
+                                    Err(e) => state.show_system_message(&format!(
+                                        "/clear failed: {e}"
+                                    )),
+                                }
+                            }
+                            None => state.show_system_message(
+                                "/clear unavailable: parent agent has no recorded spec",
+                            ),
+                        }
                     }
                     CommandResult::ChangeModel(new_model) => {
                         state.show_system_message(&format!("Switched to: {}", new_model.id));
@@ -168,7 +230,7 @@ async fn dispatch_ui_message(
                         }
                     }
                     CommandResult::BranchFrom(branch_index) => {
-                        apply_branch(state, handle, branch_index).await;
+                        apply_branch(state, handle, manager, branch_index).await;
                     }
                     CommandResult::PlanStart(description) => {
                         state.show_system_message("Entering plan mode...");
@@ -184,20 +246,22 @@ async fn dispatch_ui_message(
                         let prompt =
                             tau_tools::plan::build_plan_prompt(&context, &description);
 
-                        // Spawn Plan subagent
-                        let request = tau_agent::manager::SpawnRequest {
-                            agent_type: tau_agent::manager::AgentType::Plan,
-                            prompt: String::new(), // sent via handle.prompt() below
+                        // Spawn Plan subagent via the host's spec resolver.
+                        let plan_spec = match spec_resolver("plan", 0) {
+                            Some(s) => s,
+                            None => {
+                                state.show_system_message(
+                                    "Plan mode unavailable: 'plan' spec not registered.",
+                                );
+                                return true;
+                            }
+                        };
+                        let opts = tau_agent::SpawnOpts {
                             description: format!("Planning: {}", description),
-                            model: None,
-                            cwd: None,
-                            isolation: None,
-                            depth: 0,
-                            inherit_history_from: None,
-                            approval_policy: None,
+                            ..Default::default()
                         };
 
-                        match manager.spawn_interactive(request).await {
+                        match manager.spawn_interactive(plan_spec, opts).await {
                             Ok((plan_handle, agent_id)) => {
                                 let desc = format!("Planning: {}", description);
                                 *active_agent = Some(ActiveAgent {
@@ -234,16 +298,52 @@ async fn dispatch_ui_message(
                                 );
                             } else {
                                 let agent = active_agent.take().unwrap();
-                                manager.remove_interactive(&agent.agent_id).await;
-                                let _ = handle
-                                    .steer(tau_ai::Message::user(format!(
-                                        "Approved plan:\n\n{}\n\nProceed with implementation.",
-                                        plan_text
-                                    )))
-                                    .await;
+                                // Spawn an executor inheriting the plan
+                                // agent's history. We hold off on
+                                // remove_interactive(plan_id) until the
+                                // executor spawn has begun reading the
+                                // plan history.
+                                let executor_spec = match spec_resolver(
+                                    "general-purpose:executor",
+                                    0,
+                                ) {
+                                    Some(s) => s,
+                                    None => {
+                                        state.show_system_message(
+                                            "Executor unavailable: 'general-purpose:executor' spec not registered.",
+                                        );
+                                        manager.remove_interactive(&agent.agent_id).await;
+                                        return true;
+                                    }
+                                };
                                 state.show_system_message(
-                                    "Plan approved. Returned to main agent.",
+                                    "Plan approved. Executing inherited plan...",
                                 );
+                                let cancel = tokio_util::sync::CancellationToken::new();
+                                let opts = tau_agent::SpawnOpts {
+                                    description: "Executor: approved plan".into(),
+                                    inherit_history_from: Some(agent.agent_id.clone()),
+                                    spec_name: Some("general-purpose:executor".into()),
+                                    ..Default::default()
+                                };
+                                match manager
+                                    .spawn(
+                                        executor_spec,
+                                        "Execute the approved plan.".to_string(),
+                                        opts,
+                                        cancel,
+                                    )
+                                    .await
+                                {
+                                    Ok(result) => state.show_system_message(&format!(
+                                        "Executor finished: {}",
+                                        result.text
+                                    )),
+                                    Err(e) => state.show_system_message(&format!(
+                                        "Executor failed: {e}"
+                                    )),
+                                }
+                                manager.remove_interactive(&agent.agent_id).await;
                             }
                         }
                     }
@@ -263,10 +363,37 @@ async fn dispatch_ui_message(
             }
         }
         UiMessage::Clear => {
-            let _ = handle.clear_messages().await;
-            state.messages.clear();
-            state.reset_stats();
-            state.status = "Cleared".to_string();
+            let old_id = handle.agent_id().map(str::to_string);
+            let spec = match old_id.as_deref() {
+                Some(id) => manager.spec_for(id).await,
+                None => None,
+            };
+            match spec {
+                Some(spec) => {
+                    handle.abort();
+                    let opts = tau_agent::SpawnOpts {
+                        description: "main".into(),
+                        ..Default::default()
+                    };
+                    match manager.spawn_interactive(spec, opts).await {
+                        Ok((new_handle, _new_id)) => {
+                            if let Some(id) = old_id {
+                                manager.remove_interactive(&id).await;
+                            }
+                            *handle = new_handle;
+                            state.messages.clear();
+                            state.reset_stats();
+                            state.status = "Cleared".to_string();
+                        }
+                        Err(e) => {
+                            state.show_system_message(&format!("/clear failed: {e}"))
+                        }
+                    }
+                }
+                None => state.show_system_message(
+                    "/clear unavailable: parent agent has no recorded spec",
+                ),
+            }
         }
         UiMessage::Abort => {
             if let Some(ref agent) = *active_agent {
@@ -276,7 +403,7 @@ async fn dispatch_ui_message(
             }
         }
         UiMessage::Branch(branch_index) => {
-            apply_branch(state, handle, branch_index).await;
+            apply_branch(state, handle, manager, branch_index).await;
         }
         UiMessage::Quit => return false,
     }
@@ -285,11 +412,13 @@ async fn dispatch_ui_message(
 
 /// Run the TUI application
 pub async fn run_tui(
-    handle: &AgentHandle,
+    handle: AgentHandle,
     available_models: &[Model],
     mut interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
     manager: Arc<AgentManager>,
+    spec_resolver: tau_tools::SpecResolver,
 ) -> anyhow::Result<()> {
+    let mut handle = handle;
     use std::io;
 
     use crossterm::{
@@ -335,7 +464,7 @@ pub async fn run_tui(
         let effective_handle = active_agent
             .as_ref()
             .map(|a| &a.handle)
-            .unwrap_or(handle);
+            .unwrap_or(&handle);
 
         if let Some(content) = pending_prompt.take() {
             // Re-subscribe to the effective handle's events for this prompt
@@ -524,9 +653,9 @@ pub async fn run_tui(
                     Some(msg) => {
                         let prev_id = active_agent.as_ref().map(|a| a.agent_id.clone());
                         if !dispatch_ui_message(
-                            msg, &mut state, handle,
+                            msg, &mut state, &mut handle,
                             available_models, &mut pending_prompt,
-                            &mut active_agent, &manager,
+                            &mut active_agent, &manager, &spec_resolver,
                         ).await {
                             break Ok(());
                         }
@@ -535,7 +664,7 @@ pub async fn run_tui(
                             let new_effective = active_agent
                                 .as_ref()
                                 .map(|a| &a.handle)
-                                .unwrap_or(handle);
+                                .unwrap_or(&handle);
                             agent_rx = new_effective.subscribe();
                         }
                     }

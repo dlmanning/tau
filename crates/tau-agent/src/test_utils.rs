@@ -460,7 +460,6 @@ fn event_type_name(event: &AgentEvent) -> &'static str {
         AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionEnd { .. } => "CompactionEnd",
         AgentEvent::Error { .. } => "Error",
-        AgentEvent::ConversationOpDeferred { .. } => "ConversationOpDeferred",
         AgentEvent::Subagent { .. } => "Subagent",
     }
 }

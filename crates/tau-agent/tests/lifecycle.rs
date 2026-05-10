@@ -77,34 +77,9 @@ async fn is_streaming_false_after_prompt() {
     assert!(state.error.is_none());
 }
 
-#[tokio::test]
-async fn clear_messages_resets_state() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
-    handle.prompt_and_wait("go").await.unwrap();
-
-    handle.clear_messages().await.unwrap();
-    let _ = handle.config().await; // sync
-
-    let msgs = handle.messages().await.unwrap();
-    assert!(msgs.is_empty());
-
-    let state = handle.state().await.unwrap();
-    assert_eq!(state.total_usage.input, 0);
-    assert!(state.previous_summary.is_none());
-}
-
-#[tokio::test]
-async fn set_messages_replaces_conversation() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
-    handle
-        .set_messages(vec![Message::user("a"), Message::user("b")])
-        .await
-        .unwrap();
-    let _ = handle.config().await;
-
-    let msgs = handle.messages().await.unwrap();
-    assert_eq!(msgs.len(), 2);
-}
+// `clear_messages` and `set_messages` were removed from the handle in the
+// runtime refactor — conversation mutation is no longer a runtime
+// capability. Tests for them are dropped.
 
 #[tokio::test]
 async fn timestamps_are_milliseconds() {
@@ -173,116 +148,9 @@ impl tau_agent::transport::Transport for GatedTransport {
     }
 }
 
-#[tokio::test]
-async fn mid_prompt_clear_is_deferred_until_done() {
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tau_agent::tool::BoxedTool;
-
-    // A tool that blocks until notified — keeps the actor in AwaitingTools
-    // so we can race a clear_messages against the in-flight tool.
-    struct BlockingTool {
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    #[async_trait::async_trait]
-    impl tau_agent::Tool for BlockingTool {
-        fn name(&self) -> &str {
-            "blocker"
-        }
-        fn description(&self) -> &str {
-            "blocks"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type":"object","properties":{}})
-        }
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-            _ctx: tau_agent::ExecutionContext,
-        ) -> tau_agent::ToolResult {
-            self.release.notified().await;
-            tau_agent::ToolResult::text("done")
-        }
-    }
-
-    let release = Arc::new(tokio::sync::Notify::new());
-    let transport = MockTransport::new()
-        .with_tool_call_response("blocker", "tc1", serde_json::json!({}))
-        .with_text_response("acknowledged");
-
-    let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
-    let blocker: BoxedTool = Arc::new(BlockingTool {
-        release: release.clone(),
-    });
-    builder.add_tool(blocker);
-    let pre = builder.pre_handle();
-    let collector = EventCollector::from_handle(&pre);
-    let handle = builder.spawn();
-
-    // Kick off the prompt — actor enters AwaitingTools and parks on the
-    // tool's notified().await.
-    let rx = handle.prompt("go").await.unwrap();
-
-    // Wait for ToolExecutionStart, then issue the clear.
-    let mut deadline = 50;
-    loop {
-        if collector
-            .events()
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
-        {
-            break;
-        }
-        deadline -= 1;
-        if deadline == 0 {
-            panic!("tool never started");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // This must be deferred — applying it now would orphan the tool_use.
-    handle.clear_messages().await.unwrap();
-
-    // Release the tool so the prompt can complete.
-    release.notify_one();
-
-    let _ = tokio::time::timeout(Duration::from_secs(3), rx)
-        .await
-        .expect("prompt should complete")
-        .expect("oneshot")
-        .result;
-
-    // Post-conditions:
-    // 1. The deferred clear was eventually applied — messages is empty.
-    let msgs = handle.messages().await.unwrap();
-    assert!(
-        msgs.is_empty(),
-        "deferred clear should have applied; got {} messages",
-        msgs.len()
-    );
-
-    // 2. We observed the ConversationOpDeferred event.
-    let events = collector.events();
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ConversationOpDeferred {
-                kind: tau_agent::DeferredOpKind::Clear
-            }
-        )),
-        "expected ConversationOpDeferred event"
-    );
-
-    // 3. No transport-level Error event (which would indicate orphan
-    //    tool_results).
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error { .. })),
-        "should not see Error event from orphan tool_results"
-    );
-}
+// `mid_prompt_clear_is_deferred_until_done` was removed: the deferred-op
+// mechanism it tested was deleted along with the conversation-mutator
+// commands in the runtime refactor.
 
 #[tokio::test]
 async fn try_send_returns_err_when_channel_full() {
@@ -306,10 +174,11 @@ async fn try_send_returns_err_when_channel_full() {
     // so it cannot drain the normal channel.
     let _rx = handle.prompt("go").await.unwrap();
 
-    // The Prompt itself consumed one normal slot. Fill the rest.
+    // The Prompt itself consumed one normal slot. Fill the rest using
+    // `try_set_compaction_config` (a non-removed normal-channel command).
     let mut full_seen = false;
     for _ in 0..10 {
-        match handle.try_set_system_prompt("x".into()) {
+        match handle.try_set_compaction_config(tau_agent::CompactionConfig::default()) {
             Ok(()) => {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -320,7 +189,7 @@ async fn try_send_returns_err_when_channel_full() {
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
-    assert!(full_seen, "try_set_system_prompt should eventually see Full");
+    assert!(full_seen, "try_set_compaction_config should eventually see Full");
 
     // Cleanup: release the actor so the test doesn't leak the task.
     release.notify_one();
@@ -343,14 +212,20 @@ async fn async_send_blocks_then_succeeds_when_channel_full() {
     let rx = handle.prompt("go").await.unwrap();
 
     // Saturate the normal channel.
-    while handle.try_set_system_prompt("fill".into()).is_ok() {
+    while handle
+        .try_set_compaction_config(tau_agent::CompactionConfig::default())
+        .is_ok()
+    {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
     // The async send should block. Race it against a release of the actor:
     // until the actor unblocks, the send must not complete.
     let h2 = handle.clone();
-    let send_future = tokio::spawn(async move { h2.set_system_prompt("after-drain".into()).await });
+    let send_future = tokio::spawn(async move {
+        h2.set_compaction_config(tau_agent::CompactionConfig::default())
+            .await
+    });
 
     // Confirm it's not finishing on its own.
     tokio::time::sleep(Duration::from_millis(100)).await;

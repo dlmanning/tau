@@ -328,6 +328,19 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given arguments and execution context.
     async fn execute(&self, arguments: Value, ctx: ExecutionContext) -> ToolResult;
+
+    /// Post-construction binding hook. The runtime calls this on every
+    /// tool in a freshly-built agent's spec **after** the agent's
+    /// `pre_handle()` is available but **before** the actor task starts
+    /// processing commands. Tools that need a reference to their owning
+    /// agent (e.g. `AgentTool`, which uses the handle to track
+    /// background-subagent follow-ups) capture it here.
+    ///
+    /// Default: no-op. Implementors should treat repeat invocations as a
+    /// no-op (typically backed by a `OnceLock` or `OnceCell`); the
+    /// runtime guarantees one call per agent spawn but a tool instance
+    /// can be shared across spawns of unrelated agents.
+    fn bind_to_agent(&self, _handle: &crate::handle::AgentHandle) {}
 }
 
 /// Type alias for a boxed tool

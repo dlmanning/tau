@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use futures::FutureExt;
@@ -64,6 +64,13 @@ pub struct AgentBuilder {
     shutdown_reason: Arc<ParkingMutex<Option<String>>>,
     /// Notified after `shutdown_reason` is written.
     shutdown_signaled: Arc<Notify>,
+    /// Optional agent id slot, shared with all `AgentHandle` clones. The
+    /// `AgentManager` (or a host calling `manager.adopt`) fills this in
+    /// when this handle is registered.
+    agent_id: Arc<OnceLock<String>>,
+    /// Optional manager weak reference, shared with all `AgentHandle`
+    /// clones. Filled in alongside `agent_id`.
+    manager: Arc<OnceLock<std::sync::Weak<crate::manager::AgentManager>>>,
 }
 
 impl AgentBuilder {
@@ -94,6 +101,8 @@ impl AgentBuilder {
         let pending_follow_ups = Arc::new(AtomicU32::new(0));
         let shutdown_reason = Arc::new(ParkingMutex::new(None));
         let shutdown_signaled = Arc::new(Notify::new());
+        let agent_id = Arc::new(OnceLock::new());
+        let manager = Arc::new(OnceLock::new());
 
         Self {
             config,
@@ -116,6 +125,8 @@ impl AgentBuilder {
             pending_follow_ups,
             shutdown_reason,
             shutdown_signaled,
+            agent_id,
+            manager,
         }
     }
 
@@ -212,6 +223,8 @@ impl AgentBuilder {
             pending_follow_ups: self.pending_follow_ups.clone(),
             shutdown_reason: self.shutdown_reason.clone(),
             shutdown_signaled: self.shutdown_signaled.clone(),
+            agent_id: self.agent_id.clone(),
+            manager: self.manager.clone(),
         }
     }
 
@@ -263,7 +276,6 @@ impl AgentBuilder {
             transform_context: self.transform_context,
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),
-            pending_conversation_ops: Vec::new(),
             pending_follow_ups: self.pending_follow_ups.clone(),
             is_running: self.is_running.clone(),
             cancel: self.cancel.clone(),
@@ -315,6 +327,8 @@ impl AgentBuilder {
             pending_follow_ups: self.pending_follow_ups,
             shutdown_reason: self.shutdown_reason,
             shutdown_signaled: self.shutdown_signaled,
+            agent_id: self.agent_id,
+            manager: self.manager,
         }
     }
 }

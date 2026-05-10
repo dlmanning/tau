@@ -174,11 +174,13 @@ async fn run_prompt_and_stream(
 }
 
 pub(crate) async fn run_interactive(
-    handle: &AgentHandle,
+    handle: AgentHandle,
     mut session: Option<session::SessionManager>,
     interaction_rx: tokio::sync::mpsc::Receiver<tau_agent::InteractionRequest>,
     manager: Arc<AgentManager>,
+    spec_resolver: tau_tools::SpecResolver,
 ) -> anyhow::Result<()> {
+    let mut handle = handle;
     let available_models = get_available_models();
     let _interaction_handle = tokio::spawn(handle_interaction_stdin(interaction_rx));
 
@@ -219,7 +221,7 @@ pub(crate) async fn run_interactive(
         }
 
         if input.starts_with('/') {
-            let effective = active_agent.as_ref().map(|a| &a.0).unwrap_or(handle);
+            let effective = active_agent.as_ref().map(|a| &a.0).unwrap_or(&handle);
             let config = effective
                 .config()
                 .await
@@ -243,8 +245,37 @@ pub(crate) async fn run_interactive(
             if let Some(result) = commands::execute_command(input, &ctx) {
                 match result {
                     commands::CommandResult::Clear => {
-                        let _ = handle.clear_messages().await;
-                        println!("Cleared conversation.");
+                        // /clear: spawn a fresh agent with the same spec
+                        // and no inherited history; switch the active
+                        // handle. The old handle is dropped.
+                        let old_id = handle.agent_id().map(str::to_string);
+                        let spec = match old_id.as_deref() {
+                            Some(id) => manager.spec_for(id).await,
+                            None => None,
+                        };
+                        match spec {
+                            Some(spec) => {
+                                handle.abort();
+                                let opts = tau_agent::SpawnOpts {
+                                    description: "main".into(),
+                                    ..Default::default()
+                                };
+                                match manager.spawn_interactive(spec, opts).await {
+                                    Ok((new_handle, _new_id)) => {
+                                        if let Some(id) = old_id {
+                                            manager.remove_interactive(&id).await;
+                                        }
+                                        handle = new_handle;
+                                        prev_usage = tau_ai::Usage::default();
+                                        println!("Cleared conversation.");
+                                    }
+                                    Err(e) => println!("/clear failed: {e}"),
+                                }
+                            }
+                            None => println!(
+                                "/clear unavailable: parent agent has no recorded spec"
+                            ),
+                        }
                     }
                     commands::CommandResult::Exit => {
                         break;
@@ -325,26 +356,26 @@ pub(crate) async fn run_interactive(
                             tau_tools::plan::build_context_summary(&main_messages, prev_summary);
                         let prompt = tau_tools::plan::build_plan_prompt(&context, &description);
 
-                        let request = tau_agent::manager::SpawnRequest {
-                            agent_type: tau_agent::manager::AgentType::Plan,
-                            prompt: String::new(),
+                        let plan_spec = match spec_resolver("plan", 0) {
+                            Some(s) => s,
+                            None => {
+                                println!("Plan mode unavailable: 'plan' spec not registered.");
+                                continue;
+                            }
+                        };
+                        let opts = tau_agent::SpawnOpts {
                             description: format!("Planning: {}", description),
-                            model: None,
-                            cwd: None,
-                            isolation: None,
-                            depth: 0,
-                            inherit_history_from: None,
-                            approval_policy: None,
+                            ..Default::default()
                         };
 
-                        match manager.spawn_interactive(request).await {
+                        match manager.spawn_interactive(plan_spec, opts).await {
                             Ok((plan_handle, agent_id)) => {
                                 println!(
                                     "Plan mode active. Use /plan approve or /plan exit.\n"
                                 );
                                 active_agent = Some((plan_handle, agent_id));
                                 let effective =
-                                    active_agent.as_ref().map(|a| &a.0).unwrap_or(handle);
+                                    active_agent.as_ref().map(|a| &a.0).unwrap_or(&handle);
                                 if let Err(e) =
                                     run_prompt_and_stream(effective, &prompt, None).await
                                 {
@@ -368,15 +399,44 @@ pub(crate) async fn run_interactive(
                                     "Plan agent has no plan to approve yet. Wait for it to respond, or use /plan exit to discard."
                                 );
                             } else {
-                                let (_, agent_id) = active_agent.take().unwrap();
-                                manager.remove_interactive(&agent_id).await;
-                                let _ = handle
-                                    .steer(tau_ai::Message::user(format!(
-                                        "Approved plan:\n\n{}\n\nProceed with implementation.",
-                                        plan_text
-                                    )))
-                                    .await;
-                                println!("Plan approved. Returned to main agent.");
+                                let (_, plan_agent_id) = active_agent.take().unwrap();
+                                // Don't `remove_interactive` — the executor
+                                // spawn below reads the plan agent's history
+                                // by id from running_handles.
+                                let executor_spec = match spec_resolver(
+                                    "general-purpose:executor",
+                                    0,
+                                ) {
+                                    Some(s) => s,
+                                    None => {
+                                        println!(
+                                            "Executor unavailable: 'general-purpose:executor' spec not registered."
+                                        );
+                                        manager.remove_interactive(&plan_agent_id).await;
+                                        continue;
+                                    }
+                                };
+                                println!("Plan approved. Executing...");
+                                let cancel = tokio_util::sync::CancellationToken::new();
+                                let opts = tau_agent::SpawnOpts {
+                                    description: "Executor: approved plan".into(),
+                                    inherit_history_from: Some(plan_agent_id.clone()),
+                                    spec_name: Some("general-purpose:executor".into()),
+                                    ..Default::default()
+                                };
+                                match manager
+                                    .spawn(
+                                        executor_spec,
+                                        "Execute the approved plan.".to_string(),
+                                        opts,
+                                        cancel,
+                                    )
+                                    .await
+                                {
+                                    Ok(result) => println!("\n{}\n", result.text),
+                                    Err(e) => println!("Executor failed: {e}"),
+                                }
+                                manager.remove_interactive(&plan_agent_id).await;
                             }
                         } else {
                             println!("Not in plan mode.");
@@ -403,15 +463,51 @@ pub(crate) async fn run_interactive(
                                     new_session.id(),
                                     msg_count
                                 );
-                                if let Some(idx) = branch_index {
-                                    let truncated: Vec<_> =
-                                        messages.iter().take(idx + 1).cloned().collect();
-                                    let _ = handle.set_messages(truncated).await;
-                                } else {
-                                    let _ = handle.clear_messages().await;
+                                // Truncate the in-process conversation by
+                                // respawning the parent agent with a
+                                // seed_messages slice. The old handle is
+                                // dropped.
+                                let old_id = handle.agent_id().map(str::to_string);
+                                let spec = match old_id.as_deref() {
+                                    Some(id) => manager.spec_for(id).await,
+                                    None => None,
+                                };
+                                let truncated: Vec<_> = match branch_index {
+                                    Some(idx) => messages.iter().take(idx + 1).cloned().collect(),
+                                    None => Vec::new(),
+                                };
+                                match spec {
+                                    Some(spec) => {
+                                        handle.abort();
+                                        let opts = tau_agent::SpawnOpts {
+                                            description: "main".into(),
+                                            seed_messages: Some(truncated),
+                                            ..Default::default()
+                                        };
+                                        match manager.spawn_interactive(spec, opts).await {
+                                            Ok((new_handle, _)) => {
+                                                if let Some(id) = old_id {
+                                                    manager.remove_interactive(&id).await;
+                                                }
+                                                handle = new_handle;
+                                                prev_usage = tau_ai::Usage::default();
+                                                session = Some(new_session);
+                                                println!(
+                                                    "Continuing from branch point ({} message(s)).",
+                                                    msg_count
+                                                );
+                                            }
+                                            Err(e) => println!("/branch failed: {e}"),
+                                        }
+                                    }
+                                    None => {
+                                        println!(
+                                            "/branch unavailable: parent agent has no recorded spec; restart with --resume {} instead.",
+                                            new_session.id()
+                                        );
+                                        session = Some(new_session);
+                                    }
                                 }
-                                session = Some(new_session);
-                                println!("Continue from this point with a fresh context.");
                             }
                             Err(e) => {
                                 println!("Failed to create branch: {}", e);
@@ -428,7 +524,7 @@ pub(crate) async fn run_interactive(
 
         // Plan-agent traffic stays out of the main session log.
         let in_plan_mode = active_agent.is_some();
-        let effective = active_agent.as_ref().map(|a| &a.0).unwrap_or(handle);
+        let effective = active_agent.as_ref().map(|a| &a.0).unwrap_or(&handle);
         let save = if in_plan_mode {
             None
         } else {

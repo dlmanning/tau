@@ -180,13 +180,20 @@ async fn main() -> anyhow::Result<()> {
         builder.add_tool(Arc::new(lsp::LspTool::new(lsp_manager.clone())));
     }
 
-    // Add agent tool (subagent spawning)
-    let parent_tools: Vec<Arc<dyn tau_agent::tool::Tool>> = builder.tools().to_vec();
+    // Add agent tool (subagent spawning).
+    //
+    // The runtime is ignorant of which spec names exist. We build a host-
+    // owned spec map once, then install a SpecResolver on the parent's
+    // AgentTool. The resolver:
+    //   1. Looks up the base spec by name in the precomputed map.
+    //   2. If the spec allows nested subagents AND `depth + 1 < MAX_DEPTH`,
+    //      appends an `AgentTool` configured with the bumped depth and a
+    //      recursive ref to the same resolver. This is the host's
+    //      depth-limit enforcement; the runtime knows nothing about depth.
     let agent_handle = builder.pre_handle();
     let manager = Arc::new(
         tau_agent::manager::AgentManager::new(
             builder.event_sender(),
-            parent_tools,
             builder.config().clone(),
             transport.clone(),
             20,
@@ -194,30 +201,49 @@ async fn main() -> anyhow::Result<()> {
         .with_parent_interaction_sender(interaction_tx),
     );
 
-    // Create factory that makes AgentTools referencing this manager.
-    // Plan parents get a tool restricted to spawning read-only subagents
-    // so the read-only invariant the Plan prompt advertises is actually enforced.
-    let mgr_for_factory = manager.clone();
-    manager.set_agent_tool_factory(Arc::new(
-        move |depth, handle, parent_type, parent_policy| {
-            let mut tool = tau_tools::AgentTool::new(mgr_for_factory.clone(), depth)
-                .with_handle(handle)
-                .with_inherited_policy(parent_policy);
-            if matches!(parent_type, tau_agent::manager::AgentType::Plan) {
-                tool = tool.with_allowed_types(vec![
-                    tau_agent::manager::AgentType::Explore,
-                    tau_agent::manager::AgentType::Plan,
-                ]);
+    // Precompute the base spec map once.
+    let base_specs = build_base_specs(builder.tools());
+
+    // Recursive resolver: closure captures a Weak ref to itself via
+    // OnceLock, so the AgentTool it appends per spawn can resolve
+    // again when the LLM nests further.
+    const MAX_DEPTH: u32 = 3;
+    use std::sync::OnceLock as StdOnceLock;
+    use std::sync::Weak as StdWeak;
+    let resolver_self: Arc<StdOnceLock<StdWeak<dyn Fn(&str, u32) -> Option<tau_agent::AgentSpec>
+        + Send + Sync>>> = Arc::new(StdOnceLock::new());
+    let resolver_self_for_closure = resolver_self.clone();
+    let mgr_for_resolver = manager.clone();
+    let base_specs_arc = Arc::new(base_specs);
+    let base_specs_for_closure = base_specs_arc.clone();
+    let resolver: tau_tools::SpecResolver = Arc::new(move |name: &str, depth: u32| {
+        let mut spec = base_specs_for_closure.get(name).cloned()?;
+        if let Some(ref allowed) = spec.allowed_subagent_specs {
+            if depth + 1 < MAX_DEPTH {
+                let recursive: tau_tools::SpecResolver = resolver_self_for_closure
+                    .get()
+                    .and_then(StdWeak::upgrade)
+                    .expect("resolver self-ref not yet set");
+                let nested = tau_tools::AgentTool::new(
+                    mgr_for_resolver.clone(),
+                    depth + 1,
+                )
+                .with_spec_resolver(recursive)
+                .with_allowed_specs(allowed.clone());
+                spec.tools.push(Arc::new(nested));
             }
-            Arc::new(tool)
-        },
-    ));
+        }
+        Some(spec)
+    });
+    let _ = resolver_self.set(Arc::downgrade(&resolver));
 
     let mgr_for_send = manager.clone();
     let mgr_for_commands = manager.clone();
-    builder.add_tool(Arc::new(
-        tau_tools::AgentTool::new(manager, 0).with_handle(agent_handle),
-    ));
+    let resolver_for_host = resolver.clone();
+    let agent_tool = tau_tools::AgentTool::new(manager.clone(), 0)
+        .with_handle(agent_handle)
+        .with_spec_resolver(resolver);
+    builder.add_tool(Arc::new(agent_tool));
     builder.add_tool(Arc::new(tau_tools::SendMessageTool::new(mgr_for_send)));
 
     // Enable web search for Anthropic models
@@ -231,17 +257,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build dynamic system prompt based on registered tools
-    let tool_names = builder.tool_names();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let acolyte_mode = cfg.acolyte_mode.unwrap_or(false);
-    let prompt_opts = tau_agent::prompts::PromptOptions {
-        tool_names: &tool_names,
-        cwd: &cwd,
-        acolyte_mode,
+    let parent_system_prompt = {
+        let tool_names = builder.tool_names();
+        let prompt_opts = tau_agent::prompts::PromptOptions {
+            tool_names: &tool_names,
+            cwd: &cwd,
+            acolyte_mode,
+        };
+        tau_agent::prompts::build_system_prompt(&prompt_opts)
     };
-    builder.set_system_prompt(tau_agent::prompts::build_system_prompt(&prompt_opts));
+    builder.set_system_prompt(parent_system_prompt.clone());
 
     let mut resumed_session: Option<session::SessionManager> = None;
     if let Some(ref session_id) = args.resume {
@@ -268,8 +297,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Snapshot pieces needed to build the "root" spec before consuming the builder.
+    let root_tools: Vec<tau_agent::BoxedTool> = builder.tools().to_vec();
+    let root_spec = tau_agent::AgentSpec {
+        system_prompt: parent_system_prompt,
+        tools: root_tools,
+        max_turns: 200,
+        allows_worktree: true,
+        allowed_subagent_specs: Some(vec![
+            "general-purpose".into(),
+            "explore".into(),
+            "plan".into(),
+        ]),
+    };
+
     // Spawn the agent actor — from here on we use the handle
     let handle = builder.spawn();
+    // Register the root with the manager so handle.respec works.
+    let _root_id = manager.adopt(&handle, root_spec).await;
 
     // Non-interactive mode
     let result = if let Some(command) = args.command {
@@ -284,13 +329,151 @@ async fn main() -> anyhow::Result<()> {
         mgr_for_commands.set_default_approval_policy(auto);
         // TUI mode
         let available_models = get_available_models();
-        ui::run_tui(&handle, &available_models, interaction_rx, mgr_for_commands.clone()).await
+        ui::run_tui(
+            handle.clone(),
+            &available_models,
+            interaction_rx,
+            mgr_for_commands.clone(),
+            resolver_for_host,
+        )
+        .await
     } else {
         // Interactive mode (simple stdin/stdout)
         let session = resumed_session.or_else(|| session::SessionManager::new(&model.id).ok());
-        interactive::run_interactive(&handle, session, interaction_rx, mgr_for_commands).await
+        interactive::run_interactive(
+            handle.clone(),
+            session,
+            interaction_rx,
+            mgr_for_commands,
+            resolver_for_host,
+        )
+        .await
     };
 
     lsp_manager.shutdown_all().await;
     result
+}
+
+/// Build the host's base spec map: `general-purpose` / `explore` / `plan`
+/// (and a `general-purpose:executor` variant for plan execution). Each
+/// spec carries the bare tool list (no nested AgentTool); the resolver
+/// appends one with the right depth + recursion guard at use time.
+fn build_base_specs(
+    all_tools: &[tau_agent::BoxedTool],
+) -> std::collections::HashMap<String, tau_agent::AgentSpec> {
+    let read_only_names = ["read", "glob", "grep", "list", "lsp"];
+    let read_only_tools: Vec<tau_agent::BoxedTool> = all_tools
+        .iter()
+        .filter(|t| read_only_names.contains(&t.name()))
+        .cloned()
+        .collect();
+    let report_tool = all_tools
+        .iter()
+        .find(|t| t.name() == "subagent_report")
+        .cloned();
+    let submit_plan_tool = all_tools
+        .iter()
+        .find(|t| t.name() == "submit_plan")
+        .cloned();
+    let general_purpose_tools: Vec<tau_agent::BoxedTool> = all_tools
+        .iter()
+        .filter(|t| t.name() != "agent")
+        .cloned()
+        .collect();
+
+    let general_prompt = include_str!("prompts/agent_general.md");
+    let explore_prompt = include_str!("prompts/agent_explore.md");
+    let plan_prompt = include_str!("prompts/agent_plan.md");
+    let executor_suffix = include_str!("prompts/agent_executor.md");
+
+    let mut explore_tools = read_only_tools.clone();
+    if let Some(ref t) = report_tool {
+        explore_tools.push(t.clone());
+    }
+    let mut plan_tools = read_only_tools.clone();
+    if let Some(ref t) = report_tool {
+        plan_tools.push(t.clone());
+    }
+    if let Some(ref t) = submit_plan_tool {
+        plan_tools.push(t.clone());
+    }
+
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        "general-purpose".into(),
+        tau_agent::AgentSpec {
+            system_prompt: general_prompt.to_string(),
+            tools: general_purpose_tools.clone(),
+            max_turns: 200,
+            allows_worktree: true,
+            allowed_subagent_specs: Some(vec![
+                "general-purpose".into(),
+                "explore".into(),
+                "plan".into(),
+            ]),
+        },
+    );
+    map.insert(
+        "explore".into(),
+        tau_agent::AgentSpec {
+            system_prompt: explore_prompt.to_string(),
+            tools: explore_tools,
+            max_turns: 200,
+            allows_worktree: false,
+            allowed_subagent_specs: None,
+        },
+    );
+    map.insert(
+        "plan".into(),
+        tau_agent::AgentSpec {
+            system_prompt: plan_prompt.to_string(),
+            tools: plan_tools,
+            max_turns: 200,
+            allows_worktree: false,
+            allowed_subagent_specs: Some(vec!["explore".into(), "plan".into()]),
+        },
+    );
+    // Executor variant: same tool set as general-purpose, but the prompt
+    // ends with the executor instructions. Spawned by the host on /plan
+    // approve with `inherit_history_from = <plan_agent_id>`.
+    map.insert(
+        "general-purpose:executor".into(),
+        tau_agent::AgentSpec {
+            system_prompt: format!("{general_prompt}\n\n{executor_suffix}"),
+            tools: general_purpose_tools,
+            max_turns: 200,
+            allows_worktree: true,
+            allowed_subagent_specs: Some(vec![
+                "general-purpose".into(),
+                "explore".into(),
+                "plan".into(),
+            ]),
+        },
+    );
+    map
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::build_base_specs;
+
+    #[test]
+    fn executor_spec_carries_executor_suffix() {
+        // Build with empty tool list; we only care about the prompt.
+        let map = build_base_specs(&[]);
+        let exec = map
+            .get("general-purpose:executor")
+            .expect("executor spec registered");
+        assert!(
+            exec.system_prompt.contains("Plan Executor Mode"),
+            "executor spec carries the executor prompt suffix"
+        );
+        let general = map
+            .get("general-purpose")
+            .expect("general-purpose registered");
+        assert!(
+            !general.system_prompt.contains("Plan Executor Mode"),
+            "non-executor spec does NOT carry the suffix"
+        );
+    }
 }

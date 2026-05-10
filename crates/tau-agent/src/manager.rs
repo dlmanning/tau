@@ -1,4 +1,12 @@
 //! Subagent spawning — create independent agent instances for parallel work.
+//!
+//! The runtime is ignorant of which agent types exist, what tools are
+//! available, or what prompts they use. Hosts construct an [`AgentSpec`]
+//! (system prompt, tools, max turns, worktree allowance, allowed subagent
+//! specs) and pass it to [`AgentManager::spawn`]. Spec names are opaque
+//! strings owned by the host; the runtime treats `AgentSpec` as a fixed
+//! per-agent input. Changing the spec means spawning a new agent —
+//! exposed via [`AgentManager::respec`] / [`AgentHandle::respec`].
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -9,78 +17,105 @@ use tau_ai::{Content, Message, Model, Usage};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::interaction::InteractionRequest;
-
+use crate::approval::{ApprovalPolicy, DefaultApprovalPolicy};
 use crate::builder::AgentBuilder;
 use crate::config::AgentConfig;
-use crate::approval::{ApprovalPolicy, DefaultApprovalPolicy};
 use crate::events::{AgentEvent, SubagentOutcome};
 use crate::handle::AgentHandle;
+use crate::interaction::InteractionRequest;
 use crate::tool::{BoxedTool, send_event};
 use crate::transcript::record_transcript;
 use crate::transport::Transport;
 use crate::worktree::{WorktreeInfo, cleanup_worktree, create_worktree};
 
-/// Maximum recursion depth for nested agent spawning.
-pub const MAX_AGENT_DEPTH: u32 = 3;
-
-/// Maximum turns a subagent can execute before being stopped.
-pub const MAX_SUBAGENT_TURNS: u32 = 200;
-
-/// Agent type determines tool set and system prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentType {
-    GeneralPurpose,
-    Explore,
-    Plan,
+/// Immutable per-agent input. The system prompt + tool set + parameters the
+/// LLM sees as fixed for the agent's lifetime. To change any of these,
+/// spawn a new agent (typically via [`AgentManager::respec`] /
+/// [`AgentHandle::respec`]).
+#[derive(Clone)]
+pub struct AgentSpec {
+    /// Agent-type-specific instruction text. The runtime wraps it with
+    /// the env + tool-list section before assigning it as the actor's
+    /// `system_prompt`. Hosts pass the bare instruction; the runtime adds
+    /// the boilerplate via [`crate::prompts::build_subagent_prompt`].
+    pub system_prompt: String,
+    /// Tools the agent has access to. Hosts filter / construct this list
+    /// per spec — including any nested [`AgentTool`](crate) for
+    /// recursive spawning.
+    ///
+    /// **Tool sharing across spawns**: `BoxedTool` is `Arc<dyn Tool>`, so
+    /// reusing the same `AgentSpec` for multiple concurrent spawns shares
+    /// the same underlying tool objects. Tools that capture per-agent
+    /// state via [`Tool::bind_to_agent`](crate::tool::Tool::bind_to_agent)
+    /// (e.g. `AgentTool`'s `OnceLock<AgentHandle>`) will **bind to whichever
+    /// spawn happens first** and silently mis-route for subsequent ones.
+    /// Hosts that spawn the same spec concurrently must construct fresh
+    /// tool instances per spawn (typically via a resolver closure that
+    /// builds a new `AgentSpec` each call) rather than cloning a shared
+    /// `Vec<BoxedTool>`.
+    pub tools: Vec<BoxedTool>,
+    /// Max turns before the agent loop stops.
+    pub max_turns: u32,
+    /// Whether this agent may run inside a git worktree if the spawn opts
+    /// request `isolation = "worktree"`. Hosts set this to `false` for
+    /// read-only specs (Explore, Plan).
+    pub allows_worktree: bool,
+    /// Spec names this agent is permitted to spawn as subagents. Carried
+    /// through to the host's spawn-time resolver / `AgentTool`. The
+    /// runtime does not enforce this directly — the AgentTool the host
+    /// installs in `tools` reads it.
+    pub allowed_subagent_specs: Option<Vec<String>>,
 }
 
-impl AgentType {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "general-purpose" => Some(Self::GeneralPurpose),
-            "explore" => Some(Self::Explore),
-            "plan" => Some(Self::Plan),
-            _ => None,
-        }
-    }
-
-    /// Whether this agent type only gets read-only tools.
-    pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::Explore | Self::Plan)
-    }
-
-    /// Maximum turns before the agent loop stops.
-    fn max_turns(&self) -> u32 {
-        match self {
-            Self::GeneralPurpose => MAX_SUBAGENT_TURNS,
-            Self::Explore => MAX_SUBAGENT_TURNS,
-            Self::Plan => MAX_SUBAGENT_TURNS,
-        }
-    }
-}
-
-impl std::fmt::Display for AgentType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::GeneralPurpose => write!(f, "general-purpose"),
-            Self::Explore => write!(f, "explore"),
-            Self::Plan => write!(f, "plan"),
-        }
-    }
-}
-
-/// Factory function to create a depth-limited Agent tool for a given parent
-/// agent type. The parent type lets the factory enforce per-parent
-/// restrictions (e.g. Plan agents may only spawn read-only subagents).
+/// How a subagent's filesystem state is isolated from the parent's.
 ///
-/// The fourth argument is the parent subagent's *effective* approval
-/// policy. Passing it through the factory lets the AgentTool stamp it
-/// onto its `SpawnRequest`s so descendants inherit the same policy — per
-/// the spec's "applies at that level and below unless overridden again
-/// deeper" rule.
-type AgentToolFactory =
-    Arc<dyn Fn(u32, AgentHandle, AgentType, Arc<dyn ApprovalPolicy>) -> BoxedTool + Send + Sync>;
+/// Serializes as a snake_case string so the same enum can be used in tool
+/// argument schemas without divergence — the LLM sees `"worktree"`, the
+/// runtime gets a typed value.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    /// Run the subagent inside a fresh git worktree on a per-agent
+    /// branch. Honored only when the spec sets `allows_worktree = true`;
+    /// otherwise silently ignored.
+    Worktree,
+}
+
+/// Per-spawn options that don't belong on the agent's immutable spec.
+#[derive(Default, Clone)]
+pub struct SpawnOpts {
+    /// Short description for the parent UI / event timeline.
+    pub description: String,
+    /// Override the spec's default model.
+    pub model: Option<Model>,
+    /// Working directory for the subagent.
+    pub cwd: Option<String>,
+    /// Isolation mode for the subagent's filesystem state. `None` means
+    /// "share the parent's working tree." Honored only when the spec
+    /// allows it (see [`Isolation`]).
+    pub isolation: Option<Isolation>,
+    /// Seed the new subagent with a stored agent's full message history,
+    /// then apply the spawn prompt as a follow-up user message. Useful for
+    /// plan → execute handoffs: the executor inherits the planner's
+    /// investigation as its own history.
+    ///
+    /// The named agent must already be stored (i.e., have terminated).
+    pub inherit_history_from: Option<String>,
+    /// Override the approval policy this subagent (and any descendants
+    /// not overriding again) runs under.
+    pub approval_policy: Option<Arc<dyn ApprovalPolicy>>,
+    /// Host-supplied spec name to stamp on `SubagentStarted` events.
+    /// The runtime stores it but does not interpret it.
+    pub spec_name: Option<String>,
+    /// Seed the new agent with an explicit message vector before its
+    /// first turn. Wins over [`Self::inherit_history_from`] when both
+    /// are set: this is the lower-level primitive (the host already has
+    /// the messages — no lookup needed). Useful for `/branch`-style
+    /// flows that fork from an arbitrary index in the parent's history.
+    pub seed_messages: Option<Vec<Message>>,
+}
 
 /// Result from a completed subagent.
 #[derive(Debug)]
@@ -94,37 +129,8 @@ pub struct SubagentResult {
     pub worktree_path: Option<String>,
     pub worktree_branch: Option<String>,
     /// Path to the JSONL transcript on disk, when transcript recording
-    /// succeeded. The parent agent can use this to read the subagent's
-    /// full investigation trace if it wants more detail than the textual
-    /// result provides. See [`SpawnRequest::include_transcript`].
+    /// succeeded.
     pub transcript_path: Option<String>,
-}
-
-/// Lightweight request struct for spawning a subagent via AgentManager.
-pub struct SpawnRequest {
-    pub agent_type: AgentType,
-    pub prompt: String,
-    pub description: String,
-    pub model: Option<Model>,
-    pub cwd: Option<String>,
-    pub isolation: Option<String>,
-    pub depth: u32,
-    /// Seed the new subagent with a stored agent's full message history,
-    /// then apply `prompt` as a follow-up user message. Useful for plan →
-    /// execute handoffs: the executor inherits the planner's investigation
-    /// and the approved plan as its own history.
-    ///
-    /// The named agent must already be stored (i.e., have terminated).
-    /// If lookup fails, spawn returns an error. Inherited tool_uses
-    /// reference tools the new agent may not have — Anthropic tolerates
-    /// this; OpenAI/Google may not.
-    pub inherit_history_from: Option<String>,
-    /// Override the approval policy this subagent runs under. `None`
-    /// inherits from the parent (configured on the manager via
-    /// [`AgentManager::with_parent_approval_policy`]). The override
-    /// applies to this subagent and any descendants it spawns, unless a
-    /// descendant overrides again.
-    pub approval_policy: Option<Arc<dyn ApprovalPolicy>>,
 }
 
 /// Whether an agent is currently executing or stored (idle).
@@ -135,28 +141,39 @@ pub enum AgentStatus {
 }
 
 /// Manages subagent lifecycle: spawn, resume, evict.
+///
+/// **Registry invariant**: a spec exists in `agent_specs` iff its id is
+/// either in `agents` (idle storage) or `running_handles` (currently
+/// executing). All mutations go through [`Self::insert_spec`],
+/// [`Self::drop_spec`], [`Self::track_running`], [`Self::untrack_running`],
+/// [`Self::forget`], and [`Self::store`] so the invariant is maintained
+/// in one place.
 pub struct AgentManager {
     agents: Mutex<VecDeque<(String, ManagedAgent)>>,
     max_agents: usize,
     transport: Arc<dyn Transport>,
-    tools: Vec<BoxedTool>,
     parent_config: AgentConfig,
     parent_event_tx: broadcast::Sender<AgentEvent>,
+    /// Per-agent specs, keyed by agent id. Maintained in lockstep with
+    /// `agents` ∪ `running_handles` — see the type-level invariant above.
+    /// `AgentHandle::with_system_prompt` / `with_tools` look up the
+    /// current spec here so callers can change a single field without
+    /// rebuilding the whole spec.
+    ///
+    /// Stored as `Arc<AgentSpec>` because specs carry a `Vec<Arc<dyn Tool>>`
+    /// that's expensive to deep-clone. Sharing one Arc across the registry,
+    /// concurrent `spec_for` reads, and the run-time clone in spawn paths
+    /// keeps the cost to refcount bumps.
+    agent_specs: Mutex<HashMap<String, Arc<AgentSpec>>>,
     /// Parent's interaction sender. When set, each subagent gets a wrapping
     /// channel that stamps `agent_id` on outgoing requests and forwards them
     /// to this parent. When `None`, subagents have no interaction channel.
     parent_interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
     /// Default `ApprovalPolicy` for spawned subagents. Inherited from the
     /// parent process so subagents gate the same way the parent does (the
-    /// spawn request can override per-call). Defaults to
+    /// spawn opts can override per-call). Defaults to
     /// [`DefaultApprovalPolicy`] when not configured.
-    ///
-    /// Wrapped in a sync mutex so the host can swap the default at runtime
-    /// (e.g. when the TUI installs an auto-accept override on the parent
-    /// handle, it should mirror that on the manager so subagents stay in
-    /// sync).
     parent_approval_policy: ParkingMutex<Arc<dyn ApprovalPolicy>>,
-    agent_tool_factory: ParkingMutex<Option<AgentToolFactory>>,
     /// Handles for agents that are currently executing (keyed by agent_id).
     running_handles: Mutex<HashMap<String, (AgentHandle, String)>>,
 }
@@ -168,10 +185,11 @@ struct ManagedAgent {
     messages_at_pause: usize,
 }
 
+// ---------- Construction & configuration ----------
+
 impl AgentManager {
     pub fn new(
         parent_event_tx: broadcast::Sender<AgentEvent>,
-        tools: Vec<BoxedTool>,
         parent_config: AgentConfig,
         transport: Arc<dyn Transport>,
         max_agents: usize,
@@ -180,13 +198,12 @@ impl AgentManager {
             agents: Mutex::new(VecDeque::new()),
             max_agents,
             transport,
-            tools,
             parent_config,
             parent_event_tx,
             parent_interaction_tx: None,
             parent_approval_policy: ParkingMutex::new(Arc::new(DefaultApprovalPolicy)),
-            agent_tool_factory: ParkingMutex::new(None),
             running_handles: Mutex::new(HashMap::new()),
+            agent_specs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -202,321 +219,137 @@ impl AgentManager {
     }
 
     /// Default policy spawned subagents run under. Per-spawn override is
-    /// available via [`SpawnRequest::approval_policy`].
-    pub fn with_parent_approval_policy(self, policy: Arc<dyn ApprovalPolicy>) -> Self {
-        *self.parent_approval_policy.lock() = policy;
+    /// available via [`SpawnOpts::approval_policy`].
+    pub fn with_parent_approval_policy(mut self, policy: Arc<dyn ApprovalPolicy>) -> Self {
+        // We own `self` here, so the lock is uncontended; this is the
+        // construction-time twin of `set_default_approval_policy`.
+        *self.parent_approval_policy.get_mut() = policy;
         self
     }
 
-    /// Replace the default approval policy at runtime. Useful for host-side
-    /// overrides applied after construction (e.g. tau-cli installing
-    /// auto-accept when the user enters TUI mode). Affects future spawns
-    /// only; in-flight subagents keep the policy they were spawned with.
+    /// Replace the default approval policy at runtime. Affects future
+    /// spawns only; in-flight subagents keep the policy they were spawned
+    /// with.
     pub fn set_default_approval_policy(&self, policy: Arc<dyn ApprovalPolicy>) {
         *self.parent_approval_policy.lock() = policy;
     }
+}
 
-    /// Set the factory for creating recursive agent tools. The factory
-    /// receives the new agent's depth, handle, type, and the effective
-    /// approval policy of its parent (so descendants inherit it).
-    pub fn set_agent_tool_factory(&self, factory: AgentToolFactory) {
-        *self.agent_tool_factory.lock() = Some(factory);
+// ---------- Registry helpers (single source of truth for the invariant) ----------
+
+impl AgentManager {
+    /// Look up the current spec for an agent the manager knows about
+    /// (running or idle). Returns `None` if the id is unknown — typically
+    /// because the agent was evicted, never spawned through this manager,
+    /// or has been replaced by `respec`. The returned `Arc` shares with
+    /// the registry: clone it freely; mutate via [`Arc::unwrap_or_clone`]
+    /// or `(*spec).clone()` when you need owned access.
+    pub async fn spec_for(&self, agent_id: &str) -> Option<Arc<AgentSpec>> {
+        self.agent_specs.lock().await.get(agent_id).cloned()
     }
 
-    /// Spawn a foreground subagent. Blocks until completion.
-    pub async fn spawn(
-        self: &Arc<Self>,
-        request: SpawnRequest,
-        cancel: CancellationToken,
-    ) -> crate::error::Result<SubagentResult> {
-        let agent_id = uuid::Uuid::new_v4().to_string();
-        let description = request.description.clone();
-        let result = self.run_subagent(&request, cancel, &agent_id).await;
-        self.running_handles.lock().await.remove(&agent_id);
-        let (result, handle) = result?;
-        self.store(result.agent_id.clone(), handle, description)
-            .await;
-        Ok(result)
+    async fn insert_spec(&self, agent_id: &str, spec: Arc<AgentSpec>) {
+        self.agent_specs.lock().await.insert(agent_id.to_string(), spec);
     }
 
-    /// Spawn a background subagent. Returns immediately with the agent_id.
-    pub async fn spawn_background(
-        self: &Arc<Self>,
-        request: SpawnRequest,
-        parent_handle: AgentHandle,
-        parent_cancel: CancellationToken,
-    ) -> String {
-        let agent_id = uuid::Uuid::new_v4().to_string();
-        let description = request.description.clone();
-        let bg_cancel = CancellationToken::new();
-
-        parent_handle.expect_follow_up();
-
-        let manager = self.clone();
-        let desc = description.clone();
-        let aid = agent_id.clone();
-        let bg_cancel_inner = bg_cancel.clone();
-
-        tokio::spawn(async move {
-            let result = tokio::select! {
-                r = manager.run_subagent(&request, bg_cancel_inner, &aid) => r,
-                _ = parent_cancel.cancelled() => {
-                    bg_cancel.cancel();
-                    Err(crate::error::Error::Other("Cancelled by parent".into()))
-                }
-            };
-
-            manager.running_handles.lock().await.remove(&aid);
-
-            match result {
-                Ok((subresult, handle)) => {
-                    manager
-                        .store(subresult.agent_id.clone(), handle, desc.clone())
-                        .await;
-
-                    let _ = parent_handle
-                        .follow_up(Message::subagent_completed(
-                            &subresult.agent_id,
-                            &desc,
-                            format!(
-                                "{}\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms]",
-                                subresult.text,
-                                subresult.agent_id,
-                                subresult.input_tokens,
-                                subresult.output_tokens,
-                                subresult.tool_use_count,
-                                subresult.duration_ms,
-                            ),
-                        ))
-                        .await;
-                }
-                Err(e) => {
-                    let _ = parent_handle
-                        .follow_up(Message::subagent_failed(
-                            &aid,
-                            &desc,
-                            format!("Error: {}", e),
-                        ))
-                        .await;
-                }
-            }
-        });
-
-        agent_id
+    async fn drop_spec(&self, agent_id: &str) {
+        self.agent_specs.lock().await.remove(agent_id);
     }
 
-    /// Spawn a subagent and return its handle for interactive use.
-    /// The caller drives the conversation by sending prompts via the handle.
-    /// No event forwarder is set up — the caller subscribes directly.
-    pub async fn spawn_interactive(
-        &self,
-        request: SpawnRequest,
-    ) -> crate::error::Result<(AgentHandle, String)> {
-        let agent_id = uuid::Uuid::new_v4().to_string();
-
-        let cwd = request
-            .cwd
-            .clone()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".into())
-            });
-
-        let mut agent_cfg = self.parent_config.clone();
-        agent_cfg.system_prompt = None;
-        agent_cfg.max_turns = Some(request.agent_type.max_turns());
-        agent_cfg.max_tokens = None;
-        agent_cfg.cache_scope = None;
-        agent_cfg.cache_ttl = None;
-        if let Some(ref model) = request.model {
-            agent_cfg.model = model.clone();
-        }
-
-        let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
-        builder.set_cwd(&cwd);
-        // Inherit approval policy from the parent (or use the per-spawn
-        // override). Subagents now gate the same way the parent does.
-        let policy = request
-            .approval_policy
-            .clone()
-            .unwrap_or_else(|| self.parent_approval_policy.lock().clone());
-        builder.set_approval_policy(policy.clone());
-        if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id.as_ref()) {
-            builder.set_interaction_sender(sub_tx);
-        }
-
-        let factory = self.agent_tool_factory.lock().clone();
-        let agent_handle = builder.pre_handle();
-
-        let tools = build_tool_set(
-            &request.agent_type,
-            &self.tools,
-            request.depth,
-            &factory,
-            &agent_handle,
-            policy,
-        );
-        for tool in &tools {
-            builder.add_tool(tool.clone());
-        }
-
-        let tool_names = builder.tool_names();
-        let system_prompt = crate::prompts::build_subagent_prompt(
-            agent_type_suffix(&request.agent_type),
-            &tool_names,
-            &cwd,
-        );
-        builder.set_system_prompt(system_prompt);
-
-        let handle = builder.spawn();
-
-        // Track as running so find_agent() and send_to_running() work.
-        // Caller must call remove_interactive() when done.
-        self.running_handles.lock().await.insert(
-            agent_id.clone(),
-            (handle.clone(), request.description.clone()),
-        );
-
-        Ok((handle, agent_id))
+    async fn track_running(&self, agent_id: &str, handle: AgentHandle, description: String) {
+        self.running_handles
+            .lock()
+            .await
+            .insert(agent_id.to_string(), (handle, description));
     }
 
-    /// Remove an interactive agent from the running handles.
-    pub async fn remove_interactive(&self, agent_id: &str) {
+    async fn untrack_running(&self, agent_id: &str) {
         self.running_handles.lock().await.remove(agent_id);
     }
 
-    /// Send a message to a previously stored agent (resume).
-    pub async fn send(
-        &self,
-        id: &str,
-        message: &str,
-        parent_cancel: CancellationToken,
-    ) -> crate::error::Result<SubagentResult> {
-        let started_at = chrono::Utc::now();
-        let start = Instant::now();
-
-        let mut entry = {
-            let mut agents = self.agents.lock().await;
-            let pos = agents.iter().position(|(k, _)| k == id).ok_or_else(|| {
-                crate::error::Error::Other(format!(
-                    "No agent with ID '{}'. It may have been evicted, never stored, or is currently running.",
-                    id
-                ))
-            })?;
-            agents.remove(pos).expect("pos was found via position()").1
-        };
-
-        let usage_before = entry.usage_at_pause.clone();
-
-        // Bracket the resume on the parent's stream.
-        send_event(
-            &self.parent_event_tx,
-            AgentEvent::SubagentResumed {
-                agent_id: id.to_string(),
-                description: entry.description.clone(),
-                prompt: message.to_string(),
-                resumed_at: started_at,
-            },
-        );
-
-        let event_task =
-            self.spawn_event_forwarder(entry.handle.subscribe(), id, &entry.description);
-
-        // Wire parent cancel to subagent abort
-        let agent_handle = entry.handle.clone();
-        let bridge = tokio::spawn({
-            let parent_cancel = parent_cancel.clone();
-            async move {
-                parent_cancel.cancelled().await;
-                agent_handle.abort();
-            }
-        });
-
-        let prompt_result = entry.handle.prompt_and_wait(message).await;
-        bridge.abort();
-        event_task.abort();
-
-        let current_state = entry.handle.state().await.unwrap_or_default();
-        let current_usage = current_state.total_usage.clone();
-        let delta_input = current_usage.input.saturating_sub(usage_before.input);
-        let delta_output = current_usage.output.saturating_sub(usage_before.output);
-
-        let messages = entry.handle.messages().await.unwrap_or_default();
-        let msg_start = entry.messages_at_pause.min(messages.len());
-        let tool_use_count = messages[msg_start..]
-            .iter()
-            .map(|m| match m {
-                Message::Assistant { content, .. } => content
-                    .iter()
-                    .filter(|c| matches!(c, Content::ToolCall { .. }))
-                    .count(),
-                _ => 0,
-            })
-            .sum::<usize>() as u32;
-
-        let text = extract_final_text(&messages);
-
-        let transcript_path = record_transcript(id, &messages)
+    /// Final cleanup for an agent that won't be stored idle. Removes the
+    /// running entry; drops the spec if the agent isn't already in idle
+    /// storage. Used by error paths and by [`Self::remove_interactive`].
+    async fn forget(&self, agent_id: &str) {
+        self.untrack_running(agent_id).await;
+        let in_storage = self
+            .agents
+            .lock()
             .await
-            .map(|p| p.display().to_string());
-        entry.usage_at_pause = current_usage;
-        entry.messages_at_pause = messages.len();
-        let description = entry.description.clone();
-        self.agents.lock().await.push_back((id.to_string(), entry));
+            .iter()
+            .any(|(id, _)| id == agent_id);
+        if !in_storage {
+            self.drop_spec(agent_id).await;
+        }
+    }
 
-        let completed_at = chrono::Utc::now();
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let outcome = match &prompt_result {
-            Ok(()) if parent_cancel.is_cancelled() => SubagentOutcome::Aborted {
-                reason: "cancelled by parent".to_string(),
-            },
-            Ok(()) => SubagentOutcome::Completed,
-            Err(e) if parent_cancel.is_cancelled() => SubagentOutcome::Aborted {
-                reason: e.to_string(),
-            },
-            Err(e) => SubagentOutcome::Failed {
-                reason: e.to_string(),
-            },
+    /// Move an agent into idle storage, evicting the oldest entry (and its
+    /// spec) if at capacity. Spec stays in `agent_specs` while idle.
+    async fn store(&self, id: String, handle: AgentHandle, description: String) {
+        let mut agents = self.agents.lock().await;
+        let evicted_id = if agents.len() >= self.max_agents {
+            agents.pop_front().map(|(eid, _)| eid)
+        } else {
+            None
         };
-        send_event(
-            &self.parent_event_tx,
-            AgentEvent::SubagentCompleted {
-                agent_id: id.to_string(),
+        if let Some(eid) = evicted_id {
+            self.agent_specs.lock().await.remove(&eid);
+        }
+        let state = handle.state().await.unwrap_or_default();
+        let usage = state.total_usage.clone();
+        let message_count = state.messages.len();
+        agents.push_back((
+            id,
+            ManagedAgent {
+                handle,
                 description,
-                outcome,
-                started_at,
-                completed_at,
-                duration_ms,
-                usage: tau_ai::Usage {
-                    input: delta_input,
-                    output: delta_output,
-                    ..Default::default()
-                },
-                tool_use_count,
-                worktree_path: None,
-                worktree_branch: None,
+                usage_at_pause: usage,
+                messages_at_pause: message_count,
             },
-        );
+        ));
+    }
 
-        prompt_result?;
+    /// Register a builder-spawned handle with this manager so it can
+    /// `respec` / `with_system_prompt` / `with_tools`. Stamps the
+    /// handle's `agent_id` and `manager` `OnceLock`s and records the
+    /// spec. Returns the assigned id. No-op (returning the existing id)
+    /// if the handle already has one.
+    ///
+    /// Use this for the host's "root" agent that was built directly via
+    /// `AgentBuilder::spawn()` rather than through the manager.
+    pub async fn adopt(
+        self: &Arc<Self>,
+        handle: &AgentHandle,
+        spec: impl Into<Arc<AgentSpec>>,
+    ) -> String {
+        let spec = spec.into();
+        if let Some(existing) = handle.agent_id.get() {
+            self.insert_spec(existing, spec).await;
+            return existing.clone();
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = handle.agent_id.set(id.clone());
+        let _ = handle.manager.set(Arc::downgrade(self));
+        self.insert_spec(&id, spec).await;
+        id
+    }
 
-        Ok(SubagentResult {
-            agent_id: id.to_string(),
-            text,
-            input_tokens: delta_input,
-            output_tokens: delta_output,
-            tool_use_count,
-            duration_ms,
-            worktree_path: None,
-            worktree_branch: None,
-            transcript_path,
-        })
+    /// Remove an interactive agent from the running handles. Drops the
+    /// spec if the agent was never stored (so storage stays bounded).
+    pub async fn remove_interactive(&self, agent_id: &str) {
+        self.forget(agent_id).await;
     }
 
     /// Find an agent by name or ID.
+    ///
+    /// Resolution order: exact-id match in `running_handles`, then a
+    /// case-insensitive description-substring match in `running_handles`,
+    /// then the same two passes against idle storage. **First match wins**
+    /// — an ambiguous needle (e.g. a substring shared by several
+    /// descriptions) returns whichever matched first in iteration order,
+    /// which for HashMap-backed storage is unspecified. Hosts that need
+    /// disambiguation should pass an exact id.
     pub async fn find_agent(&self, name_or_id: &str) -> Option<(String, String, AgentStatus)> {
-        // Check running agents first
         {
             let running = self.running_handles.lock().await;
             if let Some((_, desc)) = running.get(name_or_id) {
@@ -530,7 +363,6 @@ impl AgentManager {
             }
         }
 
-        // Check stored agents
         let agents = self.agents.lock().await;
         if let Some((id, e)) = agents.iter().find(|(id, _)| id == name_or_id) {
             return Some((id.clone(), e.description.clone(), AgentStatus::Idle));
@@ -546,8 +378,6 @@ impl AgentManager {
 
     /// Send a message to a currently running agent via steering.
     pub async fn send_to_running(&self, id: &str, message: Message) -> bool {
-        // Clone the handle out from under the lock so we don't hold the
-        // running_handles mutex across the steer().await.
         let handle = {
             let guard = self.running_handles.lock().await;
             guard.get(id).map(|(h, _)| h.clone())
@@ -560,23 +390,47 @@ impl AgentManager {
         }
     }
 
-    /// Look up a stored agent by id and return a clone of its message log.
-    /// Used to seed an inheriting subagent's conversation. Errors when the
-    /// id isn't in the stored agents (still running, evicted, or never
-    /// spawned through this manager).
+    /// Look up an agent by id and return a clone of its message log.
+    /// Used to seed an inheriting subagent's conversation. Checks the
+    /// stored-idle queue first, then `running_handles` (so interactive
+    /// agents can still hand off their history without being moved into
+    /// idle storage first).
     async fn fetch_stored_messages(&self, source_id: &str) -> crate::error::Result<Vec<Message>> {
-        let agents = self.agents.lock().await;
-        let entry = agents.iter().find(|(id, _)| id == source_id).ok_or_else(|| {
+        let stored = {
+            let agents = self.agents.lock().await;
+            agents
+                .iter()
+                .find(|(id, _)| id == source_id)
+                .map(|(_, e)| e.handle.clone())
+        };
+        let handle = if let Some(h) = stored {
+            h
+        } else {
+            let guard = self.running_handles.lock().await;
+            match guard.get(source_id).map(|(h, _)| h.clone()) {
+                Some(h) => {
+                    drop(guard);
+                    h
+                }
+                None => {
+                    return Err(crate::error::Error::Other(format!(
+                        "inherit_history_from: no agent with id '{source_id}' \
+                         (still running, evicted, or never spawned)"
+                    )));
+                }
+            }
+        };
+        // Propagate fetch failures rather than masking them as "empty
+        // history": silently inheriting nothing would look like a clean
+        // handoff to callers, which is the worst kind of bug. The actor
+        // returning `None` here means it's gone or unresponsive — both
+        // cases the caller needs to know about.
+        handle.messages().await.ok_or_else(|| {
             crate::error::Error::Other(format!(
-                "inherit_history_from: no stored agent with id '{source_id}' \
-                 (still running, evicted, or never spawned)"
+                "inherit_history_from: agent '{source_id}' did not return its message log \
+                 (actor unresponsive or shutting down)"
             ))
-        })?;
-        // Clone messages out from under the lock so we don't hold it across
-        // the await in `handle.messages()`.
-        let handle = entry.1.handle.clone();
-        drop(agents);
-        Ok(handle.messages().await.unwrap_or_default())
+        })
     }
 
     /// Build a per-subagent interaction sender that stamps `agent_id` and
@@ -591,7 +445,6 @@ impl AgentManager {
         let (sub_tx, mut sub_rx) = mpsc::channel::<InteractionRequest>(8);
         tokio::spawn(async move {
             while let Some(mut req) = sub_rx.recv().await {
-                // Preserve a deeper subagent's id; only stamp if unset.
                 if req.agent_id.is_none() {
                     req.agent_id = Some(agent_id.clone());
                 }
@@ -634,141 +487,320 @@ impl AgentManager {
             }
         })
     }
+}
 
-    async fn run_subagent(
-        &self,
-        req: &SpawnRequest,
+// ---------- Spawn / resume / respec ----------
+
+impl AgentManager {
+    /// Spawn a foreground subagent. Blocks until completion.
+    pub async fn spawn(
+        self: &Arc<Self>,
+        spec: impl Into<Arc<AgentSpec>>,
+        initial_prompt: String,
+        opts: SpawnOpts,
         cancel: CancellationToken,
-        agent_id: &str,
-    ) -> crate::error::Result<(SubagentResult, AgentHandle)> {
-        let started_at = chrono::Utc::now();
-        let start = Instant::now();
-
-        let worktree = if req.isolation.as_deref() == Some("worktree") {
-            match create_worktree(agent_id).await {
-                Ok(wt) => Some(wt),
-                Err(e) => {
-                    return Err(crate::error::Error::Other(format!(
-                        "Worktree setup failed: {}",
-                        e
-                    )));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Bracket the inner run with SubagentStarted/SubagentCompleted on
-        // the parent's stream so hosts can render an expandable subagent
-        // block. The intermediate `Subagent { event }` wrapping (set up by
-        // `spawn_event_forwarder` inside `run_agent_inner`) continues to
-        // forward each child event between these two brackets.
-        send_event(
-            &self.parent_event_tx,
-            AgentEvent::SubagentStarted {
-                agent_id: agent_id.to_string(),
-                agent_type: req.agent_type.to_string(),
-                description: req.description.clone(),
-                prompt: req.prompt.clone(),
-                started_at,
-            },
-        );
-
-        let agent_result = self
-            .run_agent_inner(req, agent_id, &worktree, cancel.clone())
+    ) -> crate::error::Result<SubagentResult> {
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let description = opts.description.clone();
+        // Accept either an owned `AgentSpec` (auto-Arc'd via `From`) or an
+        // existing `Arc<AgentSpec>`. The wrap is free for the latter.
+        let spec = spec.into();
+        // Spec must exist before any handle.respec lookups during the run.
+        self.insert_spec(&agent_id, Arc::clone(&spec)).await;
+        let result = self
+            .run_subagent(&spec, &initial_prompt, &opts, cancel, &agent_id)
             .await;
-        let (wt_path, wt_branch) = if let Some(wt) = &worktree {
-            match cleanup_worktree(wt).await {
-                Ok(true) => (None, None),
-                _ => (Some(wt.path.display().to_string()), Some(wt.branch.clone())),
-            }
-        } else {
-            (None, None)
-        };
-
-        let completed_at = chrono::Utc::now();
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        match agent_result {
-            Ok((mut result, handle)) => {
-                let messages = handle.messages().await.unwrap_or_default();
-                result.transcript_path = record_transcript(agent_id, &messages)
-                    .await
-                    .map(|p| p.display().to_string());
-                result.worktree_path = wt_path.clone();
-                result.worktree_branch = wt_branch.clone();
-                result.duration_ms = duration_ms;
-
-                let outcome = if cancel.is_cancelled() {
-                    SubagentOutcome::Aborted {
-                        reason: "cancelled by parent".to_string(),
-                    }
-                } else {
-                    SubagentOutcome::Completed
-                };
-                send_event(
-                    &self.parent_event_tx,
-                    AgentEvent::SubagentCompleted {
-                        agent_id: agent_id.to_string(),
-                        description: req.description.clone(),
-                        outcome,
-                        started_at,
-                        completed_at,
-                        duration_ms,
-                        usage: tau_ai::Usage {
-                            input: result.input_tokens,
-                            output: result.output_tokens,
-                            ..Default::default()
-                        },
-                        tool_use_count: result.tool_use_count,
-                        worktree_path: wt_path,
-                        worktree_branch: wt_branch,
-                    },
-                );
-
-                Ok((result, handle))
+        self.untrack_running(&agent_id).await;
+        match result {
+            Ok((subresult, handle)) => {
+                self.store(subresult.agent_id.clone(), handle, description)
+                    .await;
+                Ok(subresult)
             }
             Err(e) => {
-                let outcome = if cancel.is_cancelled() {
-                    SubagentOutcome::Aborted {
-                        reason: "cancelled by parent".to_string(),
-                    }
-                } else {
-                    SubagentOutcome::Failed {
-                        reason: e.to_string(),
-                    }
-                };
-                send_event(
-                    &self.parent_event_tx,
-                    AgentEvent::SubagentCompleted {
-                        agent_id: agent_id.to_string(),
-                        description: req.description.clone(),
-                        outcome,
-                        started_at,
-                        completed_at,
-                        duration_ms,
-                        usage: tau_ai::Usage::default(),
-                        tool_use_count: 0,
-                        worktree_path: wt_path,
-                        worktree_branch: wt_branch,
-                    },
-                );
+                self.drop_spec(&agent_id).await;
                 Err(e)
             }
         }
     }
 
-    async fn run_agent_inner(
-        &self,
-        req: &SpawnRequest,
+    /// Spawn a background subagent. Returns immediately with the agent_id.
+    pub async fn spawn_background(
+        self: &Arc<Self>,
+        spec: impl Into<Arc<AgentSpec>>,
+        initial_prompt: String,
+        opts: SpawnOpts,
+        parent_handle: AgentHandle,
+        parent_cancel: CancellationToken,
+    ) -> String {
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let description = opts.description.clone();
+        let bg_cancel = CancellationToken::new();
+
+        parent_handle.expect_follow_up();
+        let spec = spec.into();
+        self.insert_spec(&agent_id, Arc::clone(&spec)).await;
+
+        let manager = self.clone();
+        let desc = description.clone();
+        let aid = agent_id.clone();
+        let bg_cancel_inner = bg_cancel.clone();
+
+        tokio::spawn(async move {
+            // Forward parent cancellation to bg_cancel without dropping
+            // the run-future. `run_subagent` honors bg_cancel and runs
+            // its own cleanup (event forwarder abort, untrack_running)
+            // before returning.
+            let cancel_forwarder = {
+                let bg_cancel = bg_cancel.clone();
+                tokio::spawn(async move {
+                    parent_cancel.cancelled().await;
+                    bg_cancel.cancel();
+                })
+            };
+
+            let result = manager
+                .run_subagent(&spec, &initial_prompt, &opts, bg_cancel_inner, &aid)
+                .await;
+            cancel_forwarder.abort();
+
+            manager.untrack_running(&aid).await;
+
+            match result {
+                Ok((subresult, handle)) => {
+                    manager
+                        .store(subresult.agent_id.clone(), handle, desc.clone())
+                        .await;
+
+                    let _ = parent_handle
+                        .follow_up(Message::subagent_completed(
+                            &subresult.agent_id,
+                            &desc,
+                            format!(
+                                "{}\n[Agent {} | {} in + {} out tokens | {} tool calls | {}ms]",
+                                subresult.text,
+                                subresult.agent_id,
+                                subresult.input_tokens,
+                                subresult.output_tokens,
+                                subresult.tool_use_count,
+                                subresult.duration_ms,
+                            ),
+                        ))
+                        .await;
+                }
+                Err(e) => {
+                    manager.drop_spec(&aid).await;
+                    let _ = parent_handle
+                        .follow_up(Message::subagent_failed(
+                            &aid,
+                            &desc,
+                            format!("Error: {}", e),
+                        ))
+                        .await;
+                }
+            }
+        });
+
+        agent_id
+    }
+
+    /// Spawn a subagent and return its handle for interactive use.
+    /// The caller drives the conversation by sending prompts via the handle.
+    /// No event forwarder is set up — the caller subscribes directly.
+    pub async fn spawn_interactive(
+        self: &Arc<Self>,
+        spec: impl Into<Arc<AgentSpec>>,
+        opts: SpawnOpts,
+    ) -> crate::error::Result<(AgentHandle, String)> {
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let spec = spec.into();
+        self.insert_spec(&agent_id, Arc::clone(&spec)).await;
+
+        let builder = match self.configure_builder(&spec, &opts, &agent_id, None).await {
+            Ok(b) => b,
+            Err(e) => {
+                self.drop_spec(&agent_id).await;
+                return Err(e);
+            }
+        };
+        let handle = builder.spawn();
+        self.track_running(&agent_id, handle.clone(), opts.description.clone())
+            .await;
+        Ok((handle, agent_id))
+    }
+
+    /// Transition an idle stored agent to a new spec. Fetches the old
+    /// agent's history, spawns a fresh agent under `new_spec` seeded
+    /// with that history, and **evicts the original idle entry** — the
+    /// old `agent_id` no longer resolves after this call. Use
+    /// [`Self::spawn`] / [`SpawnOpts::inherit_history_from`] directly if
+    /// you want to fork instead of transition.
+    ///
+    /// The agent must already be idle. The caller drives the returned
+    /// handle and cleans up via [`Self::remove_interactive`] when done,
+    /// same as [`Self::spawn_interactive`].
+    pub async fn respec(
+        self: &Arc<Self>,
         agent_id: &str,
-        worktree: &Option<WorktreeInfo>,
-        cancel: CancellationToken,
-    ) -> crate::error::Result<(SubagentResult, AgentHandle)> {
-        let cwd = req
+        new_spec: impl Into<Arc<AgentSpec>>,
+    ) -> crate::error::Result<AgentHandle> {
+        if self.running_handles.lock().await.contains_key(agent_id) {
+            return Err(crate::error::Error::Other(format!(
+                "respec: agent '{agent_id}' is currently running; abort and await its terminal event before respec"
+            )));
+        }
+        let opts = SpawnOpts {
+            description: format!("respec({agent_id})"),
+            inherit_history_from: Some(agent_id.to_string()),
+            ..Default::default()
+        };
+        let (handle, _new_id) = self.spawn_interactive(new_spec, opts).await?;
+        // Drop the old idle entry — respec is a transition, not a fork.
+        // Done after the spawn succeeds so a failed handoff leaves the
+        // original recoverable.
+        {
+            let mut agents = self.agents.lock().await;
+            if let Some(pos) = agents.iter().position(|(id, _)| id == agent_id) {
+                agents.remove(pos);
+            }
+        }
+        self.drop_spec(agent_id).await;
+        Ok(handle)
+    }
+
+    /// Send a message to a previously stored agent (resume).
+    pub async fn send(
+        &self,
+        id: &str,
+        message: &str,
+        parent_cancel: CancellationToken,
+    ) -> crate::error::Result<SubagentResult> {
+        let started_at = chrono::Utc::now();
+        let start = Instant::now();
+
+        let mut entry = {
+            let mut agents = self.agents.lock().await;
+            let pos = agents.iter().position(|(k, _)| k == id).ok_or_else(|| {
+                crate::error::Error::Other(format!(
+                    "No agent with ID '{}'. It may have been evicted, never stored, or is currently running.",
+                    id
+                ))
+            })?;
+            agents.remove(pos).expect("pos was found via position()").1
+        };
+
+        let usage_before = entry.usage_at_pause.clone();
+        let messages_at_pause = entry.messages_at_pause;
+
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentResumed {
+                agent_id: id.to_string(),
+                description: entry.description.clone(),
+                prompt: message.to_string(),
+                resumed_at: started_at,
+            },
+        );
+
+        let event_task =
+            self.spawn_event_forwarder(entry.handle.subscribe(), id, &entry.description);
+        let cancel_bridge = spawn_cancel_bridge(entry.handle.clone(), parent_cancel.clone());
+
+        // Maintain the registry invariant during resume: the agent has
+        // been removed from `agents` (idle), so it must show up in
+        // `running_handles` until we push it back. Without this,
+        // `find_agent` and `send_to_running` lose the agent for the
+        // duration of the resume.
+        self.track_running(id, entry.handle.clone(), entry.description.clone())
+            .await;
+
+        let prompt_result = entry.handle.prompt_and_wait(message).await;
+        cancel_bridge.abort();
+        event_task.abort();
+
+        let messages = entry.handle.messages().await.unwrap_or_default();
+        let current_state = entry.handle.state().await.unwrap_or_default();
+        let (delta_input, delta_output) = usage_delta(&usage_before, &current_state.total_usage);
+        let tool_use_count = count_tool_uses_since(&messages, messages_at_pause);
+        let text = extract_final_text(&messages);
+
+        let transcript_path = record_transcript(id, &messages)
+            .await
+            .map(|p| p.display().to_string());
+        entry.usage_at_pause = current_state.total_usage.clone();
+        entry.messages_at_pause = messages.len();
+        let description = entry.description.clone();
+        // Push back to idle BEFORE untracking from running so the agent
+        // is always visible in at least one map. Brief overlap (in both)
+        // is harmless: `find_agent` checks `running_handles` first and
+        // returns Running, which is still accurate during the post-prompt
+        // bookkeeping before idle storage takes over.
+        self.agents.lock().await.push_back((id.to_string(), entry));
+        self.untrack_running(id).await;
+
+        let completed_at = chrono::Utc::now();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let outcome = outcome_from(&prompt_result, &parent_cancel);
+
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentCompleted {
+                agent_id: id.to_string(),
+                description,
+                outcome,
+                started_at,
+                completed_at,
+                duration_ms,
+                usage: Usage {
+                    input: delta_input,
+                    output: delta_output,
+                    ..Default::default()
+                },
+                tool_use_count,
+                worktree_path: None,
+                worktree_branch: None,
+            },
+        );
+
+        prompt_result?;
+
+        Ok(SubagentResult {
+            agent_id: id.to_string(),
+            text,
+            input_tokens: delta_input,
+            output_tokens: delta_output,
+            tool_use_count,
+            duration_ms,
+            worktree_path: None,
+            worktree_branch: None,
+            transcript_path,
+        })
+    }
+}
+
+// ---------- Internal: configuration + run mechanics ----------
+
+impl AgentManager {
+    /// Build a fully-configured `AgentBuilder` ready to spawn: parent
+    /// config tweaked for a subagent, cwd resolved, approval policy +
+    /// interaction sender wired, tools added, system prompt assembled,
+    /// history seeded, `pre_handle` stamped with id + manager, and every
+    /// tool given a chance to capture the handle via `bind_to_agent`.
+    ///
+    /// `fallback_cwd` is used when `opts.cwd` is `None` — typically the
+    /// worktree path for `run_agent_inner`. For `spawn_interactive` pass
+    /// `None`.
+    async fn configure_builder(
+        self: &Arc<Self>,
+        spec: &AgentSpec,
+        opts: &SpawnOpts,
+        agent_id: &str,
+        fallback_cwd: Option<&str>,
+    ) -> crate::error::Result<AgentBuilder> {
+        let cwd = opts
             .cwd
             .clone()
-            .or_else(|| worktree.as_ref().map(|w| w.path.display().to_string()))
+            .or_else(|| fallback_cwd.map(String::from))
             .unwrap_or_else(|| {
                 std::env::current_dir()
                     .map(|p| p.display().to_string())
@@ -777,108 +809,229 @@ impl AgentManager {
 
         let mut agent_cfg = self.parent_config.clone();
         agent_cfg.system_prompt = None;
-        agent_cfg.max_turns = Some(req.agent_type.max_turns());
+        agent_cfg.max_turns = Some(spec.max_turns);
         agent_cfg.max_tokens = None;
-        // Disable prompt caching for subagents — they're short-lived so
-        // cache writes are wasted (the cache is never read back).
+        // Disable prompt caching for subagents — short-lived, never read back.
         agent_cfg.cache_scope = None;
         agent_cfg.cache_ttl = None;
-        if let Some(ref model) = req.model {
+        if let Some(ref model) = opts.model {
             agent_cfg.model = model.clone();
         }
 
         let mut builder = AgentBuilder::new(agent_cfg, self.transport.clone());
         builder.set_cwd(&cwd);
-        // Inherit approval policy from the parent (or use the per-spawn
-        // override). Subagents now gate the same way the parent does.
-        let policy = req
+
+        let policy = opts
             .approval_policy
             .clone()
             .unwrap_or_else(|| self.parent_approval_policy.lock().clone());
-        builder.set_approval_policy(policy.clone());
-        if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id.as_ref()) {
+        builder.set_approval_policy(policy);
+
+        if let Some(sub_tx) = self.build_subagent_interaction_sender(agent_id) {
             builder.set_interaction_sender(sub_tx);
         }
 
-        let factory = self.agent_tool_factory.lock().clone();
-        // pre_handle() gives us a working handle connected to the same channel
-        // that spawn() will use — resolves the circular dependency.
-        let agent_handle = builder.pre_handle();
-
-        let tools = build_tool_set(
-            &req.agent_type,
-            &self.tools,
-            req.depth,
-            &factory,
-            &agent_handle,
-            policy,
-        );
-        for tool in &tools {
+        for tool in &spec.tools {
             builder.add_tool(tool.clone());
         }
 
         let tool_names = builder.tool_names();
-        let agent_prompt: String = if req.inherit_history_from.is_some() {
-            // Executor mode: append step-emission instructions so the model
-            // knows to mark step boundaries against the inherited plan.
-            format!(
-                "{}\n\n{}",
-                agent_type_suffix(&req.agent_type),
-                AGENT_EXECUTOR_PROMPT
-            )
-        } else {
-            agent_type_suffix(&req.agent_type).to_string()
-        };
         let system_prompt =
-            crate::prompts::build_subagent_prompt(&agent_prompt, &tool_names, &cwd);
+            crate::prompts::build_subagent_prompt(&spec.system_prompt, &tool_names, &cwd);
         builder.set_system_prompt(system_prompt);
 
-        // Seed inherited history before spawning if requested.
-        if let Some(ref source_id) = req.inherit_history_from {
+        // Seed history. `seed_messages` (explicit vector from the host)
+        // wins over `inherit_history_from` (lookup by id).
+        if let Some(seed) = opts.seed_messages.clone() {
+            builder.set_messages(seed);
+        } else if let Some(ref source_id) = opts.inherit_history_from {
             let source_messages = self.fetch_stored_messages(source_id).await?;
             builder.set_messages(source_messages);
         }
 
-        let handle = builder.spawn();
+        // Stamp the pre-spawn handle with this agent's id + manager
+        // backref, then give every tool a chance to capture it.
+        let pre = builder.pre_handle();
+        let _ = pre.agent_id.set(agent_id.to_string());
+        let _ = pre.manager.set(Arc::downgrade(self));
+        for tool in &spec.tools {
+            tool.bind_to_agent(&pre);
+        }
 
-        let event_task = self.spawn_event_forwarder(handle.subscribe(), agent_id, &req.description);
+        Ok(builder)
+    }
 
-        // Wire cancel bridge
-        let cancel_handle = handle.clone();
-        let parent_cancel = cancel.clone();
-        let cancel_bridge = tokio::spawn(async move {
-            parent_cancel.cancelled().await;
-            cancel_handle.abort();
-        });
+    async fn run_subagent(
+        self: &Arc<Self>,
+        spec: &AgentSpec,
+        initial_prompt: &str,
+        opts: &SpawnOpts,
+        cancel: CancellationToken,
+        agent_id: &str,
+    ) -> crate::error::Result<(SubagentResult, AgentHandle)> {
+        let started_at = chrono::Utc::now();
+        let start = Instant::now();
 
-        // Track as running
-        self.running_handles.lock().await.insert(
-            agent_id.to_string(),
-            (handle.clone(), req.description.clone()),
+        // Emit Started before any setup work that could fail (worktree
+        // creation, builder configuration). Hosts otherwise see an
+        // unbracketed Err with no record of the spawn attempt.
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentStarted {
+                agent_id: agent_id.to_string(),
+                spec_name: opts.spec_name.clone(),
+                description: opts.description.clone(),
+                prompt: initial_prompt.to_string(),
+                started_at,
+            },
         );
 
-        let prompt_result = handle.prompt_and_wait(&req.prompt).await;
+        // Helper to emit Completed{Failed} for setup-time failures and
+        // return the same Err to the caller. Keeps the bracket complete
+        // even when we never produced a handle. `wt_path`/`wt_branch`
+        // carry teardown signal in the post-worktree-creation path
+        // (configure_builder failed but the worktree was already made),
+        // so a non-clean cleanup is still surfaced.
+        let emit_setup_failure =
+            |e: crate::error::Error,
+             wt_path: Option<String>,
+             wt_branch: Option<String>| async {
+                let completed_at = chrono::Utc::now();
+                let duration_ms = start.elapsed().as_millis() as u64;
+                send_event(
+                    &self.parent_event_tx,
+                    AgentEvent::SubagentCompleted {
+                        agent_id: agent_id.to_string(),
+                        description: opts.description.clone(),
+                        outcome: SubagentOutcome::Failed {
+                            reason: e.to_string(),
+                        },
+                        started_at,
+                        completed_at,
+                        duration_ms,
+                        usage: Usage::default(),
+                        tool_use_count: 0,
+                        worktree_path: wt_path,
+                        worktree_branch: wt_branch,
+                    },
+                );
+                e
+            };
+
+        let worktree = if spec.allows_worktree && opts.isolation == Some(Isolation::Worktree) {
+            match create_worktree(agent_id).await {
+                Ok(wt) => Some(wt),
+                Err(e) => {
+                    // No worktree exists — nothing to tear down.
+                    let err = crate::error::Error::Other(format!("Worktree setup failed: {e}"));
+                    return Err(emit_setup_failure(err, None, None).await);
+                }
+            }
+        } else {
+            None
+        };
+
+        let inner = self
+            .run_agent_inner(spec, initial_prompt, opts, agent_id, &worktree, cancel.clone())
+            .await;
+        let (wt_path, wt_branch) = teardown_worktree(&worktree).await;
+
+        let completed_at = chrono::Utc::now();
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let RunOutcome {
+            handle,
+            prompt_result,
+            mut result,
+        } = match inner {
+            Ok(o) => o,
+            Err(e) => {
+                // configure_builder failed (e.g. inherit_history_from
+                // pointed at an unknown agent). No handle exists, so
+                // nothing to record beyond the Failed outcome — but the
+                // worktree was created and torn down above, so its
+                // teardown signal rides along on the failure event.
+                return Err(emit_setup_failure(e, wt_path, wt_branch).await);
+            }
+        };
+
+        // Always record the transcript — failed runs are usually the most
+        // diagnostically interesting. `messages()` returns `None` only if
+        // the actor is gone; for a panicked actor we'll have less context
+        // but still emit Completed.
+        let messages = handle.messages().await.unwrap_or_default();
+        let transcript_path = record_transcript(agent_id, &messages)
+            .await
+            .map(|p| p.display().to_string());
+
+        let outcome = outcome_from(&prompt_result, &cancel);
+        result.transcript_path = transcript_path;
+        result.worktree_path = wt_path.clone();
+        result.worktree_branch = wt_branch.clone();
+        result.duration_ms = duration_ms;
+
+        let usage = Usage {
+            input: result.input_tokens,
+            output: result.output_tokens,
+            ..Default::default()
+        };
+        let tool_use_count = result.tool_use_count;
+
+        send_event(
+            &self.parent_event_tx,
+            AgentEvent::SubagentCompleted {
+                agent_id: agent_id.to_string(),
+                description: opts.description.clone(),
+                outcome,
+                started_at,
+                completed_at,
+                duration_ms,
+                usage,
+                tool_use_count,
+                worktree_path: wt_path,
+                worktree_branch: wt_branch,
+            },
+        );
+
+        match prompt_result {
+            Ok(()) => Ok((result, handle)),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn run_agent_inner(
+        self: &Arc<Self>,
+        spec: &AgentSpec,
+        initial_prompt: &str,
+        opts: &SpawnOpts,
+        agent_id: &str,
+        worktree: &Option<WorktreeInfo>,
+        cancel: CancellationToken,
+    ) -> crate::error::Result<RunOutcome> {
+        let wt_cwd = worktree.as_ref().map(|w| w.path.display().to_string());
+        let builder = self
+            .configure_builder(spec, opts, agent_id, wt_cwd.as_deref())
+            .await?;
+        let handle = builder.spawn();
+
+        let event_task =
+            self.spawn_event_forwarder(handle.subscribe(), agent_id, &opts.description);
+        let cancel_bridge = spawn_cancel_bridge(handle.clone(), cancel.clone());
+
+        self.track_running(agent_id, handle.clone(), opts.description.clone())
+            .await;
+
+        let prompt_result = handle.prompt_and_wait(initial_prompt).await;
         cancel_bridge.abort();
         event_task.abort();
 
-        self.running_handles.lock().await.remove(agent_id);
-
-        prompt_result?;
-
+        // Compute partial metrics regardless of outcome — we want failed
+        // runs to surface tokens used, tool calls made, and any final
+        // text the model produced before the error.
         let messages = handle.messages().await.unwrap_or_default();
         let text = extract_final_text(&messages);
         let state = handle.state().await.unwrap_or_default();
-
-        let tool_use_count = messages
-            .iter()
-            .map(|m| match m {
-                Message::Assistant { content, .. } => content
-                    .iter()
-                    .filter(|c| matches!(c, Content::ToolCall { .. }))
-                    .count(),
-                _ => 0,
-            })
-            .sum::<usize>() as u32;
+        let tool_use_count = count_tool_uses_since(&messages, 0);
 
         let result = SubagentResult {
             agent_id: agent_id.to_string(),
@@ -889,301 +1042,124 @@ impl AgentManager {
             duration_ms: 0,
             worktree_path: None,
             worktree_branch: None,
-            // Filled in by `run_subagent` after `record_transcript`.
             transcript_path: None,
         };
-        Ok((result, handle))
-    }
-
-    async fn store(&self, id: String, handle: AgentHandle, description: String) {
-        let mut agents = self.agents.lock().await;
-        if agents.len() >= self.max_agents {
-            agents.pop_front();
-        }
-        let state = handle.state().await.unwrap_or_default();
-        let usage = state.total_usage.clone();
-        let message_count = state.messages.len();
-        agents.push_back((
-            id,
-            ManagedAgent {
-                handle,
-                description,
-                usage_at_pause: usage,
-                messages_at_pause: message_count,
-            },
-        ));
+        Ok(RunOutcome {
+            handle,
+            prompt_result,
+            result,
+        })
     }
 }
 
-fn build_tool_set(
-    agent_type: &AgentType,
-    all_tools: &[BoxedTool],
-    depth: u32,
-    agent_tool_factory: &Option<AgentToolFactory>,
-    handle: &AgentHandle,
-    effective_policy: Arc<dyn ApprovalPolicy>,
-) -> Vec<BoxedTool> {
-    let mut tools: Vec<BoxedTool> = match agent_type {
-        AgentType::Explore | AgentType::Plan => {
-            // Plan also gets `submit_plan` so it can round-trip a structured
-            // plan through the host UI for approval. Both Explore and Plan
-            // get `subagent_report` so they can self-label outcomes.
-            let plan_extras = ["submit_plan"];
-            let read_only = ["read", "glob", "grep", "list", "lsp"];
-            let report_extras = ["subagent_report"];
-            all_tools
+/// Carries everything needed to finalize a run after `prompt_and_wait`,
+/// regardless of whether the prompt succeeded. Letting the handle and
+/// metrics survive a prompt error is what makes failure-path transcripts
+/// possible.
+struct RunOutcome {
+    handle: AgentHandle,
+    prompt_result: crate::error::Result<()>,
+    result: SubagentResult,
+}
+
+// ---------- Free helpers ----------
+
+/// Cancel-bridge: forwards a parent cancellation to the subagent's handle.
+fn spawn_cancel_bridge(handle: AgentHandle, parent_cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        parent_cancel.cancelled().await;
+        handle.abort();
+    })
+}
+
+/// Tear down a worktree if present. Returns `(path, branch)` for the
+/// `SubagentCompleted` event — `None`/`None` when the tree was cleanly
+/// removed (no diff, no untracked); `Some`/`Some` when changes were left
+/// behind so the host can surface them.
+async fn teardown_worktree(worktree: &Option<WorktreeInfo>) -> (Option<String>, Option<String>) {
+    match worktree {
+        Some(wt) => match cleanup_worktree(wt).await {
+            Ok(true) => (None, None),
+            _ => (Some(wt.path.display().to_string()), Some(wt.branch.clone())),
+        },
+        None => (None, None),
+    }
+}
+
+/// Map a prompt result + cancellation state to a `SubagentOutcome`.
+fn outcome_from(prompt_result: &crate::error::Result<()>, cancel: &CancellationToken) -> SubagentOutcome {
+    match prompt_result {
+        Ok(()) if cancel.is_cancelled() => SubagentOutcome::Aborted {
+            reason: "cancelled by parent".to_string(),
+        },
+        Ok(()) => SubagentOutcome::Completed,
+        Err(e) if cancel.is_cancelled() => SubagentOutcome::Aborted {
+            reason: e.to_string(),
+        },
+        Err(e) => SubagentOutcome::Failed {
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// Tokens used since `before`, saturating to avoid wrap on bookkeeping
+/// glitches.
+fn usage_delta(before: &Usage, after: &Usage) -> (u64, u64) {
+    (
+        after.input.saturating_sub(before.input),
+        after.output.saturating_sub(before.output),
+    )
+}
+
+/// Count assistant tool calls in `messages[from..]`. `from` is clamped
+/// to the slice length so callers don't have to bounds-check.
+fn count_tool_uses_since(messages: &[Message], from: usize) -> u32 {
+    let start = from.min(messages.len());
+    messages[start..]
+        .iter()
+        .map(|m| match m {
+            Message::Assistant { content, .. } => content
                 .iter()
-                .filter(|t| {
-                    read_only.contains(&t.name())
-                        || report_extras.contains(&t.name())
-                        || (matches!(agent_type, AgentType::Plan)
-                            && plan_extras.contains(&t.name()))
-                })
-                .cloned()
-                .collect()
-        }
-        AgentType::GeneralPurpose => all_tools
-            .iter()
-            .filter(|t| t.name() != "agent")
-            .cloned()
-            .collect(),
-    };
-
-    if matches!(agent_type, AgentType::GeneralPurpose | AgentType::Plan)
-        && depth + 1 < MAX_AGENT_DEPTH
-    {
-        if let Some(factory) = agent_tool_factory {
-            tools.push(factory(
-                depth + 1,
-                handle.clone(),
-                agent_type.clone(),
-                effective_policy,
-            ));
-        }
-    }
-
-    tools
+                .filter(|c| matches!(c, Content::ToolCall { .. }))
+                .count(),
+            _ => 0,
+        })
+        .sum::<usize>() as u32
 }
 
-const AGENT_GENERAL_PROMPT: &str = include_str!("prompts/agent_general.md");
-const AGENT_EXPLORE_PROMPT: &str = include_str!("prompts/agent_explore.md");
-const AGENT_PLAN_PROMPT: &str = include_str!("prompts/agent_plan.md");
-const AGENT_EXECUTOR_PROMPT: &str = include_str!("prompts/agent_executor.md");
-
-fn agent_type_suffix(agent_type: &AgentType) -> &'static str {
-    match agent_type {
-        AgentType::GeneralPurpose => AGENT_GENERAL_PROMPT,
-        AgentType::Explore => AGENT_EXPLORE_PROMPT,
-        AgentType::Plan => AGENT_PLAN_PROMPT,
-    }
-}
-
+/// Return the text of the literal *last* assistant message. Empty string
+/// when the last assistant turn was tool-calls only or there is no
+/// assistant message at all. We deliberately don't fall back to earlier
+/// turns: returning stale text from before the actual work would mislead
+/// the parent into thinking it had the agent's final answer.
 fn extract_final_text(messages: &[Message]) -> String {
     messages
         .iter()
         .rev()
         .find_map(|m| match m {
-            Message::Assistant { content, .. } => {
-                let text: String = content
+            Message::Assistant { content, .. } => Some(
+                content
                     .iter()
                     .filter_map(|c| match c {
                         Content::Text { text } => Some(text.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
-                    .join("");
-                if text.is_empty() { None } else { Some(text) }
-            }
+                    .join(""),
+            ),
             _ => None,
         })
         .unwrap_or_default()
 }
 
+// ---------- Tests ----------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DequeueMode;
-    use crate::tool::Tool;
     use async_trait::async_trait;
     use tau_ai::{AssistantMetadata, Content, Message};
-
-    struct MockTool {
-        tool_name: &'static str,
-    }
-
-    #[async_trait]
-    impl Tool for MockTool {
-        fn name(&self) -> &str {
-            self.tool_name
-        }
-        fn description(&self) -> &str {
-            ""
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({})
-        }
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-            _ctx: crate::tool::ExecutionContext,
-        ) -> crate::tool::ToolResult {
-            crate::tool::ToolResult::text("")
-        }
-    }
-
-    fn mock_tools() -> Vec<BoxedTool> {
-        vec![
-            Arc::new(MockTool { tool_name: "bash" }),
-            Arc::new(MockTool { tool_name: "read" }),
-            Arc::new(MockTool { tool_name: "write" }),
-            Arc::new(MockTool { tool_name: "edit" }),
-            Arc::new(MockTool { tool_name: "glob" }),
-            Arc::new(MockTool { tool_name: "grep" }),
-            Arc::new(MockTool { tool_name: "list" }),
-            Arc::new(MockTool { tool_name: "lsp" }),
-            Arc::new(MockTool { tool_name: "agent" }),
-        ]
-    }
-
-    #[test]
-    fn test_parse_valid_types() {
-        assert!(matches!(
-            AgentType::parse("general-purpose"),
-            Some(AgentType::GeneralPurpose)
-        ));
-        assert!(matches!(
-            AgentType::parse("explore"),
-            Some(AgentType::Explore)
-        ));
-        assert!(matches!(AgentType::parse("plan"), Some(AgentType::Plan)));
-    }
-
-    #[test]
-    fn test_parse_case_insensitive() {
-        assert!(matches!(
-            AgentType::parse("Explore"),
-            Some(AgentType::Explore)
-        ));
-        assert!(matches!(AgentType::parse("Plan"), Some(AgentType::Plan)));
-        assert!(matches!(
-            AgentType::parse("EXPLORE"),
-            Some(AgentType::Explore)
-        ));
-        assert!(matches!(
-            AgentType::parse("General-Purpose"),
-            Some(AgentType::GeneralPurpose)
-        ));
-    }
-
-    #[test]
-    fn test_parse_invalid_type() {
-        assert!(AgentType::parse("unknown").is_none());
-        assert!(AgentType::parse("").is_none());
-    }
-
-    #[test]
-    fn test_display() {
-        assert_eq!(AgentType::GeneralPurpose.to_string(), "general-purpose");
-        assert_eq!(AgentType::Explore.to_string(), "explore");
-        assert_eq!(AgentType::Plan.to_string(), "plan");
-    }
-
-    #[test]
-    fn test_max_turns() {
-        assert_eq!(AgentType::GeneralPurpose.max_turns(), 200);
-        assert_eq!(AgentType::Explore.max_turns(), 200);
-        assert_eq!(AgentType::Plan.max_turns(), 200);
-    }
-
-    fn test_handle() -> AgentHandle {
-        let config = make_test_config();
-        let transport: Arc<dyn crate::transport::Transport> = Arc::new(DummyTransport);
-        let builder = crate::builder::AgentBuilder::new(config, transport);
-        builder.pre_handle()
-    }
-
-    fn default_policy() -> Arc<dyn ApprovalPolicy> {
-        Arc::new(crate::approval::DefaultApprovalPolicy)
-    }
-
-    #[test]
-    fn test_explore_gets_read_only_tools() {
-        let all = mock_tools();
-        let handle = test_handle();
-        let filtered = build_tool_set(
-            &AgentType::Explore,
-            &all,
-            0,
-            &None,
-            &handle,
-            default_policy(),
-        );
-        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"read"));
-        assert!(names.contains(&"glob"));
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"list"));
-        assert!(names.contains(&"lsp"));
-        assert!(!names.contains(&"bash"));
-        assert!(!names.contains(&"write"));
-        assert!(!names.contains(&"edit"));
-        assert!(!names.contains(&"agent"));
-    }
-
-    #[test]
-    fn test_general_purpose_gets_all_except_agent() {
-        let all = mock_tools();
-        let handle = test_handle();
-        let filtered = build_tool_set(
-            &AgentType::GeneralPurpose,
-            &all,
-            0,
-            &None,
-            &handle,
-            default_policy(),
-        );
-        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read"));
-        assert!(names.contains(&"write"));
-        assert!(!names.contains(&"agent"));
-    }
-
-    #[test]
-    fn test_general_purpose_gets_agent_tool_from_factory() {
-        let all = mock_tools();
-        let handle = test_handle();
-        let factory: AgentToolFactory =
-            Arc::new(|_depth, _handle, _parent, _policy| Arc::new(MockTool { tool_name: "agent" }));
-        let filtered = build_tool_set(
-            &AgentType::GeneralPurpose,
-            &all,
-            0,
-            &Some(factory),
-            &handle,
-            default_policy(),
-        );
-        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"agent"), "factory should add agent tool");
-    }
-
-    #[test]
-    fn test_depth_limit_excludes_agent_tool() {
-        let all = mock_tools();
-        let handle = test_handle();
-        let factory: AgentToolFactory =
-            Arc::new(|_depth, _handle, _parent, _policy| Arc::new(MockTool { tool_name: "agent" }));
-        let filtered = build_tool_set(
-            &AgentType::GeneralPurpose,
-            &all,
-            MAX_AGENT_DEPTH - 1,
-            &Some(factory),
-            &handle,
-            default_policy(),
-        );
-        let names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"agent"), "depth exceeded — no agent tool");
-    }
 
     #[test]
     fn test_extract_final_text() {
@@ -1208,11 +1184,82 @@ mod tests {
         assert_eq!(extract_final_text(&messages), "");
     }
 
+    /// Tool-only last assistant turn must NOT fall back to earlier text —
+    /// returning stale "I'll start by doing X" instead of "" would mislead
+    /// the parent into thinking the agent had a final answer.
     #[test]
-    fn test_suffixes_are_nonempty() {
-        assert!(!agent_type_suffix(&AgentType::GeneralPurpose).is_empty());
-        assert!(!agent_type_suffix(&AgentType::Explore).is_empty());
-        assert!(!agent_type_suffix(&AgentType::Plan).is_empty());
+    fn test_extract_final_text_tool_only_last_returns_empty() {
+        let messages = vec![
+            Message::Assistant {
+                content: vec![Content::text("plan: I'll grep then edit")],
+                metadata: AssistantMetadata::default(),
+            },
+            Message::user("ok"),
+            Message::Assistant {
+                content: vec![Content::ToolCall {
+                    id: "c1".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                metadata: AssistantMetadata::default(),
+            },
+        ];
+        assert_eq!(extract_final_text(&messages), "");
+    }
+
+    #[test]
+    fn test_outcome_from_completed() {
+        let cancel = CancellationToken::new();
+        let res: crate::error::Result<()> = Ok(());
+        assert!(matches!(outcome_from(&res, &cancel), SubagentOutcome::Completed));
+    }
+
+    #[test]
+    fn test_outcome_from_aborted_when_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ok: crate::error::Result<()> = Ok(());
+        assert!(matches!(
+            outcome_from(&ok, &cancel),
+            SubagentOutcome::Aborted { .. }
+        ));
+        let err: crate::error::Result<()> = Err(crate::error::Error::Other("boom".into()));
+        assert!(matches!(
+            outcome_from(&err, &cancel),
+            SubagentOutcome::Aborted { .. }
+        ));
+    }
+
+    #[test]
+    fn test_outcome_from_failed() {
+        let cancel = CancellationToken::new();
+        let err: crate::error::Result<()> = Err(crate::error::Error::Other("boom".into()));
+        assert!(matches!(
+            outcome_from(&err, &cancel),
+            SubagentOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_usage_delta_saturates() {
+        let before = Usage {
+            input: 10,
+            output: 5,
+            ..Default::default()
+        };
+        let after = Usage {
+            input: 25,
+            output: 4, // less than before — saturates to 0
+            ..Default::default()
+        };
+        assert_eq!(usage_delta(&before, &after), (15, 0));
+    }
+
+    #[test]
+    fn test_count_tool_uses_since_clamps() {
+        let messages = vec![Message::user("hi")];
+        // `from` past end of slice: returns 0, doesn't panic.
+        assert_eq!(count_tool_uses_since(&messages, 99), 0);
     }
 
     struct DummyTransport;
@@ -1262,7 +1309,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(16);
         let transport: Arc<dyn crate::transport::Transport> = Arc::new(DummyTransport);
         let config = make_test_config();
-        Arc::new(AgentManager::new(tx, vec![], config, transport, max_agents))
+        Arc::new(AgentManager::new(tx, config, transport, max_agents))
     }
 
     #[tokio::test]
@@ -1307,17 +1354,11 @@ mod tests {
     async fn test_event_forwarder_survives_lagged() {
         let manager = make_test_manager(20);
 
-        // Tiny child capacity so we can force Lagged: subscribe the
-        // forwarder, then overrun before it gets to poll.
         let (child_tx, _keep_alive) = tokio::sync::broadcast::channel::<AgentEvent>(2);
         let mut parent_rx = manager.parent_event_tx.subscribe();
 
-        // Subscribe the forwarder's receiver up front so the channel has
-        // an active subscriber for sends to land.
         let forwarder_rx = child_tx.subscribe();
 
-        // Pre-fill beyond capacity. The forwarder is not running yet — it
-        // will see Lagged on its first poll.
         for i in 0..5 {
             child_tx
                 .send(AgentEvent::ToolExecutionStart {
@@ -1331,8 +1372,6 @@ mod tests {
 
         let task = manager.spawn_event_forwarder(forwarder_rx, "agent-lag", "lag test");
 
-        // After Lagged is observed, send another event the forwarder must
-        // still deliver. Give it a moment to drain the buffer first.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         child_tx
             .send(AgentEvent::ToolExecutionStart {
@@ -1361,5 +1400,27 @@ mod tests {
             saw_post_lag_event,
             "forwarder should keep delivering events after Lagged"
         );
+    }
+
+    /// Registry invariant: spec exists iff id is in `agents` ∪ `running_handles`.
+    #[tokio::test]
+    async fn test_registry_invariant_after_lifecycle_ops() {
+        let manager = make_test_manager(20);
+
+        // insert_spec + track_running → both visible
+        let id = "test-1";
+        let spec = AgentSpec {
+            system_prompt: "x".into(),
+            tools: vec![],
+            max_turns: 1,
+            allows_worktree: false,
+            allowed_subagent_specs: None,
+        };
+        manager.insert_spec(id, Arc::new(spec)).await;
+        assert!(manager.spec_for(id).await.is_some());
+
+        // forget when not stored → spec removed
+        manager.forget(id).await;
+        assert!(manager.spec_for(id).await.is_none());
     }
 }
