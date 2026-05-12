@@ -133,8 +133,11 @@ enum DrainPhase {
 
 enum CompactionTrigger {
     /// Manual `Command::Compact` issued from idle. Replies on the
-    /// embedded oneshot when compaction finishes.
+    /// embedded oneshot when compaction finishes. `custom_instructions`,
+    /// when present, is appended to the summarization prompt as a
+    /// `## User instructions` section.
     Manual {
+        custom_instructions: Option<String>,
         reply: oneshot::Sender<PromptResult>,
     },
     /// Overflow recovery mid-prompt. After compaction succeeds, the
@@ -696,6 +699,13 @@ async fn step_compaction(
         CompactionTrigger::Manual { .. } => CompactionReason::Manual,
         CompactionTrigger::Overflow { .. } => CompactionReason::Overflow,
     };
+    let custom_instructions: Option<&str> = match &trigger {
+        CompactionTrigger::Manual {
+            custom_instructions,
+            ..
+        } => custom_instructions.as_deref(),
+        CompactionTrigger::Overflow { .. } => None,
+    };
     send_event(
         &state.frame.event_tx,
         AgentEvent::CompactionStart { reason },
@@ -707,6 +717,7 @@ async fn step_compaction(
         &state.frame.config,
         &state.frame.transport,
         state.conv.conversation.previous_summary.as_deref(),
+        custom_instructions,
         cancel,
     )
     .await;
@@ -730,7 +741,7 @@ async fn step_compaction(
             );
 
             match trigger {
-                CompactionTrigger::Manual { reply } => {
+                CompactionTrigger::Manual { reply, .. } => {
                     let _ = reply.send(PromptResult { result: Ok(()) });
                     Phase::Idle
                 }
@@ -754,7 +765,7 @@ async fn step_compaction(
                 },
             );
             match trigger {
-                CompactionTrigger::Manual { reply } => {
+                CompactionTrigger::Manual { reply, .. } => {
                     let _ = reply.send(PromptResult {
                         result: Err(crate::types::error::Error::Compaction(e)),
                     });
@@ -785,6 +796,7 @@ async fn run_proactive_compaction(state: &mut State, cancel: &CancellationToken)
         &state.frame.config,
         &state.frame.transport,
         state.conv.conversation.previous_summary.as_deref(),
+        None,
         cancel,
     )
     .await;
@@ -848,12 +860,19 @@ fn handle_idle_command(
                 },
             })
         }
-        Command::Compact { reason: _, reply } => {
+        Command::Compact {
+            reason: _,
+            custom_instructions,
+            reply,
+        } => {
             // The `reason` field on Command::Compact is informational
             // for the host; the actor emits `CompactionStart` with
             // `Manual` since this entry point is manual by
             // construction.
-            Phase::Compaction(CompactionTrigger::Manual { reply })
+            Phase::Compaction(CompactionTrigger::Manual {
+                custom_instructions,
+                reply,
+            })
         }
         other => {
             handle_busy_command(state, other);

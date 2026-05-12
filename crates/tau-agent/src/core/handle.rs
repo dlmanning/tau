@@ -144,12 +144,14 @@ impl AgentHandle {
     pub async fn compact(
         &self,
         reason: CompactionReason,
+        custom_instructions: Option<String>,
     ) -> Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .normal_tx
             .send(Command::Compact {
                 reason,
+                custom_instructions,
                 reply: reply_tx,
             })
             .await

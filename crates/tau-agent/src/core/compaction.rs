@@ -441,12 +441,19 @@ what the assistant was doing and what tool calls were made.
 
 // ─── Entry point ─────────────────────────────────────────────────────
 
+/// Run compaction on the given messages.
+///
+/// `custom_instructions`, when present and non-empty after trimming, is
+/// appended as a `## User instructions` section to the main summarization
+/// prompt (both the initial and the update variants). The split-turn
+/// sub-summary prompt is intentionally left untouched.
 pub async fn compact(
     messages: &[Message],
     config: &CompactionConfig,
     agent_config: &AgentConfig,
     transport: &Arc<dyn Transport>,
     previous_summary: Option<&str>,
+    custom_instructions: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<CompactionResult, String> {
     let tokens_before = estimate_total_tokens(messages);
@@ -477,7 +484,7 @@ pub async fn compact(
         modified_files.join(", ")
     };
 
-    let prompt = if let Some(prev) = previous_summary {
+    let mut prompt = if let Some(prev) = previous_summary {
         UPDATE_SUMMARIZATION_PROMPT
             .replace("{previous_summary}", prev)
             .replace("{conversation}", &conversation_text)
@@ -489,6 +496,14 @@ pub async fn compact(
             .replace("{read_files}", &read_files_str)
             .replace("{modified_files}", &modified_files_str)
     };
+
+    if let Some(instructions) = custom_instructions {
+        let trimmed = instructions.trim();
+        if !trimmed.is_empty() {
+            prompt.push_str("\n\n## User instructions\n\n");
+            prompt.push_str(trimmed);
+        }
+    }
 
     let mut full_summary = String::new();
 

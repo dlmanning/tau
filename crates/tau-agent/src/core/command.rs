@@ -50,6 +50,7 @@ pub enum Command {
     // Manual compaction
     Compact {
         reason: CompactionReason,
+        custom_instructions: Option<String>,
         reply: oneshot::Sender<PromptResult>,
     },
 }
