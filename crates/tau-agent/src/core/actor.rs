@@ -32,6 +32,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::approval::{ApprovalDecision, ToolRisk};
 use crate::core::command::{Command, PromptResult};
+use crate::types::info::ToolInfo;
+use serde_json::Value as JsonValue;
 use crate::core::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
 use crate::core::state::{Frame, State, ToolCall};
 use crate::core::stream::{StreamOutcome, StreamReducer};
@@ -872,6 +874,37 @@ fn handle_busy_command(state: &mut State, cmd: Command) {
         }
         Command::GetState(reply) => {
             let _ = reply.send(state.conv.conversation.clone());
+        }
+        Command::ListTools(reply) => {
+            // `currently_allowed` = the policy would auto-dispatch a
+            // no-argument call. `Gate` and `Reject(_)` both surface as
+            // not auto-allowed.
+            let infos: Vec<ToolInfo> = state
+                .frame
+                .tools
+                .iter()
+                .map(|tool| {
+                    let risk = tool.risk(&JsonValue::Null);
+                    let default_allowed =
+                        matches!(risk, ToolRisk::Safe | ToolRisk::Local);
+                    let currently_allowed = matches!(
+                        state.frame.approval_policy.classify(
+                            tool.name(),
+                            &JsonValue::Null,
+                            risk,
+                        ),
+                        ApprovalDecision::Auto
+                    );
+                    ToolInfo {
+                        name: tool.name().to_string(),
+                        description: tool.description().to_string(),
+                        category: tool.category(),
+                        default_allowed,
+                        currently_allowed,
+                    }
+                })
+                .collect();
+            let _ = reply.send(infos);
         }
         Command::SetModel(m) => state.frame.config.model = m,
         Command::SetReasoning(l) => state.frame.config.reasoning = l,

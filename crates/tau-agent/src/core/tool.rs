@@ -269,6 +269,25 @@ impl ExecutionContext {
     }
 }
 
+/// Coarse-grained categorization of what a tool does, for grouping in
+/// UIs and for `list_tools()` snapshots. Distinct from
+/// [`ToolRisk`](crate::core::approval::ToolRisk), which is the
+/// approval-policy input: a `Read` category tool is almost always
+/// `Safe` risk, but the two axes are independent in principle and
+/// hosts may want to display either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCategory {
+    /// Reads filesystem / project state.
+    Read,
+    /// Mutates files in the workspace.
+    Edit,
+    /// Executes processes or external commands.
+    Execute,
+    /// Anything else (UI prompts, plan submission, web fetches, …).
+    Other,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -291,6 +310,13 @@ pub trait Tool: Send + Sync {
 
     fn risk(&self, _arguments: &Value) -> ToolRisk {
         ToolRisk::Local
+    }
+
+    /// Coarse category for UI grouping and snapshot queries. Defaults
+    /// to [`ToolCategory::Other`] so existing `Tool` implementations
+    /// stay source-compatible.
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Other
     }
 
     async fn execute(&self, arguments: Value, ctx: ExecutionContext) -> ToolResult;

@@ -4,7 +4,7 @@ use crate::cached_schema;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolCategory, ToolResult};
 use tokio::fs;
 
 const MAX_LINES: usize = 2000;
@@ -52,6 +52,10 @@ impl Tool for ReadTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(ReadArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {

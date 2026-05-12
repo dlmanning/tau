@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolCategory, ToolResult};
 
 /// Maximum file size to search (10 MB) — skip larger files to avoid OOM
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -71,6 +71,10 @@ impl Tool for GrepTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(GrepArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {

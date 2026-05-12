@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tau_agent::AgentEvent;
-use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolCategory, ToolResult};
 use tokio::fs;
 
 /// Normalize a path by resolving `.` and `..` components without filesystem access.
@@ -69,6 +69,10 @@ impl Tool for WriteTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(WriteArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Edit
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {

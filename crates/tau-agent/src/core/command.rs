@@ -20,6 +20,7 @@ use crate::core::compaction::CompactionConfig;
 use crate::core::config::AgentConfig;
 use crate::types::conversation::Conversation;
 use crate::types::events::CompactionReason;
+use crate::types::info::ToolInfo;
 
 /// Result of a `Prompt` or `Compact` operation, returned via the
 /// embedded oneshot.
@@ -46,6 +47,7 @@ pub enum Command {
     GetConfig(oneshot::Sender<AgentConfig>),
     GetMessages(oneshot::Sender<Vec<Message>>),
     GetState(oneshot::Sender<Conversation>),
+    ListTools(oneshot::Sender<Vec<ToolInfo>>),
 
     // Manual compaction
     Compact {

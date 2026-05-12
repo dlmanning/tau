@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolCategory, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Deserialize, JsonSchema)]
@@ -55,6 +55,10 @@ impl Tool for ListTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(ListArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
