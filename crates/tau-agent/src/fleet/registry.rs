@@ -197,6 +197,16 @@ impl Registry {
     /// Drop a running agent without idling it (error path, interactive
     /// remove_interactive, etc.). Drops the spec only if the agent
     /// isn't also in idle (which would only be the case mid-resume).
+    ///
+    /// **Snapshot behavior**: agents discarded via `drop_running` are
+    /// removed from every tracked bucket and therefore do **not**
+    /// appear in subsequent [`Self::snapshot`] results. This means
+    /// error-terminated runs leave no trace in the fleet snapshot.
+    /// A future refactor could add a dedicated "terminated" bucket so
+    /// failed agents remain visible (with `completed_at` set) for
+    /// post-mortem UI; today, hosts that need that history must rely
+    /// on the `SubagentCompleted { outcome: Failed | Aborted, .. }`
+    /// event stream instead.
     pub fn drop_running(&self, agent_id: &str) {
         let mut inner = self.inner.lock();
         inner.running.remove(agent_id);

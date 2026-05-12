@@ -21,9 +21,26 @@ pub struct AgentSnapshot {
     pub description: String,
     pub status: AgentStatus,
     pub usage: Usage,
+    /// Cumulative count of `ToolExecutionEnd` events observed for this
+    /// agent across its entire lifetime. Note this is computed via an
+    /// independent path from [`crate::fleet::SubagentResult::tool_use_count`]:
+    /// the snapshot counter is incremented as events flow through the
+    /// fleet bus, while `SubagentResult.tool_use_count` is derived by
+    /// scanning the final message log for `Content::ToolCall` blocks.
+    /// They should usually agree, but can drift if e.g. a tool errors
+    /// before emitting `ToolExecutionEnd`.
     pub tool_use_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
+    /// Wall-clock timestamp of the most recent `finish_to_idle`.
+    /// Refreshes on every resume → idle cycle, so always reflects the
+    /// last completed turn rather than the agent's original creation.
+    ///
+    /// **Not set for error-terminated agents**: agents removed from
+    /// the registry via [`crate::fleet::registry::Registry::drop_running`]
+    /// (failed spawns, `remove_interactive`, etc.) are dropped entirely
+    /// and do not appear in snapshots. Hosts that need to observe
+    /// failed runs should consume `SubagentCompleted` events directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
 }
