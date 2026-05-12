@@ -268,11 +268,12 @@ impl Session {
             // continuously.
             tokio::select! {
                 ev = events.recv() => match ev {
-                    Ok(AgentEvent::AgentEnd { total_usage: u, .. }) => {
+                    Ok(AgentEvent::AgentEnd { total_usage: u, interrupted, .. }) => {
                         total_usage = u.clone();
                         frontend.render_event(AgentEvent::AgentEnd {
                             total_usage: u,
                             total_turns: 0,
+                            interrupted,
                         }).await;
                         break;
                     }

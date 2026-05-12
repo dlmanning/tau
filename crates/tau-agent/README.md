@@ -155,7 +155,7 @@ while let Ok(event) = events.recv().await {
         AgentEvent::ToolExecutionStart { tool_name, activity, .. } => {
             println!("  ↳ {tool_name}: {activity}");
         }
-        AgentEvent::AgentEnd { total_turns, total_usage } => {
+        AgentEvent::AgentEnd { total_turns, total_usage, .. } => {
             println!("[done in {total_turns} turns, {} in / {} out tokens]",
                      total_usage.input, total_usage.output);
             break;

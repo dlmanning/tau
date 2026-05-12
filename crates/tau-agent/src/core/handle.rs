@@ -202,12 +202,26 @@ impl AgentHandle {
         self.shared.shutdown_reason.lock().clone()
     }
 
-    // ─── Abort ───────────────────────────────────────────────────────
+    // ─── Abort / interrupt ───────────────────────────────────────────
 
     /// Cancel the current operation. The actor swaps the inner token
     /// at each prompt start so this always targets the active prompt.
     pub fn abort(&self) {
         self.shared.cancel.lock().cancel();
+    }
+
+    /// Request a graceful stop. Unlike [`abort`], the in-flight tool
+    /// and turn are allowed to finish; the actor checks this flag at
+    /// the top of each new turn and, if set, emits
+    /// `AgentEvent::AgentEnd { interrupted: true, .. }` and returns to
+    /// `Idle` rather than starting another turn. The flag is reset on
+    /// each new prompt.
+    ///
+    /// [`abort`]: AgentHandle::abort
+    pub fn interrupt(&self) {
+        self.shared
+            .interrupt_requested
+            .store(true, Ordering::Release);
     }
 
     pub fn cancel_token(&self) -> Arc<Mutex<CancellationToken>> {

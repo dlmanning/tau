@@ -111,6 +111,11 @@ pub enum AgentEvent {
     AgentEnd {
         total_turns: u32,
         total_usage: Usage,
+        /// `true` when the prompt ended because `handle.interrupt()`
+        /// was observed at the top of a turn (graceful stop). `false`
+        /// for normal completion, errors, or `handle.abort()`.
+        #[serde(default)]
+        interrupted: bool,
     },
 
     CompactionStart {

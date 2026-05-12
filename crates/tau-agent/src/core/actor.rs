@@ -205,11 +205,19 @@ fn emit_end_and_idle(
 ) -> Phase {
     state.shared.is_running.store(false, Ordering::Release);
     state.conv.conversation.is_streaming = false;
+    // `interrupted` is true when a graceful interrupt was observed at
+    // the top of a turn. We swap the flag atomically so the reset is
+    // observable even if a stale `interrupt()` raced the prompt end.
+    let interrupted = state
+        .shared
+        .interrupt_requested
+        .swap(false, Ordering::AcqRel);
     send_event(
         &state.frame.event_tx,
         AgentEvent::AgentEnd {
             total_turns: *turn_number,
             total_usage: state.conv.conversation.total_usage.clone(),
+            interrupted,
         },
     );
     if let Some(reply) = prompt_reply.take() {
@@ -283,6 +291,13 @@ async fn step_prepare(
     turn_number: &mut u32,
 ) -> Phase {
     if cancel.is_cancelled() {
+        return Phase::Done(Ok(()));
+    }
+    // Graceful interrupt: check between turns, after any prior tool
+    // batch has completed and before requesting the next LLM turn.
+    // Mid-stream and mid-tool work are NOT interrupted here — that is
+    // the responsibility of `abort()`.
+    if state.shared.interrupt_requested.load(Ordering::Acquire) {
         return Phase::Done(Ok(()));
     }
     if let Some(max) = state.frame.config.max_turns {
@@ -837,6 +852,12 @@ fn handle_idle_command(
         Command::Prompt { content, reply } => {
             *prompt_reply = Some(reply);
             state.shared.is_running.store(true, Ordering::Release);
+            // Clear any stale graceful-interrupt request so it does
+            // not latch across prompts.
+            state
+                .shared
+                .interrupt_requested
+                .store(false, Ordering::Release);
             // Swap in a fresh cancellation token. Holding the lock
             // across the swap prevents `handle.abort()` from cancelling
             // the wrong token.
@@ -1234,8 +1255,8 @@ async fn run_single_tool(
     );
 
     let result = if let Some(tool) = tool {
-        let validation_error = validator_and_schema
-            .and_then(|(v, schema)| validate_with(&args, &v, &schema));
+        let validation_error =
+            validator_and_schema.and_then(|(v, schema)| validate_with(&args, &v, &schema));
         if let Some(err) = validation_error {
             ToolResult::error(err)
         } else {

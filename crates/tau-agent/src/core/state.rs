@@ -121,6 +121,12 @@ pub struct Shared {
     /// The actor swaps the inner token at each prompt start under this
     /// mutex; `handle.abort()` cancels whichever token is current.
     pub cancel: Arc<Mutex<CancellationToken>>,
+    /// Set by `handle.interrupt()` to request a graceful stop. Checked
+    /// at the top of each new turn, after the current tool batch has
+    /// completed and before the next LLM call. Distinct from `cancel`
+    /// (which hard-cancels in-flight work). Reset to `false` at the
+    /// start of every new prompt.
+    pub interrupt_requested: Arc<AtomicBool>,
     /// Stamped by the manager when the agent is registered (`spawn` /
     /// `adopt`). Surfaced to tools via
     /// [`ExecutionContext::agent_id`](crate::core::tool::ExecutionContext::agent_id).
@@ -139,6 +145,7 @@ impl Default for Shared {
             is_running: Arc::new(AtomicBool::new(false)),
             pending_follow_ups: Arc::new(AtomicU32::new(0)),
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
+            interrupt_requested: Arc::new(AtomicBool::new(false)),
             agent_id: Arc::new(OnceLock::new()),
             shutdown_reason: Arc::new(Mutex::new(None)),
             shutdown_signaled: Arc::new(tokio::sync::Notify::new()),
