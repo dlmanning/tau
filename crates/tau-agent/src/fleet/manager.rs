@@ -26,6 +26,7 @@ use crate::fleet::lifecycle::{self, LifecycleCtx};
 pub use crate::fleet::registry::Status as AgentStatus;
 use crate::fleet::registry::{Located, Registry};
 use crate::fleet::result::SubagentResult;
+use crate::fleet::snapshot::FleetSnapshot;
 use crate::types::error::Result;
 use crate::types::events::AgentEvent;
 
@@ -248,6 +249,20 @@ impl AgentManager {
     /// up the parent for background-spawn follow-up tracking.
     pub fn handle_for(&self, agent_id: &str) -> Option<AgentHandle> {
         self.registry.handle_for(agent_id)
+    }
+
+    // ─── Snapshot ────────────────────────────────────────────────────
+
+    /// Synchronous point-in-time view of every tracked agent. Locks
+    /// the registry once; safe to call from any thread. Per-agent
+    /// `usage` / `tool_use_count` are kept current by the fleet bus on
+    /// child `TurnEnd` / `ToolExecutionEnd` events, so the snapshot
+    /// reflects state through the most recently *forwarded* event —
+    /// not necessarily the agent's literal latest in-flight tick.
+    pub fn snapshot(&self) -> FleetSnapshot {
+        FleetSnapshot {
+            agents: self.registry.snapshot(),
+        }
     }
 
     // ─── Steering shortcut for "find by id, then steer" ──────────────

@@ -17,11 +17,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tau_ai::Usage;
 
 use crate::core::handle::AgentHandle;
 use crate::fleet::manager::AgentSpec;
+use crate::fleet::snapshot::AgentSnapshot;
 
 /// Per-agent metadata stored alongside its handle in idle / running /
 /// adopted state. Cloneable so the registry can keep a snapshot in
@@ -37,6 +40,22 @@ pub struct AgentEntry {
     /// Conversation message count at the last storage time. Used to
     /// compute per-resume tool-call count.
     pub messages_at_pause: usize,
+    /// Live cumulative usage, accumulated from `TurnEnd` events seen by
+    /// the fleet bus. Distinct from `usage_at_pause` (which only
+    /// updates at suspend boundaries) — `usage` is current as of the
+    /// last forwarded `TurnEnd`.
+    pub usage: Usage,
+    /// Cumulative count of `ToolExecutionEnd` events observed for this
+    /// agent. Counts every completed tool call, including errored ones,
+    /// because the count reflects "tools attempted" rather than "tools
+    /// succeeded".
+    pub tool_use_count: u32,
+    /// Wall-clock timestamp of first transition into a tracked state
+    /// (commit_running or adopt). Once set, never overwritten.
+    pub started_at: Option<DateTime<Utc>>,
+    /// Wall-clock timestamp of the most recent `finish_to_idle`.
+    /// Refreshes on every resume → idle cycle.
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 impl AgentEntry {
@@ -46,11 +65,16 @@ impl AgentEntry {
             description,
             usage_at_pause: Usage::default(),
             messages_at_pause: 0,
+            usage: Usage::default(),
+            tool_use_count: 0,
+            started_at: None,
+            completed_at: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     Running,
     Idle,
@@ -117,8 +141,14 @@ impl Registry {
         self.inner.lock().specs.insert(agent_id.to_string(), spec);
     }
 
-    /// Promote a reserved agent into the running set.
-    pub fn commit_running(&self, agent_id: &str, entry: AgentEntry) {
+    /// Promote a reserved agent into the running set. Stamps
+    /// `started_at` on first insertion (preserved across subsequent
+    /// idle→running cycles, which go through `take_idle_into_running`
+    /// instead and therefore don't reach this method).
+    pub fn commit_running(&self, agent_id: &str, mut entry: AgentEntry) {
+        if entry.started_at.is_none() {
+            entry.started_at = Some(Utc::now());
+        }
         self.inner
             .lock()
             .running
@@ -138,9 +168,24 @@ impl Registry {
     /// responsible for populating `entry.usage_at_pause` and
     /// `entry.messages_at_pause` before calling — the registry can't
     /// query the handle (async; we're holding the inner lock).
-    pub fn finish_to_idle(&self, agent_id: &str, entry: AgentEntry) {
+    ///
+    /// Bus-bookkeeping fields (`usage`, `tool_use_count`, `started_at`)
+    /// are carried over from the running entry if it exists, since the
+    /// caller typically passes a freshly-built `AgentEntry` that
+    /// doesn't reflect the bus's running updates. `completed_at` is
+    /// stamped here.
+    pub fn finish_to_idle(&self, agent_id: &str, mut entry: AgentEntry) {
         let mut inner = self.inner.lock();
-        inner.running.remove(agent_id);
+        if let Some(running) = inner.running.remove(agent_id) {
+            // Preserve fields the bus mutated during the run.
+            entry.usage = running.usage;
+            entry.tool_use_count = running.tool_use_count;
+            entry.started_at = running.started_at.or(entry.started_at);
+        }
+        if entry.started_at.is_none() {
+            entry.started_at = Some(Utc::now());
+        }
+        entry.completed_at = Some(Utc::now());
         if inner.idle.len() >= inner.max_agents {
             if let Some((evicted_id, _)) = inner.idle.pop_front() {
                 inner.specs.remove(&evicted_id);
@@ -186,7 +231,10 @@ impl Registry {
     /// recorded under `agent_id`; the entry goes into the `adopted`
     /// bucket. Preserves the invariant: spec exists ⟺ id ∈ idle ∪
     /// running ∪ adopted.
-    pub fn adopt(&self, agent_id: &str, entry: AgentEntry, spec: Arc<AgentSpec>) {
+    pub fn adopt(&self, agent_id: &str, mut entry: AgentEntry, spec: Arc<AgentSpec>) {
+        if entry.started_at.is_none() {
+            entry.started_at = Some(Utc::now());
+        }
         let mut inner = self.inner.lock();
         inner.adopted.insert(agent_id.to_string(), entry);
         inner.specs.insert(agent_id.to_string(), spec);
@@ -227,6 +275,65 @@ impl Registry {
             .lock()
             .idle
             .push_back((agent_id.to_string(), entry));
+    }
+
+    // ─── Bus bookkeeping ────────────────────────────────────────────
+
+    /// Accumulate a turn's reported `Usage` onto whichever bucket
+    /// currently holds the agent. `TurnEnd.usage` is per-turn, so we
+    /// add it onto the entry's running total.
+    pub fn record_turn_end(&self, agent_id: &str, usage: &Usage) {
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner.running.get_mut(agent_id) {
+            add_usage(&mut entry.usage, usage);
+            return;
+        }
+        if let Some((_, entry)) = inner.idle.iter_mut().find(|(k, _)| k == agent_id) {
+            add_usage(&mut entry.usage, usage);
+            return;
+        }
+        if let Some(entry) = inner.adopted.get_mut(agent_id) {
+            add_usage(&mut entry.usage, usage);
+        }
+    }
+
+    /// Increment the tool-call counter on whichever bucket currently
+    /// holds the agent. Called from the bus on `ToolExecutionEnd`.
+    pub fn record_tool_use(&self, agent_id: &str) {
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner.running.get_mut(agent_id) {
+            entry.tool_use_count = entry.tool_use_count.saturating_add(1);
+            return;
+        }
+        if let Some((_, entry)) = inner.idle.iter_mut().find(|(k, _)| k == agent_id) {
+            entry.tool_use_count = entry.tool_use_count.saturating_add(1);
+            return;
+        }
+        if let Some(entry) = inner.adopted.get_mut(agent_id) {
+            entry.tool_use_count = entry.tool_use_count.saturating_add(1);
+        }
+    }
+
+    // ─── Snapshot ────────────────────────────────────────────────────
+
+    /// Collect every tracked agent into a `Vec<AgentSnapshot>`. Walks
+    /// running, idle, and adopted buckets under a single lock — every
+    /// snapshot represents a consistent point in time.
+    pub fn snapshot(&self) -> Vec<AgentSnapshot> {
+        let inner = self.inner.lock();
+        let mut out = Vec::with_capacity(
+            inner.running.len() + inner.idle.len() + inner.adopted.len(),
+        );
+        for (id, entry) in &inner.running {
+            out.push(snapshot_of(id, entry, Status::Running));
+        }
+        for (id, entry) in &inner.idle {
+            out.push(snapshot_of(id, entry, Status::Idle));
+        }
+        for (id, entry) in &inner.adopted {
+            out.push(snapshot_of(id, entry, Status::Adopted));
+        }
+        out
     }
 
     // ─── Lookup ──────────────────────────────────────────────────────
@@ -312,6 +419,31 @@ impl Registry {
             return Some(e.handle.clone());
         }
         inner.adopted.get(agent_id).map(|e| e.handle.clone())
+    }
+}
+
+fn snapshot_of(id: &str, entry: &AgentEntry, status: Status) -> AgentSnapshot {
+    AgentSnapshot {
+        agent_id: id.to_string(),
+        description: entry.description.clone(),
+        status,
+        usage: entry.usage.clone(),
+        tool_use_count: entry.tool_use_count,
+        started_at: entry.started_at,
+        completed_at: entry.completed_at,
+    }
+}
+
+fn add_usage(dst: &mut Usage, src: &Usage) {
+    dst.input = dst.input.saturating_add(src.input);
+    dst.output = dst.output.saturating_add(src.output);
+    dst.cache_read = dst.cache_read.saturating_add(src.cache_read);
+    dst.cache_write = dst.cache_write.saturating_add(src.cache_write);
+    dst.thinking = dst.thinking.saturating_add(src.thinking);
+    dst.cache_creation_1h = dst.cache_creation_1h.saturating_add(src.cache_creation_1h);
+    dst.cache_creation_5m = dst.cache_creation_5m.saturating_add(src.cache_creation_5m);
+    if dst.service_tier.is_none() {
+        dst.service_tier = src.service_tier.clone();
     }
 }
 

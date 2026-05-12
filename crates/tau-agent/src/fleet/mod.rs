@@ -17,5 +17,6 @@ pub mod lifecycle;
 pub mod manager;
 pub mod registry;
 pub mod result;
+pub mod snapshot;
 pub mod transcript;
 pub mod worktree;

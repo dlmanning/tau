@@ -46,3 +46,4 @@ pub use crate::types::events::{
 pub use crate::fleet::manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts};
 pub use crate::fleet::registry::Located;
 pub use crate::fleet::result::SubagentResult;
+pub use crate::fleet::snapshot::{AgentSnapshot, FleetSnapshot};

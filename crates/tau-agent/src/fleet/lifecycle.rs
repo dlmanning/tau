@@ -231,6 +231,7 @@ pub async fn send(
         ctx.parent_event_tx.clone(),
         agent_id.into(),
         description.clone(),
+        Some(Arc::clone(&ctx.registry)),
     );
     let cancel_bridge = spawn_cancel_bridge(entry.handle.clone(), parent_cancel.clone());
 
@@ -638,6 +639,7 @@ async fn run_agent_inner(
         ctx.parent_event_tx.clone(),
         agent_id.into(),
         opts.description.clone(),
+        Some(Arc::clone(&ctx.registry)),
     );
     let cancel_bridge = spawn_cancel_bridge(handle.clone(), cancel.clone());
 
