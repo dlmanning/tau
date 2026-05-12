@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use glob::glob;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
 struct GlobArgs {

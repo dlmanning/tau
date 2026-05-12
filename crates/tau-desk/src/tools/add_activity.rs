@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 use crate::activity::{ActivityEntry, ActivityKind, SessionSeed};
 use crate::event::DeskEvent;
@@ -93,7 +93,9 @@ impl Tool for AddActivityTool {
             Ok(seq) => {
                 let mut emitted = entry.clone();
                 emitted.seq = seq;
-                let _ = self.events.send(DeskEvent::ActivityAppended { entry: emitted });
+                let _ = self
+                    .events
+                    .send(DeskEvent::ActivityAppended { entry: emitted });
                 ToolResult::text(format!("recorded activity {}", entry.id))
             }
             Err(e) => ToolResult::error(format!("storage error: {e}")),

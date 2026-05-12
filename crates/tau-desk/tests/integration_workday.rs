@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tau_agent::test_utils::{MockTransport, make_test_config};
-use tau_agent::tool::{BoxedTool, ExecutionContext, Tool, ToolResult};
-use tau_agent::{ApprovalPolicy, DefaultApprovalPolicy};
+use tau_agent::{ApprovalPolicy, DefaultPolicy};
+use tau_agent::{BoxedTool, ExecutionContext, Tool, ToolResult};
 use tau_desk::{
     CardBody, CardData, CardEvent, CardEventKind, CardPile, DeskAgent, DeskConfig, DeskStorage,
     DraftStatus, HandlerContext, MechanicalHandler, MemDeskStorage, Provenance, Source,
@@ -164,7 +164,7 @@ async fn workday_vignette() {
     let tmp = tempfile::tempdir().unwrap();
     let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
     let sessions = Arc::new(SessionManager::new(session_storage));
-    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
     let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
     let mut cfg = DeskConfig::new(
@@ -248,7 +248,10 @@ async fn workday_vignette() {
         .await
         .unwrap();
 
-    let drafts = storage.list_drafts(Some(DraftStatus::Pending)).await.unwrap();
+    let drafts = storage
+        .list_drafts(Some(DraftStatus::Pending))
+        .await
+        .unwrap();
     assert_eq!(drafts.len(), 1, "chat should have queued one draft");
     let draft = &drafts[0];
     assert_eq!(draft.tool_name, "gh_post_pr_comment");

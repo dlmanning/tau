@@ -33,5 +33,14 @@ reqwest = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 
+# LSP feature: optional language-server-based code intelligence tool.
+lsp-types = { version = "0.97", optional = true }
+anyhow = { workspace = true, optional = true }
+urlencoding = { version = "2.1", optional = true }
+
+[features]
+default = []
+lsp = ["dep:lsp-types", "dep:anyhow", "dep:urlencoding"]
+
 [dev-dependencies]
 tau-agent = { workspace = true, features = ["test-utils"] }

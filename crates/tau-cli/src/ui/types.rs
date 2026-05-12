@@ -14,6 +14,27 @@ pub(super) struct PendingInteraction {
     pub selector: SelectorState,
 }
 
+/// Two-stage plan-review state: first the user sees the plan and picks
+/// an action (Approve / Execute now / Reject); on Reject we flip to
+/// `EnteringReason` and route the next input-box submit to the
+/// rejection reason.
+#[derive(Debug)]
+pub(super) enum PlanModalMode {
+    Reviewing,
+    EnteringReason,
+}
+
+/// Pending plan submission awaiting user review. Mirrors
+/// [`PendingInteraction`]; rendered as a full-screen overlay by
+/// `render_plan_modal`.
+pub(super) struct PendingPlan {
+    pub plan: tau_tools::Plan,
+    pub response_tx: tokio::sync::oneshot::Sender<tau_agent::InteractionResponse>,
+    pub mode: PlanModalMode,
+    /// Vertical scroll position (line offset) in the plan body.
+    pub scroll: u16,
+}
+
 /// Messages sent from UI to agent handler
 #[derive(Debug)]
 pub enum UiMessage {

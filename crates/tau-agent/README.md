@@ -1,140 +1,395 @@
 # tau-agent
 
-Actor-based agent runtime with tool execution, context compaction, and subagent management.
+Actor-based agent runtime with tool execution, context compaction, and
+subagent management. Clean-room rewrite of `tau-agent`.
+
+## What this is
+
+A library for building agents that talk to LLM providers (Anthropic,
+OpenAI, Google, Ollama), execute tools, manage long conversations, and
+spawn subagents for parallel work. The runtime is provider-agnostic;
+all I/O goes through a `Transport` trait, and tools are user-defined.
+
+The agent runs on a background tokio task; consumers interact with it
+through a `Clone + Send + Sync` handle. Events stream out on a
+broadcast channel.
 
 ## Architecture
 
-The crate is split along an I/O boundary:
+Strict three-tier layering, top to bottom:
 
-```
-AgentHandle ──channels──▶ actor.rs (async I/O loop)
-                              │
-                    ┌─────────┼─────────┐
-                    ▼         ▼         ▼
-              logic.rs   transport.rs  compaction.rs
-              (sync)      (async)       (async)
-                    │
-                    ▼
-                state.rs (data)
+```text
+fleet/    — multi-agent management (registry, lifecycle, bus)
+  ↓
+core/     — single-agent actor: handle, state, transitions, I/O
+  ↓
+types/    — leaf data (events, errors, conversation)
 ```
 
-- **`actor.rs`** — Stepped state machine (`StepPhase`) that owns `AgentState` exclusively. Processes commands from dual channels (urgent/normal) and `select!`s on async I/O.
-- **`logic.rs`** — Synchronous decision logic. Methods on `AgentState` that never do I/O, making them testable without a tokio runtime.
-- **`state.rs`** — Pure data types. `AgentState` holds config, conversation, tools, queues, and shared atomics.
-- **`transport.rs`** — LLM provider abstraction with retry, stream timeout/stall detection, and cancellation.
-- **`compaction.rs`** — Context window management: summarization, cut-point finding, token estimation.
+Lower tiers do not import from higher tiers. `core/` knows nothing
+about subagents. `fleet/` composes `core` agents.
 
-## Key types
+### State split
 
-| Type | Module | Role |
-|------|--------|------|
-| `AgentBuilder` | `builder` | Configure and spawn an agent. `pre_handle()` available before `spawn()` to break circular deps. |
-| `AgentHandle` | `handle` | Clone + Send + Sync handle. All interaction goes through this. Spec changes consume `self` and return a new handle (`respec`, `with_system_prompt`, `with_tools`). |
-| `AgentConfig` | `config` | Model, reasoning level, max turns, compaction settings. |
-| `Tool` | `tool` | Trait for tool implementations: name, schema, concurrency, execute. Optional `bind_to_agent` hook for tools that need their owning agent's handle (e.g. recursive `AgentTool`). |
-| `AgentEvent` | `events` | Broadcast event enum: lifecycle, messages, tools, compaction, errors, subagents, file changes. |
-| `AgentSpec` | `manager` | Immutable per-agent input the runtime treats as fixed: system prompt, tools, max turns, worktree allowance, allowed-subagent-spec names. Stored as `Arc<AgentSpec>` in the manager registry; spawn/respec methods accept `impl Into<Arc<AgentSpec>>`. To change any field, spawn a new agent (typically via `respec`). |
-| `SpawnOpts` | `manager` | Per-spawn options that aren't part of the spec: description, model override, cwd, `Isolation`, `inherit_history_from`, `seed_messages`, approval-policy override, `spec_name`. |
-| `Isolation` | `manager` | Filesystem isolation mode for a subagent. Currently `Worktree`. Serializes as snake_case so the same enum drives both Rust APIs and tool-arg JSON schemas. |
-| `InteractionRequest` | `interaction` | Tool → host UI round-trip. Two shapes: `AskQuestion` (untyped, returns `Answer`) and `Typed { schema_id, payload }` (host renders by `schema_id`, replies with `Approved { payload }` / `Rejected` / `Cancelled`). The runtime treats `payload` as opaque JSON; schemas (e.g. `plan.submit`) and their typed payload structs live with the tools that emit them (e.g. `tau_tools::Plan`). |
-| `ApprovalPolicy` | `approval` | Trait that classifies a pending tool call into `Auto` / `Gate` / `Reject`. Built-in policies: `DefaultApprovalPolicy`, `AutoAcceptAllPolicy`, `RulePolicy`. |
-| `AgentManager` | `manager` | Subagent lifecycle: spawn foreground/background/interactive, resume, respec, evict. Holds the spec registry; enforces a single invariant ("spec exists ⟺ id is in idle storage or running"). |
-| `Transport` | `transport` | Trait abstracting LLM calls. `ProviderTransport` handles Anthropic/OpenAI/Google. |
+The actor's state is split into three structs by mutation discipline:
 
-## Agent loop
+```rust
+struct Frame {  // wiring: tools, transport, schema cache, policies
+    /* Read-only inside transitions. Mutated only by the actor's
+       command handler in response to SetModel / SetReasoning /
+       SetCompactionConfig / SetApprovalPolicy. */
+}
 
-1. `AgentHandle::prompt()` sends a `Command::Prompt` over the normal channel.
-2. The actor transitions through phases: `Idle` → `PrepareTurn` → `AwaitingModel` → `ProcessResponse`.
-3. `logic.rs` decides the next action: run tools, compact, or finish.
-4. Tool calls are grouped by concurrency and executed on a `JoinSet`.
-5. After tools complete, the loop returns to `PrepareTurn` for the next LLM call.
-6. Steering messages (via `handle.steer()`) arrive on the urgent channel and interrupt between tool groups.
+struct Conv {   // mutable per-turn state
+    conversation: Conversation,
+    steering_queue: Vec<Message>,
+    follow_up_queue: Vec<Message>,
+    cwd: Option<PathBuf>,
+}
 
-## Subagents
+struct Shared { // atomics shared with the handle
+    is_running: Arc<AtomicBool>,
+    pending_follow_ups: Arc<AtomicU32>,
+    cancel: Arc<Mutex<CancellationToken>>,
+    agent_id: Arc<OnceLock<String>>,
+    /* … */
+}
+```
 
-`AgentManager` spawns independent agent instances, each with their own actor loop. Each subagent is itself a complete agent satisfying the same boundary contract as the root — events flow up to the parent's broadcast wrapped as `Subagent { event }`, alongside parent-timeline events (`SubagentStarted`, `SubagentCompleted`).
+### `decide_*` / `apply_*` discipline
 
-Hosts construct an `AgentSpec` (system prompt, tools, max turns, worktree allowance, allowed-subagent-spec names) and pass it to `AgentManager::spawn` along with the initial prompt and a `SpawnOpts`. The runtime treats spec names as opaque strings owned by the host — `general-purpose`, `explore`, `plan`, etc., are conventions defined in the host's spec map / resolver, not in the runtime.
+`core::transitions` is purely synchronous, no I/O. Function names
+encode whether a function decides or mutates:
 
-### Lifecycle methods
+- `decide_*` — pure decisions, take `&Frame, &Conv`, return an
+  action enum.
+- `apply_*` — state transitions, take `&Frame, &mut Conv`, mutate.
+  Never re-decide.
+- `build_*` and other plain helpers — pure utilities.
 
-- **Foreground** — `spawn(spec, prompt, opts, cancel)` blocks the parent until completion.
-- **Background** — `spawn_background(...)` returns immediately; posts a `FollowUp` message to the parent on completion. Cancellation is forwarded via a token bridge so the subagent's internal cleanup runs to completion (event forwarder abort, registry untracking) before the task ends.
-- **Interactive** — `spawn_interactive(...)` returns the `AgentHandle` for caller-driven prompting. The caller is responsible for `remove_interactive` when done.
-- **Resume** — `send(id, message, cancel)` rehydrates a stored idle agent with a new prompt. The agent is tracked in `running_handles` for the duration of the resume so `find_agent` / `send_to_running` continue to locate it.
-- **Respec** — `respec(agent_id, new_spec)` is a *transition*: spawns a fresh agent under `new_spec` with `inherit_history_from = agent_id`, then evicts the original idle entry. The old id stops resolving. To fork instead of transition, call `spawn` directly with `inherit_history_from`.
-- **Adopt** — `adopt(handle, spec)` registers a builder-spawned root agent so it can `respec` / `with_system_prompt` / `with_tools`.
+The actor reads a `decide_*` result, performs any I/O the result
+demands, then calls one or more `apply_*` to commit.
 
-### History seeding
+### Phase machine
 
-Two ways to seed a new subagent's conversation, in precedence order:
+Nested. Outer `Phase` is four variants; sub-machines for the prompt
+body, tool batches, queue drains, and compaction live in their own
+enums:
 
-1. **`SpawnOpts::seed_messages: Option<Vec<Message>>`** — explicit message vector from the host. Used for `/branch`-style flows that fork from an arbitrary index in the parent's history.
-2. **`SpawnOpts::inherit_history_from: Option<String>`** — agent id whose full history is fetched from the registry. Used for plan → execute handoffs.
+```text
+Phase
+├── Idle
+├── Turn(Turn { first_user_message, sub: TurnSub })
+│   ├── Prepare { pending }
+│   ├── AwaitingModel { stream, pending }
+│   ├── Processing { outcome, pending }
+│   ├── Tool(ToolPhase)
+│   │   ├── AwaitingApproval { tool_calls, groups, pending_gates, … }
+│   │   ├── Executing { join_set, remaining_groups, … }
+│   │   └── Applying { tool_calls, results_map }
+│   └── Drain(DrainPhase)
+│       ├── CheckQueues
+│       └── WaitingForBackground
+├── Compaction(CompactionTrigger)
+│   ├── Manual { reply }
+│   └── Overflow { resume_pending }
+└── Done(Result)
+```
 
-`seed_messages` wins when both are set: the host already has the messages, no lookup needed.
+## Usage
 
-### Plan execution
+Add to `Cargo.toml`:
 
-One application of `respec` / `inherit_history_from`. A `plan` subagent investigates and submits a plan via the `plan.submit` typed interaction; the host approves (optionally editing the body); the host then spawns an executor subagent with `SpawnOpts.inherit_history_from = <planner_agent_id>` so the executor sees the planner's investigation and the approved plan as its own conversation history. There is no separate plan-execution mechanism in the runtime.
+```toml
+[dependencies]
+tau-agent = { path = "../path/to/tau-agent" }
+tokio = { version = "1", features = ["full"] }
+```
 
-### Tool sharing across spawns
+### Minimal example
 
-`BoxedTool` is `Arc<dyn Tool>`, so reusing the same `AgentSpec` for multiple concurrent spawns shares the same underlying tool objects. Tools that capture per-agent state via `Tool::bind_to_agent` (e.g. `AgentTool`'s `OnceLock<AgentHandle>`) bind to whichever spawn happens first and silently mis-route for subsequent ones. Hosts that spawn the same spec concurrently must construct fresh tool instances per spawn — typically via a resolver closure that builds a new `AgentSpec` each call — rather than cloning a shared tool vector.
+```rust
+use std::sync::Arc;
+use tau_agent::{AgentBuilder, AgentConfig, ProviderTransport};
 
-## Events on subagent lifecycle
+#[tokio::main]
+async fn main() -> tau_agent::Result<()> {
+    let config = AgentConfig {
+        system_prompt: Some("You are a helpful assistant.".into()),
+        /* model, reasoning, compaction, etc. — see config.rs */
+        .. /* fields */
+    };
 
-Every subagent run is bracketed by `SubagentStarted` and `SubagentCompleted`, even on setup failure (worktree creation, history-inherit lookup). Failed runs preserve token usage, tool-call count, any partial assistant text, and write a transcript to disk — the post-mortem signal for diagnosing model errors. `SubagentResumed` brackets a resume; `SubagentReport` is a self-label the subagent emits before terminating (host correlates by `agent_id`).
+    let transport = Arc::new(ProviderTransport::new());
+    let handle = AgentBuilder::new(config, transport).spawn();
+
+    // Send a prompt and wait for completion.
+    handle.prompt_and_wait("What's the capital of France?").await?;
+
+    // Read back the conversation.
+    if let Some(state) = handle.state().await {
+        for msg in &state.messages {
+            println!("[{}] {}", msg.role(), msg.text());
+        }
+    }
+    Ok(())
+}
+```
+
+### Subscribing to events
+
+The handle exposes a broadcast subscription. Events fire for every
+agent lifecycle moment — prompts, tool calls, message deltas,
+compaction, errors.
+
+```rust
+let handle = AgentBuilder::new(config, transport).spawn();
+let mut events = handle.subscribe();
+
+handle.prompt("hello").await?;
+
+while let Ok(event) = events.recv().await {
+    use tau_agent::AgentEvent;
+    match event {
+        AgentEvent::MessageEnd { message } => println!("→ {}", message.text()),
+        AgentEvent::ToolExecutionStart { tool_name, activity, .. } => {
+            println!("  ↳ {tool_name}: {activity}");
+        }
+        AgentEvent::AgentEnd { total_turns, total_usage } => {
+            println!("[done in {total_turns} turns, {} in / {} out tokens]",
+                     total_usage.input, total_usage.output);
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+### Custom tools
+
+Implement the `Tool` trait. Each tool gets an `ExecutionContext` with
+the agent's id, the cancellation token, a progress sender, the file
+access tracker, and the interaction channel (if the host wired one):
+
+```rust
+use async_trait::async_trait;
+use serde_json::Value;
+use tau_agent::{ExecutionContext, Tool, ToolResult};
+
+struct EchoTool;
+
+#[async_trait]
+impl Tool for EchoTool {
+    fn name(&self) -> &str { "echo" }
+    fn description(&self) -> &str { "Echo the text argument back." }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+        })
+    }
+    async fn execute(&self, args: Value, _ctx: ExecutionContext) -> ToolResult {
+        let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        ToolResult::text(text)
+    }
+}
+
+// then:
+let mut builder = AgentBuilder::new(config, transport);
+builder.add_tool(Arc::new(EchoTool));
+let handle = builder.spawn();
+```
+
+The `ExecutionContext::agent_id` field carries the owning agent's
+id (when the host or fleet has stamped one). Tools that need to
+identify their caller — e.g. a recursive-spawn tool that needs the
+parent handle — read this rather than capturing state at construction.
+
+### Approval policy
+
+Every tool call is classified by an `ApprovalPolicy` before it runs:
+
+```rust
+use tau_agent::{AutoAcceptAll, DefaultPolicy, RulePolicy, ToolRule};
+
+// "Auto" everything (CI / scripts).
+builder.set_approval_policy(Arc::new(AutoAcceptAll));
+
+// "Gate" tools whose risk is Elevated (Bash, network posts).
+builder.set_approval_policy(Arc::new(DefaultPolicy));
+
+// Per-tool / per-argument rules with a fallback.
+let policy = RulePolicy::new(Arc::new(DefaultPolicy))
+    .allow(ToolRule { tool: "bash".into(), arg_substrings: vec!["git status".into()] })
+    .deny(ToolRule { tool: "bash".into(), arg_substrings: vec!["rm -rf".into()] });
+builder.set_approval_policy(Arc::new(policy));
+```
+
+When the policy returns `Gate`, the runtime emits a `Typed
+{ schema_id: "tool.confirm" }` interaction request and waits for the
+host to approve, reject, or cancel. Configure the interaction sender
+with `builder.set_interaction_sender(mpsc_tx)` to receive these.
+
+### Mutating an agent after spawn
+
+The handle's mutators take `&self` and queue commands to the actor:
+
+```rust
+handle.set_model(new_model).await?;
+handle.set_reasoning(ReasoningLevel::High).await?;
+handle.set_approval_policy(Arc::new(AutoAcceptAll)).await?;
+handle.set_compaction_config(CompactionConfig::default()).await?;
+
+// Steer mid-prompt (interrupts between tool batches).
+handle.steer(Message::user("actually, focus on X")).await?;
+```
+
+To change the *spec* (tools or system prompt), spawn a new agent. The
+runtime treats `AgentSpec` as immutable for the agent's lifetime.
+
+### Multi-agent: `AgentManager`
+
+For hosts that need to spawn subagents, `AgentManager` is a thin
+composition of a registry, a lifecycle, and an event bus:
+
+```rust
+use tau_agent::{AgentManager, AgentSpec, SpawnOpts};
+
+let (event_tx, _) = tokio::sync::broadcast::channel(256);
+let manager = Arc::new(AgentManager::new(event_tx, config, transport, /* max_agents */ 20));
+
+let spec = AgentSpec {
+    system_prompt: "You are a focused research agent.".into(),
+    tools: vec![Arc::new(EchoTool)],
+    max_turns: 50,
+    allows_worktree: false,
+    allowed_subagent_specs: None,
+};
+
+let result = manager
+    .spawn(spec, "find recent commits".into(), SpawnOpts::default(), CancellationToken::new())
+    .await?;
+println!("subagent says: {}", result.text);
+
+// Later, resume:
+let resumed = manager
+    .send(&result.agent_id, "anything else?", CancellationToken::new())
+    .await?;
+
+// Or transition to a new spec (e.g. swap toolset):
+let new_handle = manager.respec(&result.agent_id, new_spec).await?;
+```
+
+`AgentManager` provides:
+
+- `spawn` — foreground subagent; blocks until completion.
+- `spawn_background` — fire-and-forget; posts a follow-up to the
+  parent handle on completion.
+- `spawn_interactive` — caller drives the returned handle.
+- `send` — resume a stored agent with a follow-up prompt.
+- `respec` — atomic spec transition: detach the agent (verifying
+  it's idle), spawn a new one inheriting its history, drop the old
+  spec. Rolls back on failure.
+- `adopt` — register an externally-built handle (e.g. the host's
+  root agent) so `spec_for` / `respec` work.
+- `find_agent` / `handle_for` — registry lookups.
+
+### Registry invariant
+
+The fleet's `Registry` maintains a single load-bearing invariant:
+
+> A spec exists in the registry **iff** its id is in idle ∪ running ∪ adopted.
+
+This is enforced by the registry's method surface — every mutation
+goes through a method that preserves the invariant. Five registry
+unit tests pin the edges. The `respec` flow uses an atomic
+verify-and-detach to close the race where a concurrent `send` could
+slip in between the "not running" check and the spec drop.
 
 ## Testing
 
-The `test-utils` feature exports mock transports, test tools, and an `EventCollector` for deterministic async testing:
+The `test-utils` feature exports mock transports, fake tools, and an
+`EventCollector` for deterministic async testing:
 
 ```toml
 [dev-dependencies]
-tau-agent = { workspace = true, features = ["test-utils"] }
+tau-agent = { path = "...", features = ["test-utils"] }
 ```
 
 ```rust
 use tau_agent::test_utils::*;
 
-let transport = MockTransport::new()
-    .with_text_response("Hello!");
+let transport = MockTransport::new().with_text_response("Hello!");
 let (handle, collector) = spawn_test_agent(transport, vec![]);
 
-handle.prompt("hi").await.unwrap();
+handle.prompt_and_wait("hi").await.unwrap();
 collector.wait_for_end().await;
 
 assert_eq!(collector.assistant_messages()[0].text(), "Hello!");
 ```
 
-Available mocks: `MockTransport`, `TextTransport`, `ToolCallTransport`, `SlowTransport`, `CapturingTransport`, `ErrorTransport`. Test tools: `EchoTool`, `FailTool`, `SlowTool`.
+Provided fixtures: `MockTransport`, `TextTransport`, `ToolCallTransport`,
+`SlowTransport`, `CapturingTransport`, `ErrorTransport`, `PanicTransport`,
+`EchoTool`, `FailTool`, `SlowTool`, `PanicTool`, `EventCollector`,
+`spawn_test_agent`.
 
-## Module index
+## Module map
 
-| Module | Visibility | Purpose |
-|--------|-----------|---------|
-| `actor` | crate | Async event loop, `StepPhase` state machine |
-| `approval` | pub | `ApprovalPolicy` trait, `ToolRisk`, `ApprovalDecision`, built-in policies |
-| `builder` | pub | `AgentBuilder` setup and spawn |
-| `command` | crate | `Command` enum (handle → actor protocol) |
-| `compaction` | pub | Context summarization and token management |
-| `config` | pub | `AgentConfig`, `DequeueMode` |
-| `context` | pub | Hierarchical context file loading (AGENTS.md / CLAUDE.md) |
-| `conversation` | pub | `Conversation` state container |
-| `error` | pub | Error types (`Error::Unmanaged` for builder-spawned handles trying to `respec`) |
-| `events` | pub | `AgentEvent` enum (broadcast events) |
-| `handle` | pub | `AgentHandle` — public API; `respec` / `with_system_prompt` / `with_tools` consume `self` |
-| `interaction` | pub | Tool ↔ UI request/reply protocol (`AskQuestion`, `Typed { schema_id, payload }`) |
-| `logic` | crate | Sync decision logic (no I/O) |
-| `manager` | pub | `AgentManager` — subagent lifecycle, `AgentSpec`, `SpawnOpts`, `Isolation` |
-| `overflow` | crate | Context overflow detection (30+ provider patterns) |
-| `prompts` | pub | System prompt assembly |
-| `state` | crate | `AgentState`, `ToolCall` data types |
-| `stream` | pub | `StreamReducer` — event stream aggregation |
-| `tool` | pub | `Tool` trait, `ExecutionContext`, `ToolResult`, `bind_to_agent` hook |
-| `tool_executor` | crate | Single tool execution harness |
-| `transcript` | pub | JSONL logging for subagent conversations (recorded on success and failure) |
-| `transport` | pub | `Transport` trait, `ProviderTransport` |
-| `worktree` | crate | Git worktree isolation for subagents |
-| `test_utils` | pub (feature-gated) | Mocks, test tools, `EventCollector` |
+| Module | Role |
+|---|---|
+| `types::events` | `AgentEvent` enum + `ConsoleLine` / `ToolApprovalOutcome` / `SubagentOutcome` payloads |
+| `types::error` | `Error` + `Result` |
+| `types::conversation` | `Conversation` (messages, usage, streaming, previous summary) |
+| `core::actor` | `run_actor`, the phase machine, the command/event loop |
+| `core::approval` | `ApprovalPolicy` trait + built-in policies |
+| `core::builder` | `AgentBuilder` setup → spawn |
+| `core::command` | `Command` (handle ↔ actor protocol) |
+| `core::compaction` | Cut-point finding, summarization, `apply_compaction_result` |
+| `core::config` | `AgentConfig`, `DequeueMode` |
+| `core::handle` | `AgentHandle` — `Clone + Send + Sync` API surface |
+| `core::interaction` | Tool ↔ UI round-trip protocol |
+| `core::overflow` | Context-overflow regex detection across providers |
+| `core::state` | `Frame` / `Conv` / `Shared` / `State` |
+| `core::stream` | `StreamReducer` — aggregate transport events into a turn outcome |
+| `core::tool` | `Tool` trait, `ExecutionContext`, `ToolResult`, `FileAccessTracker` |
+| `core::transitions` | Sync decision + apply functions (no I/O) |
+| `core::transport` | `Transport` trait + `ProviderTransport` |
+| `fleet::bus` | Child→parent event forwarding, interaction routing |
+| `fleet::lifecycle` | `spawn` / `send` / `respec` / `adopt` / `spawn_background` |
+| `fleet::manager` | `AgentManager` composition root + `AgentSpec` / `SpawnOpts` |
+| `fleet::registry` | Spec / idle / running / adopted maps with invariant baked in |
+| `fleet::result` | `SubagentResult` |
+| `fleet::transcript` | JSONL transcript recording |
+| `fleet::worktree` | Git worktree isolation for subagents |
+
+## Differences from `tau-agent`
+
+If you're coming from `tau-agent` (v1):
+
+- **No `bind_to_agent` hook** on `Tool`. Tools read `ctx.agent_id`
+  instead of capturing a handle at construction time.
+- **`AgentBuilder::handle()`** replaces `pre_handle()`.
+- **`AgentHandle::respec_with(|spec| { ... })`** replaces the
+  `with_system_prompt` / `with_tools` convenience methods.
+- **`respec` lives on `AgentManager` only.** Use
+  `manager.respec(handle.agent_id().unwrap(), new_spec)` instead of
+  `handle.respec(spec)`.
+- **No `prompts/` module.** v1 shipped opinionated system-prompt
+  fragments inside the runtime crate; v2 leaves prompt assembly to
+  the host.
+- **No `context::load_context`.** Same reason — host concern.
+- **`AutoAcceptAllPolicy` → `AutoAcceptAll`**; `DefaultApprovalPolicy`
+  → `DefaultPolicy`.
+- **`Registry` invariant** is method-enforced, not doc-enforced.
+- **State split** (`Frame` / `Conv` / `Shared`) replaces v1's flat
+  `AgentState` god struct.
+
+## Test count
+
+`cargo test -p tau-agent` runs 116 tests:
+
+- 25 unit (approval, overflow, stream, transitions, compaction, registry)
+- 91 integration across 14 files
+
+All passing.

@@ -5,13 +5,55 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
-use tau_agent::approval::{ApprovalDecision, ApprovalPolicy, AutoAcceptAllPolicy, ToolRisk};
-use tau_agent::manager::{AgentManager, AgentSpec, SpawnOpts};
+use tau_agent::core::approval::{ApprovalDecision, ApprovalPolicy, AutoAcceptAll, ToolRisk};
+use tau_agent::core::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::core::transport::Transport;
+use tau_agent::fleet::manager::{AgentManager, AgentSpec, SpawnOpts};
 use tau_agent::test_utils::*;
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
-use tau_agent::transport::Transport;
 use tau_agent::{AgentEvent, BoxedTool, SubagentOutcome};
-use tau_tools::SubagentReportTool;
+// SubagentReportTool replicated inline below (v1 had it in tau-tools;
+// v2 has no host-tools dep, so we fixture it locally).
+struct SubagentReportTool;
+
+impl SubagentReportTool {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for SubagentReportTool {
+    fn name(&self) -> &str {
+        "subagent_report"
+    }
+    fn description(&self) -> &str {
+        "Self-label this subagent's outcome."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tag": { "type": "string" },
+                "summary": { "type": "string" }
+            },
+            "required": ["summary"]
+        })
+    }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
+        let tag = args.get("tag").and_then(|v| v.as_str()).map(String::from);
+        let summary = args
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        ctx.progress
+            .emit(AgentEvent::SubagentReport { tag, summary });
+        ToolResult::text("reported")
+    }
+}
 
 fn make_manager(transport: Arc<dyn Transport>) -> Arc<AgentManager> {
     let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -20,7 +62,10 @@ fn make_manager(transport: Arc<dyn Transport>) -> Arc<AgentManager> {
 
 fn make_manager_with_rx(
     transport: Arc<dyn Transport>,
-) -> (Arc<AgentManager>, tokio::sync::broadcast::Receiver<AgentEvent>) {
+) -> (
+    Arc<AgentManager>,
+    tokio::sync::broadcast::Receiver<AgentEvent>,
+) {
     let (tx, rx) = tokio::sync::broadcast::channel::<AgentEvent>(256);
     (
         Arc::new(AgentManager::new(tx, test_config(), transport, 4)),
@@ -61,7 +106,10 @@ async fn spawn_emits_started_then_completed() {
     let (manager, mut rx) = make_manager_with_rx(transport);
 
     manager
-        .spawn(echo_spec(), ("hello").to_string(), spawn_opts("test"),
+        .spawn(
+            echo_spec(),
+            ("hello").to_string(),
+            spawn_opts("test"),
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -101,7 +149,12 @@ async fn aborted_spawn_emits_completed_with_aborted_outcome() {
     let cancel_clone = cancel.clone();
     let spawn_handle = tokio::spawn(async move {
         let _ = manager_clone
-            .spawn(echo_spec(), ("hi").to_string(), spawn_opts("slow"), cancel_clone)
+            .spawn(
+                echo_spec(),
+                ("hi").to_string(),
+                spawn_opts("slow"),
+                cancel_clone,
+            )
             .await;
     });
 
@@ -225,7 +278,7 @@ async fn subagent_inherits_parent_approval_policy() {
     let manager = Arc::try_unwrap(manager)
         .ok()
         .expect("unique")
-        .with_parent_approval_policy(Arc::new(AutoAcceptAllPolicy));
+        .with_default_approval_policy(Arc::new(AutoAcceptAll));
     let manager = Arc::new(manager);
 
     manager
@@ -269,7 +322,12 @@ async fn resume_emits_subagent_resumed_then_completed() {
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let first = manager
-        .spawn(echo_spec(), ("first").to_string(), spawn_opts("agent under test"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("first").to_string(),
+            spawn_opts("agent under test"),
+            cancel.clone(),
+        )
         .await
         .expect("spawn");
 
@@ -297,109 +355,21 @@ async fn resume_emits_subagent_resumed_then_completed() {
             _ => {}
         }
     }
-    assert!(saw_resumed_id.is_some(), "SubagentResumed emitted on send()");
+    assert!(
+        saw_resumed_id.is_some(),
+        "SubagentResumed emitted on send()"
+    );
     assert!(
         saw_completed_after_resume,
         "SubagentCompleted bracketed the resume"
     );
 }
 
-#[tokio::test]
-async fn nested_subagents_inherit_top_level_override() {
-    // Verify the spec: per-spawn approval_policy "applies at that level
-    // and below unless overridden again deeper". The host owns recursive
-    // spawning via a `SpecResolver` on the parent's `AgentTool`; the
-    // resolver builds child specs whose `tools` already include another
-    // `AgentTool` configured with the inherited policy.
-    use tau_agent::AgentSpec;
-    use tau_tools::{AgentTool, SpecResolver};
-
-    let invocations = Arc::new(AtomicU32::new(0));
-    let danger: BoxedTool = Arc::new(CountingDangerTool {
-        invocations: invocations.clone(),
-    });
-
-    // Depth-1 transport: model spawns a depth-2 with no explicit policy.
-    // Depth-2 transport: model calls the danger tool.
-    let transport: Arc<dyn Transport> = Arc::new(
-        MockTransport::new()
-            // Depth-1, turn 1: spawn a sub via agent tool
-            .with_tool_call_response(
-                "agent",
-                "c1",
-                serde_json::json!({
-                    "subagent_type": "deep",
-                    "description": "deeper",
-                    "prompt": "do dangerous thing"
-                }),
-            )
-            // Depth-2, turn 1: call danger
-            .with_tool_call_response("danger", "c2", serde_json::json!({}))
-            // Depth-2, turn 2: final
-            .with_text_response("d2 done")
-            // Depth-1, turn 2: final
-            .with_text_response("d1 done"),
-    );
-
-    let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-    let manager = Arc::new(
-        AgentManager::new(tx, test_config(), transport, 4)
-            .with_parent_approval_policy(Arc::new(AutoAcceptAllPolicy)),
-    );
-
-    // depth-2 ("deep") spec contains the danger tool.
-    let danger_for_resolver = danger.clone();
-    let resolver: SpecResolver = Arc::new(move |name: &str, _depth: u32| match name {
-        "deep" => Some(AgentSpec {
-            system_prompt: String::new(),
-            tools: vec![danger_for_resolver.clone()],
-            max_turns: 200,
-            allows_worktree: false,
-            allowed_subagent_specs: None,
-        }),
-        _ => None,
-    });
-
-    // Depth-1's spawn runs under a permissive policy (so the `agent` tool
-    // call itself succeeds). The AgentTool the depth-1 agent uses to
-    // spawn depth-2 carries `with_inherited_policy(AlwaysReject)` — that
-    // is what gets propagated into the depth-2 SpawnOpts via the tool's
-    // execute path. So depth-2 runs under AlwaysReject and its danger
-    // call gets rejected.
-    let depth1_agent_tool = AgentTool::new(manager.clone(), 0)
-        .with_spec_resolver(resolver)
-        .with_inherited_policy(Arc::new(AlwaysRejectPolicy("inherited at depth-2")));
-    let depth1_spec = AgentSpec {
-        system_prompt: String::new(),
-        tools: vec![Arc::new(depth1_agent_tool)],
-        max_turns: 200,
-        allows_worktree: false,
-        allowed_subagent_specs: Some(vec!["deep".into()]),
-    };
-
-    // Depth-1 itself runs permissive — only its descendants get rejected.
-    let opts = SpawnOpts {
-        description: "depth1".into(),
-        approval_policy: Some(Arc::new(AutoAcceptAllPolicy)),
-        ..Default::default()
-    };
-
-    manager
-        .spawn(
-            depth1_spec,
-            "nest".to_string(),
-            opts,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .expect("spawn");
-
-    assert_eq!(
-        invocations.load(Ordering::SeqCst),
-        0,
-        "depth-2 inherited depth-1's tool-attached reject policy; danger did NOT run"
-    );
-}
+// Skipped in v2: depends on `tau_tools::{AgentTool, SpecResolver}` —
+// host-side recursive-spawn machinery v2 doesn't ship with. The
+// underlying behavior (per-spawn approval_policy propagating into a
+// descendant via `SpawnOpts::approval_policy`) is exercised one level
+// deep by `spawn_request_approval_policy_overrides_parent` below.
 
 #[tokio::test]
 async fn spawn_request_approval_policy_overrides_parent() {
@@ -419,7 +389,7 @@ async fn spawn_request_approval_policy_overrides_parent() {
     let manager = Arc::try_unwrap(manager)
         .ok()
         .expect("unique")
-        .with_parent_approval_policy(Arc::new(AutoAcceptAllPolicy));
+        .with_default_approval_policy(Arc::new(AutoAcceptAll));
     let manager = Arc::new(manager);
 
     let opts = SpawnOpts {
@@ -445,19 +415,19 @@ async fn spawn_request_approval_policy_overrides_parent() {
     );
 }
 
-// ─── Tool::bind_to_agent post-construction hook ─────────────────────
+// ─── ExecutionContext::agent_id ─────────────────────────────────────
 
-/// A tool that records every call to `bind_to_agent` along with the
-/// agent_id stamped on the handle. Used to verify the manager calls the
-/// hook exactly once per tool per spawn, with the right handle.
-struct BindRecorder {
-    bound_ids: Arc<parking_lot::Mutex<Vec<String>>>,
+/// A tool that records `ctx.agent_id` on each execute call. Verifies
+/// the runtime threads the owning agent's id through to tools at
+/// invocation time.
+struct IdRecorder {
+    seen_ids: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 #[async_trait]
-impl Tool for BindRecorder {
+impl Tool for IdRecorder {
     fn name(&self) -> &str {
-        "bind_recorder"
+        "id_recorder"
     }
     fn description(&self) -> &str {
         ""
@@ -465,33 +435,28 @@ impl Tool for BindRecorder {
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
-    fn bind_to_agent(&self, handle: &tau_agent::handle::AgentHandle) {
-        let id = handle.agent_id().map(str::to_string).unwrap_or_default();
-        self.bound_ids.lock().push(id);
-    }
-    async fn execute(
-        &self,
-        _args: serde_json::Value,
-        _ctx: ExecutionContext,
-    ) -> ToolResult {
+    async fn execute(&self, _args: serde_json::Value, ctx: ExecutionContext) -> ToolResult {
+        let id = ctx.agent_id.clone().unwrap_or_default();
+        self.seen_ids.lock().push(id);
         ToolResult::text("ok")
     }
 }
 
+/// `ExecutionContext::agent_id` must be the spawning agent's id, even
+/// when the same tool instance is shared across multiple spawns. Tools
+/// carry no per-agent state; the runtime supplies identity per call.
 #[tokio::test]
-async fn bind_to_agent_called_with_owning_agent_handle() {
-    // The runtime must call bind_to_agent on every tool in the spec
-    // with the owning agent's handle. Verify by spawning two separate
-    // agents and checking each tool instance saw the right id.
-    let bound_ids = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-    let recorder: BoxedTool = Arc::new(BindRecorder {
-        bound_ids: bound_ids.clone(),
+async fn execution_context_carries_owning_agent_id() {
+    let seen_ids = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let recorder: BoxedTool = Arc::new(IdRecorder {
+        seen_ids: seen_ids.clone(),
     });
 
-    let transport: Arc<dyn Transport> = TextTransport::create("done");
-    let manager = make_manager(transport);
-
-    let spec = AgentSpec {
+    // Each manager gets its own ToolCallTransport so its quota isn't
+    // drained by the other spawn. The recorder is shared — that's the
+    // point: one stateless tool, two spawns, identity arrives via
+    // ExecutionContext rather than tool state.
+    let spec_for = || AgentSpec {
         system_prompt: String::new(),
         tools: vec![recorder.clone()],
         max_turns: 200,
@@ -499,9 +464,10 @@ async fn bind_to_agent_called_with_owning_agent_handle() {
         allowed_subagent_specs: None,
     };
 
-    let r1 = manager
+    let mgr1 = make_manager(ToolCallTransport::create(1, "id_recorder"));
+    let r1 = mgr1
         .spawn(
-            spec.clone(),
+            spec_for(),
             "first".to_string(),
             spawn_opts("first"),
             tokio_util::sync::CancellationToken::new(),
@@ -509,9 +475,10 @@ async fn bind_to_agent_called_with_owning_agent_handle() {
         .await
         .expect("first spawn");
 
-    let r2 = manager
+    let mgr2 = make_manager(ToolCallTransport::create(1, "id_recorder"));
+    let r2 = mgr2
         .spawn(
-            spec,
+            spec_for(),
             "second".to_string(),
             spawn_opts("second"),
             tokio_util::sync::CancellationToken::new(),
@@ -519,18 +486,129 @@ async fn bind_to_agent_called_with_owning_agent_handle() {
         .await
         .expect("second spawn");
 
-    let ids = bound_ids.lock().clone();
-    assert_eq!(
-        ids.len(),
-        2,
-        "bind_to_agent fired once per spawn (got {ids:?})"
-    );
+    let ids = seen_ids.lock().clone();
+    assert_eq!(ids.len(), 2, "tool invoked once per spawn (got {ids:?})");
     assert!(
         ids.contains(&r1.agent_id),
-        "first agent's id was bound: {ids:?}"
+        "first agent's id reached the tool: {ids:?}"
     );
     assert!(
         ids.contains(&r2.agent_id),
-        "second agent's id was bound: {ids:?}"
+        "second agent's id reached the tool: {ids:?}"
+    );
+}
+
+/// `respec` is a transition: on success the old id no longer resolves
+/// (`spec_for(old) -> None`, `find_agent(old) -> None`) and the new
+/// handle is usable.
+#[tokio::test]
+async fn respec_transitions_old_id_to_new() {
+    let transport: Arc<dyn Transport> = TextTransport::create("done");
+    let manager = make_manager(transport);
+
+    let r = manager
+        .spawn(
+            echo_spec(),
+            "first".to_string(),
+            spawn_opts("orig"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("spawn");
+    let old_id = r.agent_id.clone();
+    assert!(manager.spec_for(&old_id).is_some());
+
+    let new_handle = manager
+        .respec(
+            &old_id,
+            AgentSpec {
+                system_prompt: "new prompt".to_string(),
+                tools: vec![],
+                max_turns: 200,
+                allows_worktree: false,
+                allowed_subagent_specs: None,
+            },
+        )
+        .await
+        .expect("respec succeeds");
+
+    assert!(manager.spec_for(&old_id).is_none(), "old spec dropped");
+    let new_id = new_handle.agent_id().expect("stamped").to_string();
+    assert_ne!(new_id, old_id, "respec assigns a new id");
+    assert!(manager.spec_for(&new_id).is_some(), "new spec recorded");
+    // v2: spawn_interactive leaves the agent in the registry's running
+    // map; the test simply ends and the manager is dropped.
+    let _ = new_id;
+}
+
+/// Respec while the agent is currently running (resumed via `send`)
+/// must fail and leave the registry intact. Regression for the race
+/// where `respec` checked `running_handles`, released the lock, then
+/// dropped the spec while a concurrent `send` was driving the agent.
+///
+/// We exercise this by running `send` (which mid-flight tracks the
+/// agent in `running_handles` and removes it from `agents`) on one
+/// task while another tries to respec the same id. Either:
+///   - respec sees `running_handles` and rejects, OR
+///   - respec sees agents-empty (mid-resume) and rejects with
+///     "no idle agent."
+/// In neither case may the spec be dropped while the agent is alive.
+#[tokio::test]
+async fn respec_concurrent_with_send_does_not_drop_live_spec() {
+    let transport: Arc<dyn Transport> = SlowTransport::create(100);
+    let manager = make_manager(transport);
+
+    let r = manager
+        .spawn(
+            echo_spec(),
+            "first".to_string(),
+            spawn_opts("racey"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("spawn");
+    let id = r.agent_id.clone();
+
+    let mgr_send = manager.clone();
+    let id_send = id.clone();
+    let send_task = tokio::spawn(async move {
+        mgr_send
+            .send(
+                &id_send,
+                "follow up",
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+
+    // Give send() a moment to grab the lock and start the resume.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let respec_result = manager
+        .respec(
+            &id,
+            AgentSpec {
+                system_prompt: "new".into(),
+                tools: vec![],
+                max_turns: 200,
+                allows_worktree: false,
+                allowed_subagent_specs: None,
+            },
+        )
+        .await;
+
+    let send_result = send_task.await.expect("send task joins");
+
+    // respec must not have succeeded while the agent was being resumed.
+    assert!(
+        respec_result.is_err(),
+        "respec must reject while agent is resuming"
+    );
+    // send must have completed normally; the spec must still be alive
+    // for the agent that just finished its resume.
+    assert!(send_result.is_ok(), "send completes despite race");
+    assert!(
+        manager.spec_for(&id).is_some(),
+        "spec preserved through race"
     );
 }

@@ -23,8 +23,8 @@
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tau_agent::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{InteractionKind, InteractionRequest, InteractionResponse};
 use tau_ai::{Content, Message};
 
 // ---------------------------------------------------------------------------
@@ -119,10 +119,23 @@ impl Tool for SubmitPlanTool {
 
     fn description(&self) -> &str {
         "Submit a structured implementation plan for the user to review, edit, \
-         and approve. After approval the tool returns the approved plan body. \
-         If rejected, revise the plan based on the feedback and call again. \
-         Once approved, do not call this tool again — output a brief final \
-         summary and stop."
+         and approve.\n\n\
+         Required argument shape (not a freeform string — a JSON object):\n\
+         {\n  \
+         \"items\": [\n    \
+         {\"id\": \"s1\", \"title\": \"short imperative\", \"description\": \"what + why\", \"touches\": [\"path/to/file.rs\"]},\n    \
+         {\"id\": \"s2\", ...}\n  \
+         ],\n  \
+         \"files\": [\n    \
+         {\"op\": \"add|modify|delete\", \"path\": \"src/foo.rs\", \"adds\": 12, \"dels\": 3}\n  \
+         ],\n  \
+         \"flags\": [\n    \
+         {\"severity\": \"info|warning|danger\", \"title\": \"…\", \"description\": \"…\"}\n  \
+         ]\n}\n\n\
+         `items` is required. `files` and `flags` are optional but encouraged. \
+         After approval the tool returns the approved plan body. If rejected, \
+         revise the plan based on the feedback and call again. Once approved, \
+         do not call this tool again — output a brief final summary and stop."
     }
 
     fn concurrency(&self) -> Concurrency {
@@ -181,7 +194,11 @@ impl Tool for SubmitPlanTool {
                     None => plan,
                 };
                 match serde_json::to_string_pretty(&approved_plan) {
-                    Ok(json) => ToolResult::text(format!("Plan approved:\n{json}")),
+                    Ok(json) => ToolResult::text(format!(
+                        "Plan accepted for user review:\n{json}\n\nThe user has the plan; \
+                         they will choose when (or whether) to execute it. Output a brief \
+                         acknowledgement and stop. Do not call submit_plan again."
+                    )),
                     Err(e) => ToolResult::error(format!("Failed to serialize approved plan: {e}")),
                 }
             }
@@ -269,7 +286,10 @@ pub fn extract_final_text(messages: &[Message]) -> String {
 /// Format the full prompt for a Plan subagent, combining context and task description.
 pub fn build_plan_prompt(context_summary: &str, description: &str) -> String {
     if context_summary.is_empty() {
-        format!("Create an implementation plan for the following task:\n\n{}", description)
+        format!(
+            "Create an implementation plan for the following task:\n\n{}",
+            description
+        )
     } else {
         format!(
             "Here is context from the conversation so far:\n\n\

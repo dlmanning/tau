@@ -125,13 +125,13 @@ struct GatedTransport {
 }
 
 #[async_trait::async_trait]
-impl tau_agent::transport::Transport for GatedTransport {
+impl tau_agent::core::transport::Transport for GatedTransport {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _config: &tau_agent::transport::AgentRunConfig,
+        _config: &tau_agent::core::transport::AgentRunConfig,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> tau_ai::Result<tau_agent::transport::AgentEventStream> {
+    ) -> tau_ai::Result<tau_agent::core::transport::AgentEventStream> {
         self.release.notified().await;
         // After release, return an empty stream so the prompt completes.
         let s = async_stream::stream! {
@@ -189,7 +189,10 @@ async fn try_send_returns_err_when_channel_full() {
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
-    assert!(full_seen, "try_set_compaction_config should eventually see Full");
+    assert!(
+        full_seen,
+        "try_set_compaction_config should eventually see Full"
+    );
 
     // Cleanup: release the actor so the test doesn't leak the task.
     release.notify_one();
@@ -247,7 +250,7 @@ async fn actor_panic_surfaces_via_shutdown_reason_and_error_event() {
     // PanicTransport panics inside `run` on the actor task itself — that
     // kills the actor (unlike a tool panic, which JoinSet catches).
     let builder = AgentBuilder::new(test_config(), PanicTransport::create());
-    let pre_handle = builder.pre_handle();
+    let pre_handle: tau_agent::AgentHandle = builder.handle();
     let collector = EventCollector::from_handle(&pre_handle);
     let handle = builder.spawn();
 

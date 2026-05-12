@@ -11,12 +11,11 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use tau_agent::{
-    AgentBuilder, AgentConfig, ApprovalPolicy, FileAccessTracker, PromptResult, Transport,
-};
-use tau_agent::tool::{BoxedTool, ExecutionContext, ProgressSender};
-use tokio_util::sync::CancellationToken;
+use tau_agent::core::command::PromptResult;
+use tau_agent::{AgentBuilder, AgentConfig, ApprovalPolicy, FileAccessTracker, Transport};
+use tau_agent::{BoxedTool, ExecutionContext, ProgressSender};
 use tau_session::{ActiveSession, NewSessionRequest, SessionId, SessionManager, SessionStatus};
+use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 use crate::activity::{ActivityEntry, ActivityFeed, SessionSeed};
@@ -303,8 +302,7 @@ impl DeskAgent {
             self.storage.list_mutes().await?.into_iter().collect();
 
         // Walk recent activity, dedupe by `seed_from` (most recent wins).
-        let mut seen_refs: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<SuggestionView> = Vec::new();
 
         for entry in self.storage.list_activity(limit * 8).await? {
@@ -409,9 +407,7 @@ impl DeskAgent {
 
         // Tombstone first (keyed by external_ref, if any).
         if let Some(ref_) = &card.external_ref {
-            self.storage
-                .add_tombstone(ref_, reason.clone())
-                .await?;
+            self.storage.add_tombstone(ref_, reason.clone()).await?;
             let _ = self.events.send(DeskEvent::CardDismissed {
                 record: DismissalRecord {
                     external_ref: ref_.clone(),
@@ -442,8 +438,10 @@ impl DeskAgent {
         } else {
             CardEventKind::Unpinned
         };
-        self.mutate_card(id, Provenance::User, None, event_kind, |c| c.pinned = pinned)
-            .await?;
+        self.mutate_card(id, Provenance::User, None, event_kind, |c| {
+            c.pinned = pinned
+        })
+        .await?;
 
         let _ = self.events.send(DeskEvent::CardPinned {
             id: id.clone(),
@@ -518,13 +516,9 @@ impl DeskAgent {
                 actual: crate::error::AuthorClass::User,
             });
         }
-        self.mutate_card(
-            id,
-            Provenance::User,
-            None,
-            CardEventKind::Updated,
-            |c| c.body = CardBody::Note { body },
-        )
+        self.mutate_card(id, Provenance::User, None, CardEventKind::Updated, |c| {
+            c.body = CardBody::Note { body }
+        })
         .await?;
         Ok(())
     }
@@ -611,6 +605,8 @@ impl DeskAgent {
             ),
             interaction: None,
             file_access: Arc::new(parking_lot::Mutex::new(FileAccessTracker::default())),
+            agent_id: None,
+            subagent_depth: 0,
         };
 
         // Dispatch. `is_error` on ToolResult signals a logical failure;
@@ -855,9 +851,7 @@ impl DeskAgent {
                 .insert(task.name.clone(), cancel.clone());
         }
 
-        let outcome = self
-            .run_task_with_cancel(&task.name, prompt, cancel)
-            .await;
+        let outcome = self.run_task_with_cancel(&task.name, prompt, cancel).await;
 
         if !matches!(task.concurrency, Concurrency::Parallel) {
             self.in_flight.lock().remove(&task.name);
@@ -881,9 +875,9 @@ impl DeskAgent {
         prompt: String,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        let _ = self.events.send(DeskEvent::ScanStarted {
-            task: name.clone(),
-        });
+        let _ = self
+            .events
+            .send(DeskEvent::ScanStarted { task: name.clone() });
 
         let mut tools = self.desk_state_tools(Some(name.clone()));
         tools.extend(self.sources.read().all_tools());
@@ -905,9 +899,9 @@ impl DeskAgent {
 
         match &outcome {
             Ok(_) => {
-                let _ = self.events.send(DeskEvent::ScanCompleted {
-                    task: name.clone(),
-                });
+                let _ = self
+                    .events
+                    .send(DeskEvent::ScanCompleted { task: name.clone() });
             }
             Err(e) => {
                 let _ = self.events.send(DeskEvent::ScanFailed {
@@ -925,13 +919,9 @@ impl DeskAgent {
     /// own set, so mutations stamp the right `Provenance::Agent { agent_id }`.
     fn desk_state_tools(&self, agent_id: Option<String>) -> Vec<BoxedTool> {
         use crate::tools::{
-            add_activity::AddActivityTool,
-            attach_to_card::AttachToCardTool,
-            enqueue_draft::EnqueueDraftTool,
-            move_card::MoveCardTool,
-            retire_card::RetireCardTool,
-            update_brief::UpdateBriefTool,
-            update_take::UpdateTakeTool,
+            add_activity::AddActivityTool, attach_to_card::AttachToCardTool,
+            enqueue_draft::EnqueueDraftTool, move_card::MoveCardTool, retire_card::RetireCardTool,
+            update_brief::UpdateBriefTool, update_take::UpdateTakeTool,
             upsert_card::UpsertCardTool,
         };
 
@@ -1132,7 +1122,13 @@ impl DeskAgent {
                 entries.len()
             );
             for e in entries {
-                let _ = writeln!(buf, "- {} ({}): {}", rel_time(e.at), e.at.to_rfc3339(), e.text);
+                let _ = writeln!(
+                    buf,
+                    "- {} ({}): {}",
+                    rel_time(e.at),
+                    e.at.to_rfc3339(),
+                    e.text
+                );
             }
             buf.push('\n');
         }
@@ -1334,8 +1330,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use tau_agent::test_utils::{make_test_config, MockTransport};
-    use tau_agent::{ApprovalPolicy, DefaultApprovalPolicy};
+    use tau_agent::test_utils::{MockTransport, make_test_config};
+    use tau_agent::{ApprovalPolicy, DefaultPolicy};
     use tau_session::{FsStorage, SessionManager};
 
     use crate::activity::ActivityEntry;
@@ -1385,7 +1381,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
         let sessions = Arc::new(SessionManager::new(session_storage));
-        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
         let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
         let cfg = DeskConfig::new(
@@ -1462,7 +1458,12 @@ mod tests {
         assert!(desk.storage.read_card(&"a".into()).await.unwrap().is_none());
 
         // Tombstone in place.
-        let tomb = desk.storage.read_tombstone(&ext_ref).await.unwrap().unwrap();
+        let tomb = desk
+            .storage
+            .read_tombstone(&ext_ref)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(tomb.reason.as_deref(), Some("nope"));
 
         // Re-upserting blocked.
@@ -1490,10 +1491,25 @@ mod tests {
         desk.storage.upsert_card(&pr_card("a")).await.unwrap();
 
         desk.user_pin_card(&"a".into(), true).await.unwrap();
-        assert!(desk.storage.read_card(&"a".into()).await.unwrap().unwrap().pinned);
+        assert!(
+            desk.storage
+                .read_card(&"a".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
 
         desk.user_pin_card(&"a".into(), false).await.unwrap();
-        assert!(!desk.storage.read_card(&"a".into()).await.unwrap().unwrap().pinned);
+        assert!(
+            !desk
+                .storage
+                .read_card(&"a".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
 
         let stored = desk.storage.read_card(&"a".into()).await.unwrap().unwrap();
         let recent: Vec<_> = stored
@@ -1520,7 +1536,9 @@ mod tests {
         assert!(matches!(stored.body, CardBody::Note { .. }));
         assert_eq!(stored.last_modified_by, Provenance::User);
 
-        desk.user_edit_note(&id, "moved to 11am".into()).await.unwrap();
+        desk.user_edit_note(&id, "moved to 11am".into())
+            .await
+            .unwrap();
         let edited = desk.storage.read_card(&id).await.unwrap().unwrap();
         match &edited.body {
             CardBody::Note { body } => assert_eq!(body, "moved to 11am"),
@@ -1723,13 +1741,13 @@ mod tests {
         async fn execute(
             &self,
             arguments: serde_json::Value,
-            _ctx: tau_agent::tool::ExecutionContext,
-        ) -> tau_agent::tool::ToolResult {
+            _ctx: tau_agent::ExecutionContext,
+        ) -> tau_agent::ToolResult {
             self.calls.lock().push(arguments);
             if self.fail {
-                tau_agent::tool::ToolResult::error("network down")
+                tau_agent::ToolResult::error("network down")
             } else {
-                tau_agent::tool::ToolResult::text("comment posted: gh.example/c/42")
+                tau_agent::ToolResult::text("comment posted: gh.example/c/42")
             }
         }
     }
@@ -1743,7 +1761,7 @@ mod tests {
         fn id(&self) -> &str {
             "gh"
         }
-        fn tools(&self) -> Vec<tau_agent::tool::BoxedTool> {
+        fn tools(&self) -> Vec<tau_agent::BoxedTool> {
             vec![self.tool.clone()]
         }
     }
@@ -1763,7 +1781,11 @@ mod tests {
 
     /// Helper: enqueue a draft directly through storage so the
     /// approve-side tests don't have to go through the agent loop.
-    async fn enqueue_test_draft(desk: &DeskAgent, tool_name: &str, args: serde_json::Value) -> String {
+    async fn enqueue_test_draft(
+        desk: &DeskAgent,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> String {
         let draft_id = format!("draft:test-{}", Uuid::new_v4());
         let now = Utc::now();
         let by = Provenance::Agent {
@@ -1771,9 +1793,7 @@ mod tests {
         };
         let draft = crate::draft::Draft {
             id: draft_id.clone(),
-            source_id: tool_name
-                .split_once('_')
-                .map(|(p, _)| p.to_string()),
+            source_id: tool_name.split_once('_').map(|(p, _)| p.to_string()),
             tool_name: tool_name.into(),
             arguments: args,
             rationale: None,
@@ -1855,7 +1875,10 @@ mod tests {
         let mut saw = false;
         for _ in 0..10 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await {
-                Ok(Ok(DeskEvent::DraftApproved { draft_id: id, outcome })) => {
+                Ok(Ok(DeskEvent::DraftApproved {
+                    draft_id: id,
+                    outcome,
+                })) => {
                     assert_eq!(id, draft_id);
                     assert!(outcome.success);
                     saw = true;
@@ -1887,7 +1910,7 @@ mod tests {
         // The user's decision to approve is final; the failure is informational.
         let stored = desk.storage.read_draft(&draft_id).await.unwrap().unwrap();
         assert_eq!(stored.status, crate::draft::DraftStatus::Approved);
-        assert!(stored.outcome.unwrap().success == false);
+        assert!(!stored.outcome.unwrap().success);
 
         // Card still moves to Done; reason notes the failure.
         let card = desk
@@ -1907,12 +1930,7 @@ mod tests {
     #[tokio::test]
     async fn approve_draft_rejects_unknown_tool() {
         let (desk, _tmp) = make_desk().await;
-        let draft_id = enqueue_test_draft(
-            &desk,
-            "nonexistent_tool",
-            serde_json::json!({}),
-        )
-        .await;
+        let draft_id = enqueue_test_draft(&desk, "nonexistent_tool", serde_json::json!({})).await;
 
         let res = desk.approve_draft(&draft_id).await;
         assert!(matches!(res, Err(Error::UnknownTool(_))));
@@ -2007,11 +2025,17 @@ mod tests {
             .unwrap()
             .expect("card upserted");
         assert_eq!(card.pile, CardPile::NeedsYou);
-        assert_eq!(card.last_modified_by, Provenance::Agent {
-            agent_id: Some("morning_scan".into()),
-        });
+        assert_eq!(
+            card.last_modified_by,
+            Provenance::Agent {
+                agent_id: Some("morning_scan".into()),
+            }
+        );
         let take = card.agent_take.expect("take present");
-        assert_eq!(take.ask.as_deref(), Some("review — Priya is blocked on a deploy window"));
+        assert_eq!(
+            take.ask.as_deref(),
+            Some("review — Priya is blocked on a deploy window")
+        );
         assert!(take.note.as_deref().unwrap().contains("refund_test"));
 
         // History: Created → Updated (from the body re-upsert if any) → TakeUpdated.
@@ -2124,11 +2148,7 @@ mod tests {
         }
         fn handles(&self, notice: &ChangeNotice) -> bool {
             notice.source == "gh"
-                && notice
-                    .context
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    == Some("pr_merged")
+                && notice.context.get("event").and_then(|v| v.as_str()) == Some("pr_merged")
         }
         async fn apply(
             &self,
@@ -2217,7 +2237,12 @@ mod tests {
         assert_eq!(calls.lock().len(), 1);
 
         // Card moved to Done with Source provenance.
-        let card = desk.storage.read_card(&"4821".into()).await.unwrap().unwrap();
+        let card = desk
+            .storage
+            .read_card(&"4821".into())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(card.pile, CardPile::Done);
         assert_eq!(
             card.last_modified_by,
@@ -2226,7 +2251,13 @@ mod tests {
             }
         );
         let last = card.history.back().unwrap();
-        assert!(matches!(last.kind, CardEventKind::Moved { to: CardPile::Done, .. }));
+        assert!(matches!(
+            last.kind,
+            CardEventKind::Moved {
+                to: CardPile::Done,
+                ..
+            }
+        ));
         assert!(matches!(last.by, Provenance::Source { .. }));
     }
 
@@ -2274,7 +2305,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
         let sessions = Arc::new(SessionManager::new(session_storage));
-        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
         let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
         let mut cfg = DeskConfig::new(
             Arc::new(MockTransport::new()),
@@ -2426,7 +2457,7 @@ mod tests {
     ) -> Arc<DeskAgent> {
         let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
         let sessions = Arc::new(SessionManager::new(session_storage));
-        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
         let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
         let cfg = DeskConfig::new(
@@ -2527,8 +2558,7 @@ mod tests {
 
         // First desk: create chat, accumulate one turn, shutdown.
         let id_before = {
-            let transport =
-                Arc::new(MockTransport::new().with_text_response("first"));
+            let transport = Arc::new(MockTransport::new().with_text_response("first"));
             let desk = make_desk_at(&tmp, transport).await;
             desk.ask("hi".into()).await.unwrap().await.unwrap();
             let id = desk.chat_session_id().unwrap();
@@ -2607,7 +2637,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
         let sessions = Arc::new(SessionManager::new(session_storage));
-        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
         let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
         let mut cfg = DeskConfig::new(
@@ -2637,7 +2667,9 @@ mod tests {
         let task = task_plain("morning_scan", "Run", Concurrency::Skip);
         let (desk, _tmp) = make_desk_with_tasks(transport, vec![task]).await;
 
-        desk.trigger_scan(&"morning_scan".to_string()).await.unwrap();
+        desk.trigger_scan(&"morning_scan".to_string())
+            .await
+            .unwrap();
 
         let activity = desk.storage.list_activity(10).await.unwrap();
         assert_eq!(activity.len(), 1);
@@ -2646,8 +2678,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_scan_unknown_task_errors() {
-        let (desk, _tmp) =
-            make_desk_with_tasks(Arc::new(MockTransport::new()), vec![]).await;
+        let (desk, _tmp) = make_desk_with_tasks(Arc::new(MockTransport::new()), vec![]).await;
         let res = desk.trigger_scan(&"nonexistent".to_string()).await;
         assert!(res.is_err());
     }
@@ -2683,7 +2714,7 @@ mod tests {
             fn id(&self) -> &str {
                 "gh"
             }
-            fn tools(&self) -> Vec<tau_agent::tool::BoxedTool> {
+            fn tools(&self) -> Vec<tau_agent::BoxedTool> {
                 vec![]
             }
             fn watch(&self) -> Option<broadcast::Receiver<ChangeNotice>> {
@@ -2712,7 +2743,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
         let sessions = Arc::new(SessionManager::new(session_storage));
-        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+        let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
         let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
         let mut cfg = DeskConfig::new(
@@ -2724,7 +2755,9 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         cfg.sources
-            .register(Arc::new(WatchOnly { tx: source_tx.clone() }))
+            .register(Arc::new(WatchOnly {
+                tx: source_tx.clone(),
+            }))
             .unwrap();
         cfg.tasks = vec![task];
         let desk = Arc::new(DeskAgent::new(cfg).await.unwrap());
@@ -2764,8 +2797,7 @@ mod tests {
             prompt: PromptSpec::Plain("tick".into()),
             enabled: true,
         };
-        let (desk, _tmp) =
-            make_desk_with_tasks(Arc::new(MockTransport::new()), vec![task]).await;
+        let (desk, _tmp) = make_desk_with_tasks(Arc::new(MockTransport::new()), vec![task]).await;
 
         desk.start().await.unwrap();
         assert_eq!(desk.loop_handles.lock().len(), 1);
@@ -2789,8 +2821,7 @@ mod tests {
             prompt: PromptSpec::Plain("x".into()),
             enabled: true,
         };
-        let (desk, _tmp) =
-            make_desk_with_tasks(Arc::new(MockTransport::new()), vec![task]).await;
+        let (desk, _tmp) = make_desk_with_tasks(Arc::new(MockTransport::new()), vec![task]).await;
 
         let res = desk.start().await;
         assert!(res.is_err(), "invalid cron should error");
@@ -2801,8 +2832,7 @@ mod tests {
         // Test that cancel_task triggers the cancel token. We don't run
         // a real agent here — manually insert a token, call cancel, and
         // verify it fired.
-        let (desk, _tmp) =
-            make_desk_with_tasks(Arc::new(MockTransport::new()), vec![]).await;
+        let (desk, _tmp) = make_desk_with_tasks(Arc::new(MockTransport::new()), vec![]).await;
 
         let token = tokio_util::sync::CancellationToken::new();
         desk.in_flight
@@ -2816,8 +2846,7 @@ mod tests {
 
     #[tokio::test]
     async fn hydrate_prompt_substitutes_state() {
-        let (desk, _tmp) =
-            make_desk_with_tasks(Arc::new(MockTransport::new()), vec![]).await;
+        let (desk, _tmp) = make_desk_with_tasks(Arc::new(MockTransport::new()), vec![]).await;
 
         // Seed some state.
         desk.user_create_note("Don't ping David before 10".into(), CardPile::Watching)
@@ -2905,4 +2934,3 @@ mod tests {
         assert!(saw_completed, "missing ScanCompleted");
     }
 }
-

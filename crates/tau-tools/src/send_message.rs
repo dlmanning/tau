@@ -6,8 +6,8 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::manager::{AgentManager, AgentStatus};
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{AgentManager, AgentStatus};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
 struct SendMessageArgs {
@@ -55,9 +55,7 @@ impl Tool for SendMessageTool {
         let manager = match self.manager.upgrade() {
             Some(m) => m,
             None => {
-                return ToolResult::error(
-                    "SendMessageTool: parent AgentManager has been dropped",
-                );
+                return ToolResult::error("SendMessageTool: parent AgentManager has been dropped");
             }
         };
 
@@ -69,7 +67,7 @@ impl Tool for SendMessageTool {
         let to = &args.to;
         let message = &args.message;
 
-        let (agent_id, description, status) = match manager.find_agent(to).await {
+        let located = match manager.find_agent(to) {
             Some(found) => found,
             None => {
                 return ToolResult::error(format!(
@@ -78,6 +76,9 @@ impl Tool for SendMessageTool {
                 ));
             }
         };
+        let agent_id = located.agent_id;
+        let description = located.description;
+        let status = located.status;
 
         // Wrap message with sender attribution so the receiving agent
         // knows this came from another agent, not the user.
@@ -93,18 +94,20 @@ impl Tool for SendMessageTool {
                     description, agent_id
                 ))
             }
-            AgentStatus::Idle => match manager.send(&agent_id, &wrapped, ctx.cancel).await {
-                Ok(result) => ToolResult::text(format!(
-                    "{}\n[Agent {} resumed | {} in + {} out tokens | {} tool calls | {}ms]",
-                    result.text,
-                    result.agent_id,
-                    result.input_tokens,
-                    result.output_tokens,
-                    result.tool_use_count,
-                    result.duration_ms,
-                )),
-                Err(e) => ToolResult::error(format!("Failed to resume agent: {}", e)),
-            },
+            AgentStatus::Idle | AgentStatus::Adopted => {
+                match manager.send(&agent_id, &wrapped, ctx.cancel).await {
+                    Ok(result) => ToolResult::text(format!(
+                        "{}\n[Agent {} resumed | {} in + {} out tokens | {} tool calls | {}ms]",
+                        result.text,
+                        result.agent_id,
+                        result.input_tokens,
+                        result.output_tokens,
+                        result.tool_use_count,
+                        result.duration_ms,
+                    )),
+                    Err(e) => ToolResult::error(format!("Failed to resume agent: {}", e)),
+                }
+            }
         }
     }
 }

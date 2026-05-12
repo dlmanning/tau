@@ -1,6 +1,23 @@
-//! CLI argument parsing and model resolution
+//! CLI argument parsing and model resolution.
+//!
+//! Subcommand structure:
+//!
+//! ```text
+//! tau                       # interactive (TUI) — default
+//! tau run <prompt>          # one-shot non-interactive
+//! tau auth login <provider>
+//! tau auth logout <provider>
+//! tau auth status
+//! tau sessions ls
+//! tau sessions resume <id>
+//! tau config init
+//! ```
+//!
+//! Common runtime flags (`--model`, `--provider`, `--reasoning`,
+//! `--working-dir`, `--no-tui`, `--verbose`) sit on the top level and
+//! apply to the implicit-default and `run` commands.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tau_ai::{CostInfo, InputType, Model, Provider, ReasoningLevel};
 
 /// tau - AI-powered coding agent
@@ -9,60 +26,86 @@ use tau_ai::{CostInfo, InputType, Model, Provider, ReasoningLevel};
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Args {
     /// Model to use (default: claude-sonnet-4-5-20250929)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub model: Option<String>,
 
     /// Provider (anthropic, openai, google)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub provider: Option<String>,
 
     /// Enable reasoning/thinking mode
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub reasoning: bool,
 
     /// Reasoning level (off, minimal, low, medium, high)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub reasoning_level: Option<String>,
 
-    /// Run in non-interactive mode with a single prompt
-    #[arg(short = 'c', long)]
-    pub command: Option<String>,
-
     /// Working directory
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub working_dir: Option<String>,
 
     /// Verbose output
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub verbose: bool,
 
     /// Disable TUI mode (use simple stdin/stdout)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_tui: bool,
 
-    /// Resume a previous session by ID
-    #[arg(long)]
-    pub resume: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
 
-    /// List saved sessions
-    #[arg(long)]
-    pub sessions: bool,
+#[derive(Subcommand, Debug)]
+pub(crate) enum Command {
+    /// Run a single prompt non-interactively and exit.
+    Run {
+        /// The prompt to send to the agent.
+        prompt: String,
+    },
+    /// OAuth login / logout / status.
+    #[command(subcommand)]
+    Auth(AuthCmd),
+    /// List or resume saved sessions.
+    #[command(subcommand)]
+    Sessions(SessionsCmd),
+    /// Manage the configuration file.
+    #[command(subcommand)]
+    Config(ConfigCmd),
+}
 
-    /// Initialize config file
-    #[arg(long)]
-    pub init_config: bool,
+#[derive(Subcommand, Debug)]
+pub(crate) enum AuthCmd {
+    /// Log in to an OAuth provider (currently: anthropic).
+    Login {
+        /// Provider id (e.g. `anthropic`).
+        provider: String,
+    },
+    /// Log out from an OAuth provider.
+    Logout {
+        /// Provider id (e.g. `anthropic`).
+        provider: String,
+    },
+    /// Show login status across all known providers.
+    Status,
+}
 
-    /// Login to an OAuth provider (anthropic)
-    #[arg(long)]
-    pub login: Option<String>,
+#[derive(Subcommand, Debug)]
+pub(crate) enum SessionsCmd {
+    /// List saved sessions.
+    Ls,
+    /// Resume a saved session by id.
+    Resume {
+        /// The session id (or short prefix).
+        id: String,
+    },
+}
 
-    /// Logout from an OAuth provider (anthropic)
-    #[arg(long)]
-    pub logout: Option<String>,
-
-    /// List OAuth login status
-    #[arg(long)]
-    pub auth_status: bool,
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConfigCmd {
+    /// Create a default config file if one doesn't exist.
+    Init,
 }
 
 pub(crate) fn parse_reasoning_level(s: &str) -> anyhow::Result<ReasoningLevel> {

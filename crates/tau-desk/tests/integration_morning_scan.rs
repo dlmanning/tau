@@ -20,8 +20,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tau_agent::test_utils::{MockTransport, make_test_config};
-use tau_agent::tool::{BoxedTool, ExecutionContext, Tool, ToolResult};
-use tau_agent::{ApprovalPolicy, DefaultApprovalPolicy};
+use tau_agent::{ApprovalPolicy, DefaultPolicy};
+use tau_agent::{BoxedTool, ExecutionContext, Tool, ToolResult};
 use tau_desk::{
     CardBody, CardFilter, CardPile, DeskAgent, DeskConfig, DeskStorage, DraftStatus,
     MemDeskStorage, Provenance, Source,
@@ -251,7 +251,7 @@ async fn morning_scan_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
     let sessions = Arc::new(SessionManager::new(session_storage));
-    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
     let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
     let mut cfg = DeskConfig::new(
@@ -318,7 +318,10 @@ async fn morning_scan_end_to_end() {
     assert!(att.summary.contains("token bucket"));
 
     // One draft, both as a draft row and as a card in the Drafts pile.
-    let drafts = storage.list_drafts(Some(DraftStatus::Pending)).await.unwrap();
+    let drafts = storage
+        .list_drafts(Some(DraftStatus::Pending))
+        .await
+        .unwrap();
     assert_eq!(drafts.len(), 1);
     let d = &drafts[0];
     assert_eq!(d.tool_name, "gh_post_pr_comment");

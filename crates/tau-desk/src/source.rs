@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use tau_agent::tool::BoxedTool;
+use tau_agent::BoxedTool;
 
 use crate::Result;
 

@@ -1,6 +1,6 @@
 //! Top-level session manager for `tau-agent`.
 //!
-//! Where `tau_agent::manager::AgentManager` runs *subagents* under one root
+//! Where `tau_agent::AgentManager` runs *subagents* under one root
 //! agent, this crate manages the *roots* themselves: multiple long-lived
 //! conversations across restarts, each with its own metadata, persistence,
 //! and lifecycle (Idle/Running/Hibernated/Closed).
@@ -29,9 +29,7 @@ pub mod snapshot;
 pub mod storage;
 
 pub use info::{ProjectInfo, SessionId, SessionInfo, SessionStatus};
-pub use manager::{
-    ActiveSession, NewSessionRequest, SessionManager, SessionManagerEvent,
-};
+pub use manager::{ActiveSession, NewSessionRequest, SessionManager, SessionManagerEvent};
 pub use snapshot::SessionSnapshot;
 pub use storage::{FsStorage, SessionStorage};
 

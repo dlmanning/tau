@@ -6,7 +6,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 use crate::card::{AgentTake, CardBody, CardData, CardPile};
 use crate::error::Error;
@@ -133,14 +133,8 @@ impl Tool for UpsertCardTool {
             .get("agent_take")
             .filter(|v| !v.is_null())
             .and_then(|v| {
-                let ask = v
-                    .get("ask")
-                    .and_then(|x| x.as_str())
-                    .map(String::from);
-                let note = v
-                    .get("note")
-                    .and_then(|x| x.as_str())
-                    .map(String::from);
+                let ask = v.get("ask").and_then(|x| x.as_str()).map(String::from);
+                let note = v.get("note").and_then(|x| x.as_str()).map(String::from);
                 if ask.is_none() && note.is_none() {
                     None
                 } else {
@@ -233,9 +227,7 @@ impl Tool for UpsertCardTool {
             }) => ToolResult::error(format!(
                 "external_ref `{external_ref}` is tombstoned (dismissed at \
                  {dismissed_at}{}); fall back to `add_activity`",
-                reason
-                    .map(|r| format!(": {r}"))
-                    .unwrap_or_default()
+                reason.map(|r| format!(": {r}")).unwrap_or_default()
             )),
             Err(e) => ToolResult::error(format!("upsert failed: {e}")),
         }

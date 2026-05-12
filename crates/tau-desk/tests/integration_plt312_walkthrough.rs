@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tau_agent::test_utils::{MockTransport, make_test_config};
-use tau_agent::tool::{BoxedTool, ExecutionContext, Tool, ToolResult};
-use tau_agent::{ApprovalPolicy, DefaultApprovalPolicy};
+use tau_agent::{ApprovalPolicy, DefaultPolicy};
+use tau_agent::{BoxedTool, ExecutionContext, Tool, ToolResult};
 use tau_desk::{
     ActivityKind, CardFilter, CardPile, DeskAgent, DeskConfig, DeskStorage, MemDeskStorage,
     Provenance, Source,
@@ -204,7 +204,11 @@ async fn plt312_full_lifecycle() {
             // ===== Scan 1: Birth + cross-source synthesis =====
             .with_tool_call_response("jira_list_assigned", "s1.t1", json!({}))
             .with_tool_call_response("slack_list_mentions", "s1.t2", json!({}))
-            .with_tool_call_response("desk_upsert_card", "s1.t3", upsert_args("needs_you", "Needs decision"))
+            .with_tool_call_response(
+                "desk_upsert_card",
+                "s1.t3",
+                upsert_args("needs_you", "Needs decision"),
+            )
             .with_tool_call_response(
                 "desk_attach_to_card",
                 "s1.t4",
@@ -285,7 +289,7 @@ async fn plt312_full_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
     let sessions = Arc::new(SessionManager::new(session_storage));
-    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
     let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
     let mut cfg = DeskConfig::new(
@@ -300,7 +304,9 @@ async fn plt312_full_lifecycle() {
         .register(Arc::new(MockJiraSource { data: jira.clone() }))
         .unwrap();
     cfg.sources
-        .register(Arc::new(MockSlackSource { data: slack.clone() }))
+        .register(Arc::new(MockSlackSource {
+            data: slack.clone(),
+        }))
         .unwrap();
 
     let desk = DeskAgent::new(cfg).await.unwrap();
@@ -332,7 +338,11 @@ async fn plt312_full_lifecycle() {
         .await
         .unwrap();
 
-    let card = storage.read_card(&PLT_ID.to_string()).await.unwrap().unwrap();
+    let card = storage
+        .read_card(&PLT_ID.to_string())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(card.pile, CardPile::Watching);
     assert_eq!(card.last_modified_by, Provenance::User);
 
@@ -341,7 +351,11 @@ async fn plt312_full_lifecycle() {
         .await
         .unwrap();
 
-    let card = storage.read_card(&PLT_ID.to_string()).await.unwrap().unwrap();
+    let card = storage
+        .read_card(&PLT_ID.to_string())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(card.pile, CardPile::Watching, "agent did not re-pile");
     let take = card.agent_take.as_ref().expect("scan 2: take present");
     assert!(take.note.as_deref().unwrap().contains("unchanged"));
@@ -354,7 +368,11 @@ async fn plt312_full_lifecycle() {
         .await
         .unwrap();
 
-    let card = storage.read_card(&PLT_ID.to_string()).await.unwrap().unwrap();
+    let card = storage
+        .read_card(&PLT_ID.to_string())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(card.pile, CardPile::NeedsYou, "agent moved it back");
     assert_eq!(
         card.last_modified_by,
@@ -371,7 +389,11 @@ async fn plt312_full_lifecycle() {
         .await
         .unwrap();
 
-    let card = storage.read_card(&PLT_ID.to_string()).await.unwrap().unwrap();
+    let card = storage
+        .read_card(&PLT_ID.to_string())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(card.pile, CardPile::Done);
     assert_eq!(
         card.last_modified_reason.as_deref(),
@@ -384,7 +406,11 @@ async fn plt312_full_lifecycle() {
         .await
         .unwrap();
 
-    let card = storage.read_card(&PLT_ID.to_string()).await.unwrap().unwrap();
+    let card = storage
+        .read_card(&PLT_ID.to_string())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(card.pile, CardPile::NeedsYou, "retire is soft; restored");
     assert_eq!(
         card.attachments.len(),
@@ -398,7 +424,11 @@ async fn plt312_full_lifecycle() {
         .unwrap();
 
     assert!(
-        storage.read_card(&PLT_ID.to_string()).await.unwrap().is_none(),
+        storage
+            .read_card(&PLT_ID.to_string())
+            .await
+            .unwrap()
+            .is_none(),
         "dismissal removes card"
     );
     assert!(
@@ -412,7 +442,13 @@ async fn plt312_full_lifecycle() {
         .unwrap();
 
     // Card stays absent — tombstone blocked the upsert.
-    assert!(storage.read_card(&PLT_ID.to_string()).await.unwrap().is_none());
+    assert!(
+        storage
+            .read_card(&PLT_ID.to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // The agent's fallback `add_activity` produced a TombstoneHit entry.
     let activity = storage.list_activity(20).await.unwrap();
@@ -461,7 +497,7 @@ async fn draft_rejection_flow() {
     let tmp = tempfile::tempdir().unwrap();
     let session_storage = Arc::new(FsStorage::new(tmp.path().to_path_buf()));
     let sessions = Arc::new(SessionManager::new(session_storage));
-    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy);
+    let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultPolicy);
     let storage: Arc<dyn DeskStorage> = Arc::new(MemDeskStorage::new());
 
     let cfg = DeskConfig::new(
@@ -498,7 +534,10 @@ async fn draft_rejection_flow() {
     let mut saw = false;
     for _ in 0..20 {
         match tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await {
-            Ok(Ok(tau_desk::DeskEvent::DraftRejected { draft_id: id, reason })) => {
+            Ok(Ok(tau_desk::DeskEvent::DraftRejected {
+                draft_id: id,
+                reason,
+            })) => {
                 assert_eq!(id, draft_id);
                 assert_eq!(reason.as_deref(), Some("not yet"));
                 saw = true;

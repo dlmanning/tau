@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 tau-ai = { workspace = true }
 tau-agent = { workspace = true }
-tau-tools = { workspace = true }
+tau-tools = { workspace = true, features = ["lsp"] }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -41,7 +41,6 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-util = "0.7"
-lsp-types = "0.97"
 reqwest = { workspace = true }
 sha2 = "0.11"
 base64 = "0.22"
@@ -52,3 +51,6 @@ url = { workspace = true }
 unicode-width = "0.2"
 textwrap = "0.16"
 pulldown-cmark = { version = "0.13.3", default-features = false }
+
+[dev-dependencies]
+tau-agent = { workspace = true, features = ["test-utils"] }

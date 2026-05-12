@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
-use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
@@ -22,7 +22,9 @@ async fn follow_up_processed_after_prompt() {
     let h2 = handle.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        h2.follow_up(Message::user("background result")).await.unwrap();
+        h2.follow_up(Message::user("background result"))
+            .await
+            .unwrap();
         h2.consume_follow_up();
     });
 

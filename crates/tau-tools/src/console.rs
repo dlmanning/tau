@@ -9,8 +9,8 @@
 //! ANSI escape codes in the input are inspected for color hints but kept in
 //! the line content so terminal hosts pass them through.
 
-use tau_agent::events::{ConsoleLevel, ConsoleLine};
-use tau_agent::tool::ProgressSender;
+use tau_agent::ProgressSender;
+use tau_agent::{ConsoleLevel, ConsoleLine};
 
 /// Classify a single line. Examines ANSI color codes first (they're a
 /// strong producer signal), then prefix patterns common to cargo / sh / Rust
@@ -82,9 +82,7 @@ fn classify_by_prefix(line: &str) -> ConsoleLevel {
         return ConsoleLevel::Success;
     }
 
-    if starts_with_ci(bare, "warning:")
-        || bare.starts_with("Running ")
-        || bare.starts_with("WARN ")
+    if starts_with_ci(bare, "warning:") || bare.starts_with("Running ") || bare.starts_with("WARN ")
     {
         return ConsoleLevel::Warning;
     }
@@ -156,10 +154,7 @@ mod tests {
     #[test]
     fn cargo_test_lines_classify() {
         assert_eq!(classify_line("Running 3 tests"), ConsoleLevel::Warning);
-        assert_eq!(
-            classify_line("test foo::bar ... ok"),
-            ConsoleLevel::Success
-        );
+        assert_eq!(classify_line("test foo::bar ... ok"), ConsoleLevel::Success);
         assert_eq!(
             classify_line("test result: ok. 3 passed; 0 failed"),
             ConsoleLevel::Success

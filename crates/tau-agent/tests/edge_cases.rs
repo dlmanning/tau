@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
-use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
@@ -128,7 +128,10 @@ async fn follow_up_during_tool_execution() {
     let rx = handle.prompt("go").await.unwrap();
 
     // Immediately post a follow-up (it will arrive while tools execute or during DrainFollowUps)
-    handle.follow_up(Message::user("follow-up message")).await.unwrap();
+    handle
+        .follow_up(Message::user("follow-up message"))
+        .await
+        .unwrap();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
     assert!(result.is_ok());

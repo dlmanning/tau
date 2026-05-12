@@ -1,18 +1,14 @@
 //! /model command - list and switch models
 
+use async_trait::async_trait;
 use tau_ai::Model;
 
-use super::{Command, CommandContext, CommandResult};
+use super::Command;
+use crate::driver::{Frontend, Session};
 
 pub struct ModelCommand;
 
-impl ModelCommand {
-    /// List models as text (for CLI mode)
-    pub fn list_models_text(current_model: &Model, available_models: &[Model]) -> String {
-        list_models(current_model, available_models)
-    }
-}
-
+#[async_trait]
 impl Command for ModelCommand {
     fn name(&self) -> &str {
         "model"
@@ -23,16 +19,25 @@ impl Command for ModelCommand {
     fn description(&self) -> &str {
         "List models or switch model (/model <name>)"
     }
-    fn execute(&self, ctx: &CommandContext) -> CommandResult {
-        if ctx.args.is_empty() {
-            CommandResult::OpenModelSelector
-        } else {
-            match find_model(ctx.args, ctx.available_models) {
-                Some(model) => CommandResult::ChangeModel(model),
-                None => CommandResult::Message(format!(
-                    "No model found matching '{}'\nUse /model to list available models",
-                    ctx.args
-                )),
+    async fn execute(&self, args: &str, session: &mut Session, frontend: &mut dyn Frontend) {
+        let Some(config) = session.current_config().await else {
+            frontend.show_error("Agent shut down.").await;
+            return;
+        };
+        if args.is_empty() {
+            let text = list_models(&config.model, session.available_models());
+            frontend.show_system(&text).await;
+            return;
+        }
+        match find_model(args, session.available_models()) {
+            Some(model) => session.change_model(model, frontend).await,
+            None => {
+                frontend
+                    .show_system(&format!(
+                        "No model found matching '{}'\nUse /model to list available models",
+                        args
+                    ))
+                    .await;
             }
         }
     }

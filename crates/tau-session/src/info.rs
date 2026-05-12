@@ -92,7 +92,12 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
-    pub fn new(id: SessionId, title: String, project: ProjectInfo, original_request: String) -> Self {
+    pub fn new(
+        id: SessionId,
+        title: String,
+        project: ProjectInfo,
+        original_request: String,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id,

@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 use crate::card::AgentTake;
 use crate::error::Error;
@@ -105,7 +105,9 @@ impl Tool for UpdateTakeTool {
 
         match result {
             Ok(_) => {
-                let _ = self.events.send(DeskEvent::CardTakeUpdated { id: id.clone() });
+                let _ = self
+                    .events
+                    .send(DeskEvent::CardTakeUpdated { id: id.clone() });
                 ToolResult::text(format!("updated take on `{id}`"))
             }
             Err(Error::NotFound(_)) => ToolResult::error(format!("card `{id}` not found")),

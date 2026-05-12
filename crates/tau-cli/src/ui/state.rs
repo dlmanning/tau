@@ -10,7 +10,7 @@ use super::{
 };
 use tokio::sync::mpsc;
 
-use super::types::{GitBranchState, PendingInteraction, UiMessage};
+use super::types::{GitBranchState, PendingInteraction, PendingPlan, UiMessage};
 
 /// Token and cost accounting for the session.
 #[derive(Default)]
@@ -101,6 +101,8 @@ pub(super) struct TuiState {
     pub branch_selector: SelectorState,
     /// Pending interaction request (question waiting for user to pick an option)
     pub pending_interaction: Option<PendingInteraction>,
+    /// Pending plan submission awaiting Approve / Execute now / Reject.
+    pub pending_plan: Option<PendingPlan>,
 }
 
 impl TuiState {
@@ -142,10 +144,14 @@ impl TuiState {
             model_selector,
             branch_selector: SelectorState::default(),
             pending_interaction: None,
+            pending_plan: None,
         }
     }
 
-    /// Open the branch selector popup.
+    /// Open the branch selector popup. Invoked by the TUI frontend's
+    /// `Frontend::open_branch_selector` impl when the user runs bare
+    /// `/branch`. Selection navigates with Up/Down and emits
+    /// `UiMessage::Branch(Some(idx))` on Enter.
     pub fn open_branch_selector(&mut self) {
         if !self.messages.is_empty() {
             self.branch_selector.selected = self.messages.len().saturating_sub(1);
@@ -171,6 +177,9 @@ impl TuiState {
     }
 
     /// Sync model/reasoning from agent config (call before rendering).
+    /// Sync mutable agent config (model, reasoning level, thinking
+    /// mode) into the display. Called by the TUI frontend's
+    /// `Frontend::on_config_change` impl after `/model` / `/thinking`.
     pub fn sync_from_config(&mut self, config: &AgentConfig) {
         self.model = config.model.clone();
         self.reasoning = config.reasoning;

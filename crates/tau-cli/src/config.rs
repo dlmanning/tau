@@ -4,6 +4,8 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use tau_agent::{AgentConfig, CompactionConfig, DequeueMode};
+use tau_ai::{Model, ReasoningLevel};
 
 /// Configuration for tau
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,6 +204,33 @@ impl Config {
         };
 
         std::env::var(env_var).ok()
+    }
+
+    /// Build the runtime [`AgentConfig`] from this config plus CLI-supplied
+    /// `model` and `reasoning` (which override any config values).
+    pub fn to_agent_config(&self, model: Model, reasoning: ReasoningLevel) -> AgentConfig {
+        let compaction = match self.compaction.as_ref() {
+            Some(c) => CompactionConfig {
+                enabled: c.enabled.unwrap_or(true),
+                reserve_tokens: c.reserve_tokens.unwrap_or(16384),
+                keep_recent_tokens: c.keep_recent_tokens.unwrap_or(20000),
+            },
+            None => CompactionConfig::default(),
+        };
+        AgentConfig {
+            system_prompt: None,
+            model,
+            reasoning,
+            thinking_adaptive: self.thinking_adaptive.unwrap_or(false),
+            max_tokens: None,
+            max_turns: Some(200),
+            compaction,
+            steering_mode: DequeueMode::All,
+            follow_up_mode: DequeueMode::All,
+            cache_scope: self.cache.as_ref().and_then(|c| c.scope.clone()),
+            cache_ttl: self.cache.as_ref().and_then(|c| c.ttl.clone()),
+            system_prompt_boundary: self.cache.as_ref().and_then(|c| c.prompt_boundary.clone()),
+        }
     }
 
     /// Get API key for a provider, checking OAuth first, then config, then env

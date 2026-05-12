@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 /// Maximum file size to search (10 MB) — skip larger files to avoid OOM
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;

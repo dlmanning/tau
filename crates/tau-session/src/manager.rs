@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
-use tau_agent::config::AgentConfig;
-use tau_agent::events::AgentEvent;
-use tau_agent::handle::AgentHandle;
-use tau_agent::tool::BoxedTool;
-use tau_agent::transport::Transport;
+use tau_agent::AgentConfig;
+use tau_agent::AgentEvent;
+use tau_agent::AgentHandle;
+use tau_agent::BoxedTool;
+use tau_agent::Transport;
 use tau_ai::Message;
 use tokio::sync::{Mutex, broadcast};
 
@@ -36,8 +36,7 @@ use crate::{Error, Result};
 /// `spawn()`. Use this to wire builder methods the request struct
 /// doesn't expose directly: interaction sender, approval policy,
 /// transform context, etc.
-pub type CustomizeBuilder =
-    Box<dyn FnOnce(&mut tau_agent::builder::AgentBuilder) + Send>;
+pub type CustomizeBuilder = Box<dyn FnOnce(&mut tau_agent::AgentBuilder) + Send>;
 
 /// Request to create a fresh session.
 pub struct NewSessionRequest {
@@ -78,12 +77,26 @@ pub struct ActiveSession {
 /// Lifecycle events broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub enum SessionManagerEvent {
-    Created { id: SessionId, info: Box<SessionInfo> },
-    Activated { id: SessionId },
-    Hibernated { id: SessionId },
-    Closed { id: SessionId },
-    Deleted { id: SessionId },
-    InfoUpdated { id: SessionId, info: Box<SessionInfo> },
+    Created {
+        id: SessionId,
+        info: Box<SessionInfo>,
+    },
+    Activated {
+        id: SessionId,
+    },
+    Hibernated {
+        id: SessionId,
+    },
+    Closed {
+        id: SessionId,
+    },
+    Deleted {
+        id: SessionId,
+    },
+    InfoUpdated {
+        id: SessionId,
+        info: Box<SessionInfo>,
+    },
 }
 
 /// In-memory active session record.
@@ -143,8 +156,7 @@ impl SessionManager {
         self.storage.write_info(&info).await?;
 
         // Build the agent.
-        let mut builder =
-            tau_agent::builder::AgentBuilder::new(req.config, req.transport);
+        let mut builder = tau_agent::AgentBuilder::new(req.config, req.transport);
         builder.set_cwd(&req.project_path);
         for tool in &req.tools {
             builder.add_tool(tool.clone());
@@ -257,7 +269,7 @@ impl SessionManager {
             schema_version: crate::snapshot::CURRENT_SCHEMA_VERSION,
         };
 
-        let mut builder = tau_agent::builder::AgentBuilder::new(config, transport);
+        let mut builder = tau_agent::AgentBuilder::new(config, transport);
         builder.set_cwd(&snapshot.info.project.path);
         for tool in &tools {
             builder.add_tool(tool.clone());
@@ -295,7 +307,9 @@ impl SessionManager {
             },
         );
 
-        let _ = self.events_tx.send(SessionManagerEvent::Activated { id: id.clone() });
+        let _ = self
+            .events_tx
+            .send(SessionManagerEvent::Activated { id: id.clone() });
 
         Ok(ActiveSession {
             id: id.clone(),
@@ -342,7 +356,9 @@ impl SessionManager {
         };
         self.storage.write_snapshot(&snapshot).await?;
         self.storage.write_info(&info).await?;
-        let _ = self.events_tx.send(SessionManagerEvent::Hibernated { id: id.clone() });
+        let _ = self
+            .events_tx
+            .send(SessionManagerEvent::Hibernated { id: id.clone() });
         Ok(())
     }
 
@@ -356,7 +372,9 @@ impl SessionManager {
         info.status = SessionStatus::Closed;
         info.last_activity = Utc::now();
         self.storage.write_info(&info).await?;
-        let _ = self.events_tx.send(SessionManagerEvent::Closed { id: id.clone() });
+        let _ = self
+            .events_tx
+            .send(SessionManagerEvent::Closed { id: id.clone() });
         Ok(())
     }
 
@@ -366,7 +384,9 @@ impl SessionManager {
             return Err(Error::Running(id.clone()));
         }
         self.storage.delete(id).await?;
-        let _ = self.events_tx.send(SessionManagerEvent::Deleted { id: id.clone() });
+        let _ = self
+            .events_tx
+            .send(SessionManagerEvent::Deleted { id: id.clone() });
         Ok(())
     }
 
@@ -493,7 +513,10 @@ async fn rewrite_messages(
 /// Default title from a prompt: first ~60 chars of the first non-empty
 /// line, with trailing whitespace trimmed.
 fn derive_title(prompt: &str) -> String {
-    let first = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("untitled");
+    let first = prompt
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("untitled");
     let mut t: String = first.chars().take(60).collect();
     if first.chars().count() > 60 {
         t.push('…');

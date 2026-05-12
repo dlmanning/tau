@@ -4,13 +4,12 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tau_agent::approval::{
-    ApprovalDecision, ApprovalPolicy, AutoAcceptAllPolicy, DefaultApprovalPolicy, ToolApprovalOutcome,
-    ToolRisk,
+use tau_agent::core::approval::{
+    ApprovalDecision, ApprovalPolicy, AutoAcceptAll, DefaultPolicy, ToolApprovalOutcome, ToolRisk,
 };
-use tau_agent::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
+use tau_agent::core::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
+use tau_agent::core::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tau_agent::test_utils::*;
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
@@ -74,8 +73,8 @@ async fn auto_accept_policy_dispatches_elevated_without_gating() {
 
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
-    builder.set_approval_policy(Arc::new(AutoAcceptAllPolicy));
-    let handle = builder.pre_handle();
+    builder.set_approval_policy(Arc::new(AutoAcceptAll));
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
@@ -146,7 +145,7 @@ async fn default_policy_elevated_without_interaction_channel_rejects() {
 
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
-    let handle = builder.pre_handle();
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
@@ -155,21 +154,25 @@ async fn default_policy_elevated_without_interaction_channel_rejects() {
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0, "tool must not run");
 
-    let rejected_with_reason = collector.events().into_iter().any(|e| matches!(
-        e,
-        AgentEvent::ToolApprovalResolved {
-            outcome: ToolApprovalOutcome::Rejected { reason },
-            ..
-        } if reason.contains("no interaction channel")
-    ));
+    let rejected_with_reason = collector.events().into_iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::ToolApprovalResolved {
+                outcome: ToolApprovalOutcome::Rejected { reason },
+                ..
+            } if reason.contains("no interaction channel")
+        )
+    });
     assert!(rejected_with_reason);
 
     let msgs = handle.messages().await.unwrap();
-    let synth_error = msgs.iter().any(|m| matches!(
-        m,
-        Message::ToolResult { is_error: true, content, .. }
-            if content.iter().any(|c| c.as_text().is_some_and(|t| t.contains("rejected")))
-    ));
+    let synth_error = msgs.iter().any(|m| {
+        matches!(
+            m,
+            Message::ToolResult { is_error: true, content, .. }
+                if content.iter().any(|c| c.as_text().is_some_and(|t| t.contains("rejected")))
+        )
+    });
     assert!(synth_error, "model should see a synth error tool result");
 }
 
@@ -186,13 +189,14 @@ async fn elevated_with_user_approval_dispatches() {
         .with_text_response("done");
 
     let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(8);
-    let _handler =
-        handle_confirm_with(interaction_rx, || InteractionResponse::Approved { payload: None });
+    let _handler = handle_confirm_with(interaction_rx, || InteractionResponse::Approved {
+        payload: None,
+    });
 
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
     builder.set_interaction_sender(interaction_tx);
-    let handle = builder.pre_handle();
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
@@ -233,7 +237,7 @@ async fn elevated_with_user_rejection_synth_errors() {
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
     builder.set_interaction_sender(interaction_tx);
-    let handle = builder.pre_handle();
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
@@ -242,21 +246,25 @@ async fn elevated_with_user_rejection_synth_errors() {
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0, "must not run");
 
-    let rejected = collector.events().into_iter().any(|e| matches!(
-        e,
-        AgentEvent::ToolApprovalResolved {
-            outcome: ToolApprovalOutcome::Rejected { reason },
-            ..
-        } if reason == "user said no"
-    ));
+    let rejected = collector.events().into_iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::ToolApprovalResolved {
+                outcome: ToolApprovalOutcome::Rejected { reason },
+                ..
+            } if reason == "user said no"
+        )
+    });
     assert!(rejected);
 
     let msgs = handle.messages().await.unwrap();
-    let synth_error = msgs.iter().any(|m| matches!(
-        m,
-        Message::ToolResult { is_error: true, content, .. }
-            if content.iter().any(|c| c.as_text().is_some_and(|t| t.contains("user said no")))
-    ));
+    let synth_error = msgs.iter().any(|m| {
+        matches!(
+            m,
+            Message::ToolResult { is_error: true, content, .. }
+                if content.iter().any(|c| c.as_text().is_some_and(|t| t.contains("user said no")))
+        )
+    });
     assert!(synth_error);
 }
 
@@ -271,9 +279,9 @@ async fn mixed_approval_preserves_tool_call_order() {
         async fn run(
             &self,
             _: Vec<Message>,
-            _: &tau_agent::transport::AgentRunConfig,
+            _: &tau_agent::core::transport::AgentRunConfig,
             _: tokio_util::sync::CancellationToken,
-        ) -> tau_ai::Result<tau_agent::transport::AgentEventStream> {
+        ) -> tau_ai::Result<tau_agent::core::transport::AgentEventStream> {
             let prev = self
                 .0
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -318,8 +326,7 @@ async fn mixed_approval_preserves_tool_call_order() {
     });
 
     // Per-call response: Approve "call_a", Reject "call_b".
-    let (interaction_tx, mut interaction_rx) =
-        tokio::sync::mpsc::channel::<InteractionRequest>(8);
+    let (interaction_tx, mut interaction_rx) = tokio::sync::mpsc::channel::<InteractionRequest>(8);
     let _handler = tokio::spawn(async move {
         while let Some(req) = interaction_rx.recv().await {
             let id = match &req.kind {
@@ -346,7 +353,7 @@ async fn mixed_approval_preserves_tool_call_order() {
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(tool);
     builder.set_interaction_sender(interaction_tx);
-    let handle = builder.pre_handle();
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
@@ -366,10 +373,12 @@ async fn mixed_approval_preserves_tool_call_order() {
     assert_eq!(ids, vec!["call_a", "call_b"], "results in original order");
 
     // call_b should be an error result.
-    let b_is_error = msgs.iter().any(|m| matches!(
-        m,
-        Message::ToolResult { tool_call_id, is_error: true, .. } if tool_call_id == "call_b"
-    ));
+    let b_is_error = msgs.iter().any(|m| {
+        matches!(
+            m,
+            Message::ToolResult { tool_call_id, is_error: true, .. } if tool_call_id == "call_b"
+        )
+    });
     assert!(b_is_error);
 }
 
@@ -391,14 +400,17 @@ async fn set_approval_policy_takes_effect_for_subsequent_prompt() {
 
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
-    let handle = builder.pre_handle();
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
     handle.prompt_and_wait("first").await.unwrap();
     assert_eq!(invocations.load(Ordering::SeqCst), 0, "rejected on first");
 
-    handle.set_approval_policy(Arc::new(AutoAcceptAllPolicy)).await.unwrap();
+    handle
+        .set_approval_policy(Arc::new(AutoAcceptAll))
+        .await
+        .unwrap();
     // Sync: send a noop query to ensure the SetApprovalPolicy command was processed.
     let _ = handle.config().await;
 
@@ -422,8 +434,7 @@ async fn abort_during_pending_gate_terminates_cleanly() {
 
     // Receiver that captures the request but never responds, so the gate
     // stays pending until we abort.
-    let (interaction_tx, mut interaction_rx) =
-        tokio::sync::mpsc::channel::<InteractionRequest>(8);
+    let (interaction_tx, mut interaction_rx) = tokio::sync::mpsc::channel::<InteractionRequest>(8);
     let captured: Arc<tokio::sync::Mutex<Option<InteractionRequest>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let captured_clone = captured.clone();
@@ -436,7 +447,7 @@ async fn abort_during_pending_gate_terminates_cleanly() {
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
     builder.set_interaction_sender(interaction_tx);
-    let handle = builder.pre_handle();
+    let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
     builder.spawn();
 
@@ -484,8 +495,8 @@ async fn abort_during_pending_gate_terminates_cleanly() {
 
 #[tokio::test]
 async fn default_policy_passes_through() {
-    // Sanity: confirm DefaultApprovalPolicy gates Elevated and lets Local through.
-    let p = DefaultApprovalPolicy;
+    // Sanity: confirm DefaultPolicy gates Elevated and lets Local through.
+    let p = DefaultPolicy;
     assert!(matches!(
         p.classify("x", &serde_json::Value::Null, ToolRisk::Elevated),
         ApprovalDecision::Gate

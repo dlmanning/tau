@@ -238,9 +238,7 @@ impl SessionStorage for FsStorage {
         let dir = self.dir(id);
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::NotFound(id.clone()))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound(id.clone())),
             Err(e) => Err(Error::Io(e)),
         }
     }

@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
-use tau_agent::events::AgentEvent;
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::AgentEvent;
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::fs;
 
 #[derive(Deserialize, JsonSchema)]

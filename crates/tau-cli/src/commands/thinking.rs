@@ -1,11 +1,14 @@
 //! /thinking command - show and set reasoning level
 
+use async_trait::async_trait;
 use tau_ai::ReasoningLevel;
 
-use super::{Command, CommandContext, CommandResult};
+use super::Command;
+use crate::driver::{Frontend, Session};
 
 pub struct ThinkingCommand;
 
+#[async_trait]
 impl Command for ThinkingCommand {
     fn name(&self) -> &str {
         "thinking"
@@ -16,16 +19,25 @@ impl Command for ThinkingCommand {
     fn description(&self) -> &str {
         "Show or set reasoning level (/thinking <off|minimal|low|medium|high>)"
     }
-    fn execute(&self, ctx: &CommandContext) -> CommandResult {
-        if ctx.args.is_empty() {
-            CommandResult::Message(show_levels(ctx.config.reasoning))
-        } else {
-            match parse_level(ctx.args) {
-                Some(level) => CommandResult::ChangeReasoning(level),
-                None => CommandResult::Message(format!(
-                    "Unknown reasoning level: '{}'\nValid levels: off, minimal, low, medium, high",
-                    ctx.args
-                )),
+    async fn execute(&self, args: &str, session: &mut Session, frontend: &mut dyn Frontend) {
+        if args.is_empty() {
+            let current = session
+                .current_config()
+                .await
+                .map(|c| c.reasoning)
+                .unwrap_or(ReasoningLevel::Off);
+            frontend.show_system(&show_levels(current)).await;
+            return;
+        }
+        match parse_level(args) {
+            Some(level) => session.change_reasoning(level, frontend).await,
+            None => {
+                frontend
+                    .show_system(&format!(
+                        "Unknown reasoning level: '{}'\nValid levels: off, minimal, low, medium, high",
+                        args
+                    ))
+                    .await
             }
         }
     }

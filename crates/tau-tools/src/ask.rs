@@ -4,10 +4,8 @@ use crate::cached_schema;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::interaction::{
-    InteractionKind, InteractionRequest, InteractionResponse, QuestionOption,
-};
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
 
 #[derive(Deserialize, JsonSchema)]
 struct AskOption {

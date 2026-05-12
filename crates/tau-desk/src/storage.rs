@@ -5,13 +5,13 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+use crate::Result;
 use crate::activity::{ActivityEntry, ActivityId};
 use crate::brief::Brief;
 use crate::card::{CardData, CardId, CardPile};
 use crate::draft::{Draft, DraftId, DraftStatus};
 use crate::error::Error;
 use crate::tombstone::DismissalRecord;
-use crate::Result;
 
 /// Pluggable persistence for the desk. Everything inside `tau-desk`
 /// (manager, draft queue, activity feed, scheduler state) talks through
@@ -502,14 +502,8 @@ mod tests {
         let s = MemDeskStorage::new();
         let card = pr_card("a", None);
 
-        assert_eq!(
-            s.upsert_card(&card).await.unwrap(),
-            UpsertOutcome::Inserted
-        );
-        assert_eq!(
-            s.upsert_card(&card).await.unwrap(),
-            UpsertOutcome::Updated
-        );
+        assert_eq!(s.upsert_card(&card).await.unwrap(), UpsertOutcome::Inserted);
+        assert_eq!(s.upsert_card(&card).await.unwrap(), UpsertOutcome::Updated);
         assert_eq!(s.list_cards(CardFilter::default()).await.unwrap().len(), 1);
     }
 
@@ -618,7 +612,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(needs.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["c", "a"]);
+        assert_eq!(
+            needs.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "a"]
+        );
 
         // Limit
         let limited = s
@@ -659,11 +656,17 @@ mod tests {
 
         // list_activity returns newest-first.
         let recent = s.list_activity(10).await.unwrap();
-        assert_eq!(recent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["c", "b", "a"]);
+        assert_eq!(
+            recent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
 
         // activity_since returns oldest-first, exclusive.
         let since = s.activity_since(s1).await.unwrap();
-        assert_eq!(since.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
+        assert_eq!(
+            since.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
     }
 
     #[tokio::test]
@@ -695,7 +698,9 @@ mod tests {
         };
         s.write_draft(&d("p1", DraftStatus::Pending)).await.unwrap();
         s.write_draft(&d("p2", DraftStatus::Pending)).await.unwrap();
-        s.write_draft(&d("a1", DraftStatus::Approved)).await.unwrap();
+        s.write_draft(&d("a1", DraftStatus::Approved))
+            .await
+            .unwrap();
 
         let pending = s.list_drafts(Some(DraftStatus::Pending)).await.unwrap();
         assert_eq!(pending.len(), 2);
@@ -719,4 +724,3 @@ mod tests {
         assert_eq!(s.list_mutes().await.unwrap(), vec!["jira:PLT-313"]);
     }
 }
-

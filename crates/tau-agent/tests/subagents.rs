@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use futures::stream;
-use tau_agent::manager::{AgentManager, AgentSpec, AgentStatus, SpawnOpts};
+use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
+use tau_agent::fleet::manager::{AgentManager, AgentSpec, AgentStatus, SpawnOpts};
 use tau_agent::test_utils::*;
-use tau_agent::transport::{AgentEventStream, AgentRunConfig};
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 use tokio_util::sync::CancellationToken;
@@ -45,7 +45,12 @@ async fn spawn_foreground_completes_and_returns_result() {
     let cancel = CancellationToken::new();
 
     let result = manager
-        .spawn(echo_spec(), ("do something").to_string(), spawn_opts("test subagent"), cancel)
+        .spawn(
+            echo_spec(),
+            ("do something").to_string(),
+            spawn_opts("test subagent"),
+            cancel,
+        )
         .await;
 
     assert!(result.is_ok(), "spawn should succeed: {:?}", result.err());
@@ -63,17 +68,22 @@ async fn spawn_foreground_stores_agent_for_resumption() {
     let cancel = CancellationToken::new();
 
     let result = manager
-        .spawn(echo_spec(), ("hello").to_string(), spawn_opts("resumable agent"), cancel)
+        .spawn(
+            echo_spec(),
+            ("hello").to_string(),
+            spawn_opts("resumable agent"),
+            cancel,
+        )
         .await
         .unwrap();
 
     // The agent should be findable by ID
-    let found = manager.find_agent(&result.agent_id).await;
+    let found = manager.find_agent(&result.agent_id);
     assert!(found.is_some(), "spawned agent should be stored");
-    let (id, desc, status) = found.unwrap();
-    assert_eq!(id, result.agent_id);
-    assert_eq!(desc, "resumable agent");
-    assert_eq!(status, AgentStatus::Idle);
+    let located = found.unwrap();
+    assert_eq!(located.agent_id, result.agent_id);
+    assert_eq!(located.description, "resumable agent");
+    assert_eq!(located.status, AgentStatus::Idle);
 }
 
 // ─── Resume (send) ──────────────────────────────────────────────────
@@ -85,7 +95,12 @@ async fn resume_agent_with_send() {
     let cancel = CancellationToken::new();
 
     let first = manager
-        .spawn(echo_spec(), ("first").to_string(), spawn_opts("resumable"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("first").to_string(),
+            spawn_opts("resumable"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
 
@@ -110,7 +125,11 @@ async fn send_to_nonexistent_agent_errors() {
 
     let result = manager.send("nonexistent-id", "hello", cancel).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("No agent with ID"));
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("no agent with id"),
+        "expected 'no agent with id' in error, got: {msg}"
+    );
 }
 
 // ─── Eviction ───────────────────────────────────────────────────────
@@ -121,33 +140,44 @@ async fn eviction_removes_oldest_agent() {
     let transport = TextTransport::create("ok");
     let config = test_config();
     // Max 2 agents
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config,
-        transport,
-        2));
+    let manager = Arc::new(AgentManager::new(event_tx, config, transport, 2));
     let cancel = CancellationToken::new();
 
     let a1 = manager
-        .spawn(echo_spec(), ("1").to_string(), spawn_opts("first"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("1").to_string(),
+            spawn_opts("first"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
     let a2 = manager
-        .spawn(echo_spec(), ("2").to_string(), spawn_opts("second"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("2").to_string(),
+            spawn_opts("second"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
     let _a3 = manager
-        .spawn(echo_spec(), ("3").to_string(), spawn_opts("third"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("3").to_string(),
+            spawn_opts("third"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
 
     // First agent should be evicted
     assert!(
-        manager.find_agent(&a1.agent_id).await.is_none(),
+        manager.find_agent(&a1.agent_id).is_none(),
         "oldest should be evicted"
     );
     assert!(
-        manager.find_agent(&a2.agent_id).await.is_some(),
+        manager.find_agent(&a2.agent_id).is_some(),
         "second should remain"
     );
 }
@@ -159,15 +189,16 @@ async fn subagent_events_forwarded_as_wrapped() {
     let (event_tx, mut parent_rx) = tokio::sync::broadcast::channel(256);
     let transport = TextTransport::create("ok");
     let config = test_config();
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config,
-        transport,
-        20));
+    let manager = Arc::new(AgentManager::new(event_tx, config, transport, 20));
     let cancel = CancellationToken::new();
 
     manager
-        .spawn(echo_spec(), ("go").to_string(), spawn_opts("event test"), cancel)
+        .spawn(
+            echo_spec(),
+            ("go").to_string(),
+            spawn_opts("event test"),
+            cancel,
+        )
         .await
         .unwrap();
 
@@ -201,19 +232,24 @@ async fn find_agent_by_description_substring() {
     let cancel = CancellationToken::new();
 
     manager
-        .spawn(echo_spec(), ("go").to_string(), spawn_opts("search the codebase"), cancel)
+        .spawn(
+            echo_spec(),
+            ("go").to_string(),
+            spawn_opts("search the codebase"),
+            cancel,
+        )
         .await
         .unwrap();
 
-    let found = manager.find_agent("codebase").await;
+    let found = manager.find_agent("codebase");
     assert!(found.is_some(), "should find by description substring");
-    assert_eq!(found.unwrap().1, "search the codebase");
+    assert_eq!(found.unwrap().description, "search the codebase");
 }
 
 #[tokio::test]
 async fn find_agent_not_found() {
     let manager = make_manager(TextTransport::create("ok"));
-    assert!(manager.find_agent("nonexistent").await.is_none());
+    assert!(manager.find_agent("nonexistent").is_none());
 }
 
 // ─── Background spawn ───────────────────────────────────────────────
@@ -223,11 +259,7 @@ async fn spawn_background_posts_follow_up() {
     let transport = TextTransport::create("background result");
     let config = test_config();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config.clone(),
-        transport,
-        20));
+    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
 
     // Create a parent agent to receive the follow-up
     let parent_builder = AgentBuilder::new(config, TextTransport::create("parent response"));
@@ -236,7 +268,10 @@ async fn spawn_background_posts_follow_up() {
     let parent_cancel = CancellationToken::new();
 
     let agent_id = manager
-        .spawn_background(echo_spec(), ("background task").to_string(), spawn_opts("bg agent"),
+        .spawn_background(
+            echo_spec(),
+            ("background task").to_string(),
+            spawn_opts("bg agent"),
             parent_handle.clone(),
             parent_cancel,
         )
@@ -254,7 +289,7 @@ async fn spawn_background_posts_follow_up() {
     // sends a FollowUp command to the parent actor.
 
     // The agent should be stored for resumption
-    let found = manager.find_agent(&agent_id).await;
+    let found = manager.find_agent(&agent_id);
     assert!(
         found.is_some(),
         "background agent should be stored after completion"
@@ -274,7 +309,12 @@ async fn cancel_propagates_to_subagent() {
 
     let spawn_handle = tokio::spawn(async move {
         manager_clone
-            .spawn(echo_spec(), ("slow task").to_string(), spawn_opts("cancel test"), cancel_clone)
+            .spawn(
+                echo_spec(),
+                ("slow task").to_string(),
+                spawn_opts("cancel test"),
+                cancel_clone,
+            )
             .await
     });
 
@@ -298,7 +338,12 @@ async fn subagent_executes_tools() {
     let cancel = CancellationToken::new();
 
     let result = manager
-        .spawn(echo_spec(), ("use the echo tool").to_string(), spawn_opts("tool test"), cancel)
+        .spawn(
+            echo_spec(),
+            ("use the echo tool").to_string(),
+            spawn_opts("tool test"),
+            cancel,
+        )
         .await
         .unwrap();
 
@@ -318,7 +363,12 @@ async fn resume_tracks_delta_usage() {
     let cancel = CancellationToken::new();
 
     let first = manager
-        .spawn(echo_spec(), ("first").to_string(), spawn_opts("usage test"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("first").to_string(),
+            spawn_opts("usage test"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
 
@@ -351,7 +401,10 @@ async fn multiple_foreground_agents_sequentially() {
     let mut ids = vec![];
     for i in 0..6 {
         let result = manager
-            .spawn(echo_spec(), (&format!("task {i}")).to_string(), spawn_opts(&format!("agent-{i}")),
+            .spawn(
+                echo_spec(),
+                format!("task {i}").to_string(),
+                spawn_opts(&format!("agent-{i}")),
                 cancel.clone(),
             )
             .await
@@ -362,7 +415,7 @@ async fn multiple_foreground_agents_sequentially() {
 
     // All 6 should be stored
     for (i, id) in ids.iter().enumerate() {
-        let found = manager.find_agent(id).await;
+        let found = manager.find_agent(id);
         assert!(found.is_some(), "agent {i} should be stored");
     }
 }
@@ -374,11 +427,7 @@ async fn multiple_background_agents_complete_at_different_times() {
     let transport: Arc<dyn Transport> = Arc::new(VariableDelayTransport::new());
     let config = test_config();
     let (event_tx, mut parent_rx) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config.clone(),
-        transport,
-        20));
+    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
 
     // Parent agent receives follow-ups
     let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
@@ -387,7 +436,10 @@ async fn multiple_background_agents_complete_at_different_times() {
     let mut agent_ids = vec![];
     for i in 0..6 {
         let id = manager
-            .spawn_background(echo_spec(), (&format!("bg task {i}")).to_string(), spawn_opts(&format!("bg-{i}")),
+            .spawn_background(
+                echo_spec(),
+                format!("bg task {i}").to_string(),
+                spawn_opts(&format!("bg-{i}")),
                 parent_handle.clone(),
                 parent_cancel.clone(),
             )
@@ -400,7 +452,7 @@ async fn multiple_background_agents_complete_at_different_times() {
 
     // All 6 should be stored
     for (i, id) in agent_ids.iter().enumerate() {
-        let found = manager.find_agent(id).await;
+        let found = manager.find_agent(id);
         assert!(
             found.is_some(),
             "background agent {i} ({id}) should be stored"
@@ -429,18 +481,17 @@ async fn cancel_all_concurrent_background_agents() {
     let transport = SlowTransport::create(10_000);
     let config = test_config();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config.clone(),
-        transport,
-        20));
+    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
 
     let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
 
     for i in 0..4 {
         manager
-            .spawn_background(echo_spec(), (&format!("slow {i}")).to_string(), spawn_opts(&format!("slow-{i}")),
+            .spawn_background(
+                echo_spec(),
+                format!("slow {i}").to_string(),
+                spawn_opts(&format!("slow-{i}")),
                 parent_handle.clone(),
                 parent_cancel.clone(),
             )
@@ -467,11 +518,7 @@ async fn interleave_foreground_and_background_agents() {
     let transport: Arc<dyn Transport> = Arc::new(VariableDelayTransport::new());
     let config = test_config();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config.clone(),
-        transport,
-        20));
+    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
 
     let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
@@ -479,7 +526,10 @@ async fn interleave_foreground_and_background_agents() {
 
     // Background 1
     let bg1_id = manager
-        .spawn_background(echo_spec(), ("bg1").to_string(), spawn_opts("background-1"),
+        .spawn_background(
+            echo_spec(),
+            ("bg1").to_string(),
+            spawn_opts("background-1"),
             parent_handle.clone(),
             parent_cancel.clone(),
         )
@@ -487,14 +537,22 @@ async fn interleave_foreground_and_background_agents() {
 
     // Foreground (blocks until done)
     let fg_result = manager
-        .spawn(echo_spec(), ("fg").to_string(), spawn_opts("foreground"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("fg").to_string(),
+            spawn_opts("foreground"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
     assert!(!fg_result.text.is_empty());
 
     // Background 2
     let bg2_id = manager
-        .spawn_background(echo_spec(), ("bg2").to_string(), spawn_opts("background-2"),
+        .spawn_background(
+            echo_spec(),
+            ("bg2").to_string(),
+            spawn_opts("background-2"),
             parent_handle.clone(),
             parent_cancel,
         )
@@ -505,15 +563,15 @@ async fn interleave_foreground_and_background_agents() {
 
     // All three should be stored
     assert!(
-        manager.find_agent(&fg_result.agent_id).await.is_some(),
+        manager.find_agent(&fg_result.agent_id).is_some(),
         "fg should be stored"
     );
     assert!(
-        manager.find_agent(&bg1_id).await.is_some(),
+        manager.find_agent(&bg1_id).is_some(),
         "bg1 should be stored"
     );
     assert!(
-        manager.find_agent(&bg2_id).await.is_some(),
+        manager.find_agent(&bg2_id).is_some(),
         "bg2 should be stored"
     );
 }
@@ -525,11 +583,7 @@ async fn resume_while_background_agent_running() {
     let transport: Arc<dyn Transport> = Arc::new(VariableDelayTransport::new());
     let config = test_config();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config.clone(),
-        transport,
-        20));
+    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
 
     let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
     let parent_cancel = CancellationToken::new();
@@ -537,13 +591,21 @@ async fn resume_while_background_agent_running() {
 
     // Spawn and store an agent
     let first = manager
-        .spawn(echo_spec(), ("first task").to_string(), spawn_opts("agent-a"), cancel.clone())
+        .spawn(
+            echo_spec(),
+            ("first task").to_string(),
+            spawn_opts("agent-a"),
+            cancel.clone(),
+        )
         .await
         .unwrap();
 
     // Spawn a slow background agent (will take ~200ms)
     manager
-        .spawn_background(echo_spec(), ("slow bg").to_string(), spawn_opts("agent-slow"),
+        .spawn_background(
+            echo_spec(),
+            ("slow bg").to_string(),
+            spawn_opts("agent-slow"),
             parent_handle,
             parent_cancel,
         )
@@ -676,7 +738,8 @@ async fn abort_root_agent_cancels_all_subagents() {
         event_tx,
         config.clone(),
         sub_transport,
-        20));
+        20,
+    ));
 
     // Root agent with a slow transport (simulates LLM streaming)
     let root_handle = AgentBuilder::new(config, SlowTransport::create(60_000)).spawn();
@@ -691,7 +754,10 @@ async fn abort_root_agent_cancels_all_subagents() {
     // Spawn 3 slow background subagents
     for i in 0..3 {
         manager
-            .spawn_background(echo_spec(), (&format!("slow task {i}")).to_string(), spawn_opts(&format!("sub-{i}")),
+            .spawn_background(
+                echo_spec(),
+                format!("slow task {i}").to_string(),
+                spawn_opts(&format!("sub-{i}")),
                 root_handle.clone(),
                 parent_cancel.clone(),
             )

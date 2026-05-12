@@ -1,4 +1,10 @@
-//! Slash commands for interactive mode
+//! Slash commands.
+//!
+//! Each command implements the [`Command`] trait and acts directly on
+//! the [`Session`] (state-changing operations) and the
+//! [`Frontend`](crate::driver::Frontend) (output). The driver
+//! ([`Session::handle_command`](crate::driver::Session)) looks up a
+//! command by name/alias and calls `execute`.
 
 mod branch;
 mod model;
@@ -6,69 +12,24 @@ mod plan;
 mod session;
 mod thinking;
 
-pub use model::ModelCommand;
-use tau_agent::AgentConfig;
-use tau_ai::{Message, Model, ReasoningLevel};
+use async_trait::async_trait;
 
-/// Context passed to every command — uses pre-fetched snapshots from the handle.
-pub struct CommandContext<'a> {
-    pub args: &'a str,
-    pub config: &'a AgentConfig,
-    pub messages: &'a [Message],
-    pub usage: &'a tau_ai::Usage,
-    pub available_models: &'a [Model],
-    /// Whether a non-main agent is currently active (e.g. plan mode).
-    pub has_active_agent: bool,
-}
+use crate::driver::{Frontend, Session};
 
-/// Result of executing a slash command
-pub enum CommandResult {
-    /// Clear the conversation
-    Clear,
-    /// Change the model
-    ChangeModel(Model),
-    /// Change the reasoning level
-    ChangeReasoning(ReasoningLevel),
-    /// Show a message to the user (not sent to agent)
-    Message(String),
-    /// Exit the application
-    Exit,
-    /// Unknown command
-    Unknown(String),
-    /// Open model selector (TUI only)
-    OpenModelSelector,
-    /// Open branch selector (TUI only) - lets user pick a message to branch from
-    OpenBranchSelector,
-    /// Create branch from specific message index
-    BranchFrom(Option<usize>),
-    /// Trigger manual context compaction
-    Compact,
-    /// Enter plan mode — spawn a Plan subagent with the given description
-    PlanStart(String),
-    /// Approve the plan and return to the main agent
-    PlanApprove,
-    /// Exit plan mode without approving
-    PlanExit,
-}
-
-/// Trait for slash commands
-pub trait Command {
-    /// Primary name (e.g. "model")
+/// A slash command.
+#[async_trait]
+pub trait Command: Send + Sync {
     fn name(&self) -> &str;
-
-    /// Aliases (e.g. &["m"]). Default: none.
     fn aliases(&self) -> &[&str] {
         &[]
     }
-
-    /// One-line description for /help
     fn description(&self) -> &str;
-
-    /// Execute the command
-    fn execute(&self, ctx: &CommandContext) -> CommandResult;
+    async fn execute(&self, args: &str, session: &mut Session, frontend: &mut dyn Frontend);
 }
 
-fn all_commands() -> Vec<Box<dyn Command>> {
+/// Registry of all built-in commands. Cheap to call: returns a fresh
+/// `Vec<Box<dyn Command>>` per invocation. Commands are stateless.
+pub fn all_commands() -> Vec<Box<dyn Command>> {
     vec![
         Box::new(HelpCommand),
         Box::new(ClearCommand),
@@ -82,35 +43,11 @@ fn all_commands() -> Vec<Box<dyn Command>> {
     ]
 }
 
-/// Parse and execute a slash command
-pub fn execute_command(input: &str, ctx: &CommandContext) -> Option<CommandResult> {
-    let input = input.trim();
-
-    if !input.starts_with('/') {
-        return None;
-    }
-
-    let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
-    let cmd_name = parts[0].to_lowercase();
-    let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
-
-    let ctx = CommandContext { args, ..*ctx };
-
-    let commands = all_commands();
-    let matched = commands
-        .iter()
-        .find(|c| c.name() == cmd_name || c.aliases().contains(&cmd_name.as_str()));
-
-    Some(match matched {
-        Some(cmd) => cmd.execute(&ctx),
-        None => CommandResult::Unknown(cmd_name),
-    })
-}
-
-// --- Simple commands inlined here ---
+// ─── Simple commands inlined ─────────────────────────────────────────
 
 struct HelpCommand;
 
+#[async_trait]
 impl Command for HelpCommand {
     fn name(&self) -> &str {
         "help"
@@ -121,7 +58,7 @@ impl Command for HelpCommand {
     fn description(&self) -> &str {
         "Show available commands"
     }
-    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
+    async fn execute(&self, _args: &str, _session: &mut Session, frontend: &mut dyn Frontend) {
         let commands = all_commands();
         let mut output = String::from("Available commands:\n");
         for cmd in &commands {
@@ -137,12 +74,13 @@ impl Command for HelpCommand {
             };
             output.push_str(&format!("  {:<24} {}\n", names, cmd.description()));
         }
-        CommandResult::Message(output)
+        frontend.show_system(&output).await;
     }
 }
 
 struct ClearCommand;
 
+#[async_trait]
 impl Command for ClearCommand {
     fn name(&self) -> &str {
         "clear"
@@ -153,13 +91,14 @@ impl Command for ClearCommand {
     fn description(&self) -> &str {
         "Clear conversation history"
     }
-    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
-        CommandResult::Clear
+    async fn execute(&self, _args: &str, session: &mut Session, frontend: &mut dyn Frontend) {
+        session.clear(frontend).await;
     }
 }
 
 struct ExitCommand;
 
+#[async_trait]
 impl Command for ExitCommand {
     fn name(&self) -> &str {
         "quit"
@@ -170,13 +109,14 @@ impl Command for ExitCommand {
     fn description(&self) -> &str {
         "Exit tau"
     }
-    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
-        CommandResult::Exit
+    async fn execute(&self, _args: &str, session: &mut Session, _frontend: &mut dyn Frontend) {
+        session.request_exit();
     }
 }
 
 struct CompactCommand;
 
+#[async_trait]
 impl Command for CompactCommand {
     fn name(&self) -> &str {
         "compact"
@@ -184,7 +124,7 @@ impl Command for CompactCommand {
     fn description(&self) -> &str {
         "Compact context by summarizing old messages"
     }
-    fn execute(&self, _ctx: &CommandContext) -> CommandResult {
-        CommandResult::Compact
+    async fn execute(&self, _args: &str, session: &mut Session, frontend: &mut dyn Frontend) {
+        session.compact(frontend).await;
     }
 }

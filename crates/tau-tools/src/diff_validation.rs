@@ -973,13 +973,7 @@ fn find_v4a_match(edit: &V4AHunk, file_lines: &[&str]) -> Option<Range<usize>> {
     .concat()
     .join("\n");
 
-    if let Some(range) = match_diff(
-        &combined_search,
-        None,
-        search_lines,
-        1.0,
-        MakeExactMatch,
-    ) {
+    if let Some(range) = match_diff(&combined_search, None, search_lines, 1.0, MakeExactMatch) {
         return calculate_old_range(search_start, range, &pre_context_lines, &old_lines);
     }
 
@@ -1241,7 +1235,8 @@ mod tests {
     #[test]
     fn test_prefix_tail_rescue_with_line_number_hint() {
         let actual_line = "if the stripping tool encounters any error (nesting, unmatched markers, UTF-8 decode failure), the sync workflow **fails** and does **not** update the watermark.  the next run will retry from the same commit.  this is correct fail-closed behavior \u{2014} a stripping error might indicate a condition that could cause private code to leak.";
-        let file_content = format!("(preamble)\n\n### error handling\n\n{actual_line}\n\n(trailer)\n");
+        let file_content =
+            format!("(preamble)\n\n### error handling\n\n{actual_line}\n\n(trailer)\n");
 
         let search = "5|if the stripping tool encounters any error (nesting, unmatched markers, UTF-8 decode failure), the sync workflow **fails** and does **not** update the watermark.";
         let replace = "if the stripping tool encounters any error (nesting, unmatched markers, UTF-8 decode failure, symlinks), the sync workflow **fails** and does **not** update the watermark.";
@@ -1548,7 +1543,8 @@ mod tests {
             post_context: "    fn existing_method() {".to_string(),
         }];
 
-        let file_content = "class MyClass {\n    fn existing_method() {\n        return 1;\n    }\n}";
+        let file_content =
+            "class MyClass {\n    fn existing_method() {\n        return 1;\n    }\n}";
         let diff = fuzzy_match_v4a_diffs("test.rs", &hunks, None, file_content);
 
         assert_eq!(deltas(&diff).len(), 1);

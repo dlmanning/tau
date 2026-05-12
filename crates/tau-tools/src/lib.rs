@@ -10,6 +10,8 @@ mod edit;
 mod glob;
 mod grep;
 mod list;
+#[cfg(feature = "lsp")]
+pub mod lsp;
 pub mod plan;
 mod read;
 mod send_message;

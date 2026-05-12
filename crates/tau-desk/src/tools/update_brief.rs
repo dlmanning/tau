@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 
 use crate::brief::{Brief, BriefStat};
 use crate::event::DeskEvent;

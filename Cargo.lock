@@ -3110,7 +3110,6 @@ dependencies = [
 name = "tau-agent"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-stream",
  "async-trait",
  "chrono",
@@ -3124,7 +3123,6 @@ dependencies = [
  "serde_json",
  "tau-agent",
  "tau-ai",
- "tau-tools",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3166,7 +3164,6 @@ dependencies = [
  "glob",
  "htmd",
  "ignore",
- "lsp-types",
  "pulldown-cmark",
  "ratatui",
  "regex",
@@ -3242,6 +3239,7 @@ dependencies = [
 name = "tau-tools"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "dirs",
@@ -3250,6 +3248,7 @@ dependencies = [
  "htmd",
  "ignore",
  "itertools",
+ "lsp-types",
  "regex",
  "reqwest 0.12.28",
  "schemars",
@@ -3263,6 +3262,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "urlencoding",
 ]
 
 [[package]]

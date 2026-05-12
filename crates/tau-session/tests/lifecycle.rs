@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use tau_agent::BoxedTool;
+use tau_agent::Transport;
 use tau_agent::test_utils::*;
-use tau_agent::transport::Transport;
-use tau_agent::tool::BoxedTool;
 use tau_ai::Message;
 use tau_session::{FsStorage, NewSessionRequest, SessionManager, SessionStatus};
 
@@ -58,18 +58,24 @@ async fn first_prompt_persists_messages() {
         .expect("create");
 
     // Drive a prompt and wait for completion.
-    active
-        .handle
-        .prompt_and_wait("ping")
-        .await
-        .expect("prompt");
+    active.handle.prompt_and_wait("ping").await.expect("prompt");
 
     // Give the persister a moment to drain the event queue.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Storage should now contain the messages.
-    let info = manager.list().await.expect("list").into_iter().next().unwrap();
-    assert!(info.message_count >= 2, "user + assistant: got {}", info.message_count);
+    let info = manager
+        .list()
+        .await
+        .expect("list")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(
+        info.message_count >= 2,
+        "user + assistant: got {}",
+        info.message_count
+    );
     assert!(info.total_usage.input > 0, "TurnEnd usage rolled into info");
 }
 
@@ -110,7 +116,10 @@ async fn hibernate_then_activate_restores_messages() {
 
     // The activated handle should have the prior messages restored.
     let msgs = activated.handle.messages().await.expect("messages");
-    assert!(msgs.iter().any(|m| matches!(m, Message::User { .. })), "user msg restored: {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| matches!(m, Message::User { .. })),
+        "user msg restored: {msgs:?}"
+    );
     assert!(
         msgs.iter().any(|m| matches!(m, Message::Assistant { .. })),
         "assistant msg restored"

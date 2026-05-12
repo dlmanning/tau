@@ -1,9 +1,13 @@
 //! /plan command — enter plan mode via Plan subagent
 
-use super::{Command, CommandContext, CommandResult};
+use async_trait::async_trait;
+
+use super::Command;
+use crate::driver::{Frontend, Session};
 
 pub struct PlanCommand;
 
+#[async_trait]
 impl Command for PlanCommand {
     fn name(&self) -> &str {
         "plan"
@@ -17,29 +21,49 @@ impl Command for PlanCommand {
         "Enter plan mode (/plan <description>), approve (/plan approve), or exit (/plan exit)"
     }
 
-    fn execute(&self, ctx: &CommandContext) -> CommandResult {
-        let args = ctx.args.trim();
+    async fn execute(&self, args: &str, session: &mut Session, frontend: &mut dyn Frontend) {
+        let args = args.trim();
 
-        if !ctx.has_active_agent {
+        if !session.is_plan_mode() {
             if args.is_empty() {
-                return CommandResult::Message(
-                    "Usage: /plan <description> — enter plan mode to explore and design an approach"
-                        .to_string(),
-                );
+                frontend
+                    .show_system(
+                        "Usage: /plan <description> — enter plan mode to explore and design an approach",
+                    )
+                    .await;
+                return;
             }
-            return CommandResult::PlanStart(args.to_string());
+            if let Err(e) = session.enter_plan_mode(args.to_string(), frontend).await {
+                frontend
+                    .show_error(&format!("Plan mode failed: {}", e))
+                    .await;
+            }
+            return;
         }
 
         match args {
-            "" => CommandResult::Message(
-                "In plan mode. Use /plan approve to approve, or /plan exit to cancel."
-                    .to_string(),
-            ),
-            "approve" | "ok" | "yes" => CommandResult::PlanApprove,
-            "exit" | "cancel" | "quit" => CommandResult::PlanExit,
-            _ => CommandResult::Message(
-                "Already in plan mode. Use /plan approve or /plan exit first.".to_string(),
-            ),
+            "" => {
+                frontend
+                    .show_system(
+                        "In plan mode. Use /plan approve to approve, or /plan exit to cancel.",
+                    )
+                    .await
+            }
+            "approve" | "ok" | "yes" => {
+                if let Err(e) = session.approve_plan(frontend).await {
+                    frontend
+                        .show_error(&format!("Plan approval failed: {}", e))
+                        .await;
+                }
+            }
+            "exit" | "cancel" | "quit" => session.exit_plan_mode(frontend).await,
+            _ => {
+                frontend
+                    .show_system(
+                        "Already in plan mode. Use /plan approve or /plan exit first.",
+                    )
+                    .await
+            }
         }
     }
 }

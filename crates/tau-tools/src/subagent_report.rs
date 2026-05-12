@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use tau_agent::approval::ToolRisk;
-use tau_agent::events::AgentEvent;
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::AgentEvent;
+use tau_agent::ToolRisk;
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
 
 use crate::cached_schema;
 

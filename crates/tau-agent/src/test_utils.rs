@@ -1,12 +1,14 @@
 //! Test utilities for tau-agent and downstream crates.
 //!
-//! Available within tau-agent via `#[cfg(test)]`, and to downstream crates
-//! via the `test-utils` feature flag:
+//! Available within tau-agent via `#[cfg(test)]` and to downstream
+//! crates via the `test-utils` feature flag:
 //!
 //! ```toml
 //! [dev-dependencies]
 //! tau-agent = { workspace = true, features = ["test-utils"] }
 //! ```
+//!
+//! Port of v1 `tau-agent`'s test_utils, adapted to v2's type paths.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -14,8 +16,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_stream::stream;
 use async_trait::async_trait;
-use futures::stream;
+use futures::stream as fstream;
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::Value;
 use tau_ai::{
@@ -26,24 +29,21 @@ use tokio::sync::{broadcast, watch};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AgentConfig, DequeueMode};
-use crate::events::AgentEvent;
-use crate::handle::AgentHandle;
-use crate::tool::{
+use crate::core::compaction::CompactionConfig;
+use crate::core::config::{AgentConfig, DequeueMode};
+use crate::core::handle::AgentHandle;
+use crate::core::tool::{
     BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
 };
-use crate::transport::{AgentEventStream, AgentRunConfig, Transport};
+use crate::core::transport::{AgentEventStream, AgentRunConfig, Transport};
+use crate::types::events::AgentEvent;
 
-// ---------------------------------------------------------------------------
-// Message constructors
-// ---------------------------------------------------------------------------
+// ─── Message constructors ────────────────────────────────────────────
 
-/// Create a user message with text content.
 pub fn make_user_message(text: &str) -> Message {
     Message::user(text)
 }
 
-/// Create an assistant message with text content.
 pub fn make_assistant_message(text: &str) -> Message {
     Message::Assistant {
         content: vec![Content::text(text)],
@@ -51,7 +51,6 @@ pub fn make_assistant_message(text: &str) -> Message {
     }
 }
 
-/// Create an assistant message containing a tool call.
 pub fn make_tool_call_message(name: &str, id: &str, args: Value) -> Message {
     Message::Assistant {
         content: vec![Content::tool_call(id, name, args)],
@@ -59,23 +58,19 @@ pub fn make_tool_call_message(name: &str, id: &str, args: Value) -> Message {
     }
 }
 
-/// Create a tool result message.
 pub fn make_tool_result(id: &str, name: &str, text: &str) -> Message {
     Message::tool_result(id, name, vec![Content::text(text)], false)
 }
 
-// ---------------------------------------------------------------------------
-// Test model & config
-// ---------------------------------------------------------------------------
+// ─── Test model & config ─────────────────────────────────────────────
 
-/// Create a minimal Model suitable for tests. Does not hit any real API.
 pub fn make_test_model() -> Model {
     Model {
-        id: "test-model".to_string(),
-        name: "Test Model".to_string(),
+        id: "test-model".into(),
+        name: "Test Model".into(),
         api: Api::AnthropicMessages,
         provider: Provider::Anthropic,
-        base_url: "https://test.invalid".to_string(),
+        base_url: "https://test.invalid".into(),
         reasoning: false,
         input_types: vec![InputType::Text],
         cost: CostInfo::default(),
@@ -85,14 +80,14 @@ pub fn make_test_model() -> Model {
     }
 }
 
-/// Create a test AgentConfig with a system prompt set. Used by integration tests.
+/// Like `make_test_config` but with a `system_prompt` set. Used by
+/// integration tests that exercise system-prompt-in-context.
 pub fn test_config() -> AgentConfig {
     let mut cfg = make_test_config();
     cfg.system_prompt = Some("You are a test agent.".into());
     cfg
 }
 
-/// Create a minimal AgentConfig suitable for tests.
 pub fn make_test_config() -> AgentConfig {
     AgentConfig {
         system_prompt: None,
@@ -101,7 +96,7 @@ pub fn make_test_config() -> AgentConfig {
         thinking_adaptive: false,
         max_tokens: None,
         max_turns: None,
-        compaction: crate::compaction::CompactionConfig::default(),
+        compaction: CompactionConfig::default(),
         steering_mode: DequeueMode::All,
         follow_up_mode: DequeueMode::All,
         cache_scope: None,
@@ -110,7 +105,6 @@ pub fn make_test_config() -> AgentConfig {
     }
 }
 
-/// Create an `ExecutionContext` for testing tools in isolation.
 pub fn make_execution_context() -> ExecutionContext {
     let (tx, _rx) = broadcast::channel(256);
     ExecutionContext {
@@ -119,28 +113,13 @@ pub fn make_execution_context() -> ExecutionContext {
         progress: ProgressSender::new(tx, "test_call", "test_tool"),
         interaction: None,
         file_access: Arc::new(ParkingMutex::new(FileAccessTracker::default())),
+        agent_id: None,
+        subagent_depth: 0,
     }
 }
 
-// ---------------------------------------------------------------------------
-// MockTransport
-// ---------------------------------------------------------------------------
+// ─── MockTransport: queued canned responses ──────────────────────────
 
-/// A transport that returns canned responses. Each call to `run()` pops the
-/// next queued response and streams it as an `AgentEventStream`.
-///
-/// Panics if `run()` is called after all queued responses have been consumed.
-///
-/// # Example
-///
-/// ```ignore
-/// let transport = MockTransport::new()
-///     .with_text_response("Hello!")
-///     .with_text_response("Goodbye!");
-///
-/// // First run() returns "Hello!", second returns "Goodbye!"
-/// // Third run() would panic.
-/// ```
 pub struct MockTransport {
     responses: Mutex<VecDeque<Vec<AgentEvent>>>,
     call_count: Mutex<usize>,
@@ -156,10 +135,9 @@ impl MockTransport {
         }
     }
 
-    /// Queue a complete turn that returns a text-only assistant message.
     pub fn with_text_response(self, text: &str) -> Self {
         let msg = make_assistant_message(text);
-        let events = vec![
+        self.with_events(vec![
             AgentEvent::TurnStart { turn_number: 1 },
             AgentEvent::MessageStart {
                 message: msg.clone(),
@@ -176,14 +154,12 @@ impl MockTransport {
                     ..Default::default()
                 },
             },
-        ];
-        self.with_events(events)
+        ])
     }
 
-    /// Queue a complete turn where the assistant requests a tool call.
     pub fn with_tool_call_response(self, tool_name: &str, tool_call_id: &str, args: Value) -> Self {
         let msg = make_tool_call_message(tool_name, tool_call_id, args);
-        let events = vec![
+        self.with_events(vec![
             AgentEvent::TurnStart { turn_number: 1 },
             AgentEvent::MessageStart {
                 message: msg.clone(),
@@ -200,22 +176,18 @@ impl MockTransport {
                     ..Default::default()
                 },
             },
-        ];
-        self.with_events(events)
+        ])
     }
 
-    /// Queue an error response (error arrives as a stream event).
     pub fn with_error(self, msg: &str) -> Self {
-        let events = vec![
+        self.with_events(vec![
             AgentEvent::TurnStart { turn_number: 1 },
             AgentEvent::Error {
-                message: msg.to_string(),
+                message: msg.into(),
             },
-        ];
-        self.with_events(events)
+        ])
     }
 
-    /// Queue a raw sequence of events as one response.
     pub fn with_events(self, events: Vec<AgentEvent>) -> Self {
         self.responses.lock().unwrap().push_back(events);
         *self.total_queued.lock().unwrap() += 1;
@@ -235,7 +207,7 @@ impl Transport for MockTransport {
         &self,
         _messages: Vec<Message>,
         _config: &AgentRunConfig,
-        _cancel: tokio_util::sync::CancellationToken,
+        _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
         let events = {
             let mut responses = self.responses.lock().unwrap();
@@ -246,42 +218,20 @@ impl Transport for MockTransport {
                 panic!("MockTransport: no more queued responses (queued {total}, call #{count})")
             })
         };
-
-        Ok(Box::pin(stream::iter(events)))
+        Ok(Box::pin(fstream::iter(events)))
     }
 }
 
-// ---------------------------------------------------------------------------
-// EventCollector — deterministic async event collection
-// ---------------------------------------------------------------------------
+// ─── EventCollector: deterministic async event collection ────────────
 
-/// Collects `AgentEvent`s from a broadcast channel in a background task,
-/// providing deterministic wait methods that replace sleep+poll patterns.
-///
-/// Modeled after pipecat-rs's `FrameCollector`.
-///
-/// # Example
-///
-/// ```ignore
-/// let handle = builder.spawn();
-/// let collector = EventCollector::from_handle(&handle);
-///
-/// handle.prompt("hello").await.unwrap();
-/// collector.wait_for_end().await;
-///
-/// let events = collector.events();
-/// assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentEnd { .. })));
-/// ```
 pub struct EventCollector {
     inner: Arc<Mutex<Vec<AgentEvent>>>,
     count_rx: watch::Receiver<usize>,
-    // Keep alive so the channel doesn't close
     _count_tx: Arc<watch::Sender<usize>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
 impl EventCollector {
-    /// Subscribe to an `AgentHandle`'s event stream and start collecting.
     pub fn from_handle(handle: &AgentHandle) -> Self {
         let mut event_rx = handle.subscribe();
         let inner = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
@@ -320,8 +270,6 @@ impl EventCollector {
         }
     }
 
-    /// Wait until an `AgentEnd` or `Error` event has been collected.
-    /// Panics if neither appears within 5 seconds.
     pub async fn wait_for_end(&self) {
         self.wait_for_event_timeout(
             |e| matches!(e, AgentEvent::AgentEnd { .. } | AgentEvent::Error { .. }),
@@ -330,15 +278,11 @@ impl EventCollector {
         .await;
     }
 
-    /// Wait until an event matching the predicate has been collected.
-    /// Panics if no match appears within 5 seconds.
     pub async fn wait_for_event(&self, pred: impl Fn(&AgentEvent) -> bool) {
         self.wait_for_event_timeout(pred, Duration::from_secs(5))
             .await;
     }
 
-    /// Wait until at least `count` events have been collected.
-    /// Panics if the count isn't reached within 5 seconds.
     pub async fn wait_for_count(&self, count: usize) {
         let result = time::timeout(Duration::from_secs(5), async {
             let mut rx = self.count_rx.clone();
@@ -364,7 +308,6 @@ impl EventCollector {
         }
     }
 
-    /// Wait with a custom timeout.
     pub async fn wait_for_event_timeout(
         &self,
         pred: impl Fn(&AgentEvent) -> bool,
@@ -383,7 +326,6 @@ impl EventCollector {
     async fn wait_for_event_inner(&self, pred: &(impl Fn(&AgentEvent) -> bool + ?Sized)) {
         let mut rx = self.count_rx.clone();
         loop {
-            // IMPORTANT: lock must be dropped before .await
             rx.borrow_and_update();
             {
                 let events = self.inner.lock().unwrap();
@@ -398,18 +340,14 @@ impl EventCollector {
         }
     }
 
-    /// Clone all collected events.
     pub fn events(&self) -> Vec<AgentEvent> {
         self.inner.lock().unwrap().clone()
     }
 
-    /// Take all collected events, clearing the buffer. Subsequent waits will
-    /// only see events arriving after this call.
     pub fn take_events(&self) -> Vec<AgentEvent> {
         std::mem::take(&mut *self.inner.lock().unwrap())
     }
 
-    /// Extract assistant messages from collected events (from MessageEnd events).
     pub fn assistant_messages(&self) -> Vec<Message> {
         self.inner
             .lock()
@@ -422,7 +360,6 @@ impl EventCollector {
             .collect()
     }
 
-    /// Get human-readable event type names for debugging.
     pub fn event_names(&self) -> Vec<&'static str> {
         self.inner
             .lock()
@@ -432,13 +369,11 @@ impl EventCollector {
             .collect()
     }
 
-    /// Number of events collected so far.
     pub fn count(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 }
 
-/// Return the variant name of an `AgentEvent` for debugging.
 fn event_type_name(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::AgentStart => "AgentStart",
@@ -464,12 +399,8 @@ fn event_type_name(event: &AgentEvent) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// EchoTool — simple test tool
-// ---------------------------------------------------------------------------
+// ─── Tools ───────────────────────────────────────────────────────────
 
-/// A tool that returns its `text` argument as output. Useful for testing
-/// the full tool execution round-trip without side effects.
 pub struct EchoTool;
 
 #[async_trait]
@@ -477,28 +408,19 @@ impl Tool for EchoTool {
     fn name(&self) -> &str {
         "echo"
     }
-
     fn description(&self) -> &str {
         "Echoes the text argument back"
     }
-
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Text to echo back"
-                }
-            },
+            "properties": { "text": { "type": "string", "description": "Text to echo back" } },
             "required": ["text"]
         })
     }
-
     fn concurrency(&self) -> Concurrency {
         Concurrency::Parallel
     }
-
     async fn execute(&self, arguments: Value, _ctx: ExecutionContext) -> ToolResult {
         let text = arguments
             .get("text")
@@ -508,11 +430,6 @@ impl Tool for EchoTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FailTool — always errors
-// ---------------------------------------------------------------------------
-
-/// A tool that always returns an error. Useful for testing error handling.
 pub struct FailTool;
 
 #[async_trait]
@@ -520,30 +437,17 @@ impl Tool for FailTool {
     fn name(&self) -> &str {
         "fail"
     }
-
     fn description(&self) -> &str {
         "Always fails"
     }
-
     fn parameters_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {}
-        })
+        serde_json::json!({ "type": "object", "properties": {} })
     }
-
     async fn execute(&self, _arguments: Value, _ctx: ExecutionContext) -> ToolResult {
         ToolResult::error("intentional failure")
     }
 }
 
-// ---------------------------------------------------------------------------
-// PanicTool — panics inside execute, used for actor-supervisor tests
-// ---------------------------------------------------------------------------
-
-/// A tool that panics in `execute`. Used to verify that tool-level panics
-/// are caught by the actor's `JoinSet` (they are — see `actor.rs`).
-/// **Does not** kill the actor; for that, use [`PanicTransport`].
 pub struct PanicTool;
 
 #[async_trait]
@@ -551,30 +455,43 @@ impl Tool for PanicTool {
     fn name(&self) -> &str {
         "panic"
     }
-
     fn description(&self) -> &str {
         "Panics inside execute"
     }
-
     fn parameters_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {}
-        })
+        serde_json::json!({ "type": "object", "properties": {} })
     }
-
     async fn execute(&self, _arguments: Value, _ctx: ExecutionContext) -> ToolResult {
         panic!("intentional panic in tool");
     }
 }
 
-// ---------------------------------------------------------------------------
-// PanicTransport — panics inside `run`, on the actor task itself
-// ---------------------------------------------------------------------------
+pub struct SlowTool {
+    pub delay_ms: u64,
+}
 
-/// A transport that panics in `run`. Unlike `PanicTool`, this propagates the
-/// panic to the actor task, killing it. Used to test the supervisor's
-/// `shutdown_reason` recording and `Error::ActorPanic` mapping.
+#[async_trait]
+impl Tool for SlowTool {
+    fn name(&self) -> &str {
+        "slow"
+    }
+    fn description(&self) -> &str {
+        "Slow tool"
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Sequential
+    }
+    async fn execute(&self, _args: Value, _ctx: ExecutionContext) -> ToolResult {
+        time::sleep(Duration::from_millis(self.delay_ms)).await;
+        ToolResult::text("slow done")
+    }
+}
+
+// ─── Transports ──────────────────────────────────────────────────────
+
 pub struct PanicTransport;
 
 impl PanicTransport {
@@ -595,41 +512,6 @@ impl Transport for PanicTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: spawn an agent with MockTransport for testing
-// ---------------------------------------------------------------------------
-
-/// Build and spawn an agent with the given MockTransport and tools.
-/// Returns `(AgentHandle, EventCollector)` ready for testing.
-pub fn spawn_test_agent(
-    transport: MockTransport,
-    tools: Vec<BoxedTool>,
-) -> (AgentHandle, EventCollector) {
-    spawn_test_agent_with_config(make_test_config(), transport, tools)
-}
-
-/// Build and spawn an agent with a custom config, MockTransport, and tools.
-pub fn spawn_test_agent_with_config(
-    config: AgentConfig,
-    transport: MockTransport,
-    tools: Vec<BoxedTool>,
-) -> (AgentHandle, EventCollector) {
-    let mut builder = crate::builder::AgentBuilder::new(config, Arc::new(transport));
-    builder.set_tools(tools);
-
-    let handle = builder.pre_handle();
-    let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
-
-    (handle, collector)
-}
-
-// ---------------------------------------------------------------------------
-// Integration test transports (moved from tests/harness.rs)
-// ---------------------------------------------------------------------------
-
-/// Returns a fixed text response on every call. Useful for tests that
-/// prompt multiple times and always expect the same response.
 pub struct TextTransport {
     pub text: String,
 }
@@ -645,32 +527,31 @@ impl Transport for TextTransport {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _config: &AgentRunConfig,
+        config: &AgentRunConfig,
         _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
         let msg = make_assistant_message(&self.text);
+        let turn_number = config.turn_number;
         let usage = Usage {
             input: 100,
             output: 50,
             ..Default::default()
         };
         let events = vec![
-            AgentEvent::TurnStart { turn_number: 1 },
+            AgentEvent::TurnStart { turn_number },
             AgentEvent::MessageEnd {
                 message: msg.clone(),
             },
             AgentEvent::TurnEnd {
-                turn_number: 1,
+                turn_number,
                 message: msg,
                 usage,
             },
         ];
-        Ok(Box::pin(stream::iter(events)))
+        Ok(Box::pin(fstream::iter(events)))
     }
 }
 
-/// Returns tool calls for `n` turns, then a text response.
-/// Each turn's tool call has a unique id based on the turn counter.
 pub struct ToolCallTransport {
     remaining: AtomicU32,
     pub tool_name: String,
@@ -690,7 +571,7 @@ impl Transport for ToolCallTransport {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _config: &AgentRunConfig,
+        config: &AgentRunConfig,
         _cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
         let prev = self
@@ -716,28 +597,27 @@ impl Transport for ToolCallTransport {
             make_assistant_message("Done.")
         };
 
+        let turn_number = config.turn_number;
         let usage = Usage {
             input: 50,
             output: 25,
             ..Default::default()
         };
         let events = vec![
-            AgentEvent::TurnStart { turn_number: 1 },
+            AgentEvent::TurnStart { turn_number },
             AgentEvent::MessageEnd {
                 message: msg.clone(),
             },
             AgentEvent::TurnEnd {
-                turn_number: 1,
+                turn_number,
                 message: msg,
                 usage,
             },
         ];
-        Ok(Box::pin(stream::iter(events)))
+        Ok(Box::pin(fstream::iter(events)))
     }
 }
 
-/// Streams events with a delay between start and completion.
-/// Responds to cancellation.
 pub struct SlowTransport {
     delay_ms: u64,
 }
@@ -753,12 +633,13 @@ impl Transport for SlowTransport {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _config: &AgentRunConfig,
+        config: &AgentRunConfig,
         cancel: CancellationToken,
     ) -> tau_ai::Result<AgentEventStream> {
         let delay = self.delay_ms;
-        let events = async_stream::stream! {
-            yield AgentEvent::TurnStart { turn_number: 1 };
+        let turn_number = config.turn_number;
+        let events = stream! {
+            yield AgentEvent::TurnStart { turn_number };
             tokio::select! {
                 _ = time::sleep(Duration::from_millis(delay)) => {}
                 _ = cancel.cancelled() => {
@@ -768,11 +649,7 @@ impl Transport for SlowTransport {
             }
             let msg = make_assistant_message("done");
             yield AgentEvent::MessageEnd { message: msg.clone() };
-            yield AgentEvent::TurnEnd {
-                turn_number: 1,
-                message: msg,
-                usage: Usage::default(),
-            };
+            yield AgentEvent::TurnEnd { turn_number, message: msg, usage: Usage::default() };
         };
         Ok(Box::pin(events))
     }
@@ -787,7 +664,6 @@ pub struct CapturedCall {
     pub model_id: String,
 }
 
-/// Returns a fixed response but captures the messages and config it received.
 pub struct CapturingTransport {
     pub text: String,
     pub captured: Mutex<Vec<CapturedCall>>,
@@ -821,27 +697,27 @@ impl Transport for CapturingTransport {
             model_id: config.model.id.clone(),
         });
         let msg = make_assistant_message(&self.text);
+        let turn_number = config.turn_number;
         let usage = Usage {
             input: 100,
             output: 50,
             ..Default::default()
         };
         let events = vec![
-            AgentEvent::TurnStart { turn_number: 1 },
+            AgentEvent::TurnStart { turn_number },
             AgentEvent::MessageEnd {
                 message: msg.clone(),
             },
             AgentEvent::TurnEnd {
-                turn_number: 1,
+                turn_number,
                 message: msg,
                 usage,
             },
         ];
-        Ok(Box::pin(stream::iter(events)))
+        Ok(Box::pin(fstream::iter(events)))
     }
 }
 
-/// Transport that always fails with an error from `run()` (transport-level failure).
 pub struct ErrorTransport {
     pub message: String,
 }
@@ -869,276 +745,37 @@ impl Transport for ErrorTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Integration test tools
-// ---------------------------------------------------------------------------
+// ─── Test-spawn helpers ──────────────────────────────────────────────
 
-/// A sequential tool that sleeps, useful for testing steering between groups.
-pub struct SlowTool {
-    pub delay_ms: u64,
+/// Build and spawn an agent with a MockTransport + tools.
+pub fn spawn_test_agent(
+    transport: MockTransport,
+    tools: Vec<BoxedTool>,
+) -> (AgentHandle, EventCollector) {
+    spawn_test_agent_with_config(make_test_config(), transport, tools)
 }
 
-#[async_trait]
-impl Tool for SlowTool {
-    fn name(&self) -> &str {
-        "slow"
-    }
-    fn description(&self) -> &str {
-        "Slow tool"
-    }
-    fn parameters_schema(&self) -> Value {
-        serde_json::json!({ "type": "object", "properties": {} })
-    }
-    fn concurrency(&self) -> Concurrency {
-        Concurrency::Sequential
-    }
-    async fn execute(&self, _args: Value, _ctx: ExecutionContext) -> ToolResult {
-        time::sleep(Duration::from_millis(self.delay_ms)).await;
-        ToolResult::text("slow done")
-    }
+pub fn spawn_test_agent_with_config(
+    config: AgentConfig,
+    transport: MockTransport,
+    tools: Vec<BoxedTool>,
+) -> (AgentHandle, EventCollector) {
+    let mut builder = crate::core::builder::AgentBuilder::new(config, Arc::new(transport));
+    builder.set_tools(tools);
+
+    let handle = builder.handle();
+    let collector = EventCollector::from_handle(&handle);
+    builder.spawn();
+
+    (handle, collector)
 }
 
-// ---------------------------------------------------------------------------
-// Event collection utility
-// ---------------------------------------------------------------------------
+// ─── Event collection utility ────────────────────────────────────────
 
-/// Drain all available events from a broadcast receiver.
 pub fn collect_events(rx: &mut broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut events = vec![];
     while let Ok(e) = rx.try_recv() {
         events.push(e);
     }
     events
-}
-
-// ---------------------------------------------------------------------------
-// Tests for the test utilities themselves
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn make_user_message_creates_user_role() {
-        let msg = make_user_message("hello");
-        assert_eq!(msg.role(), "user");
-        assert_eq!(msg.text(), "hello");
-    }
-
-    #[test]
-    fn make_assistant_message_creates_assistant_role() {
-        let msg = make_assistant_message("hi");
-        assert_eq!(msg.role(), "assistant");
-        assert_eq!(msg.text(), "hi");
-    }
-
-    #[test]
-    fn make_tool_call_message_has_tool_call() {
-        let msg = make_tool_call_message("echo", "call_1", serde_json::json!({"text": "x"}));
-        let calls = msg.tool_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, "echo");
-    }
-
-    #[test]
-    fn make_tool_result_creates_tool_result() {
-        let msg = make_tool_result("call_1", "echo", "output");
-        assert_eq!(msg.role(), "tool_result");
-    }
-
-    #[tokio::test]
-    async fn mock_transport_returns_queued_responses() {
-        let transport = MockTransport::new()
-            .with_text_response("first")
-            .with_text_response("second");
-
-        let config = AgentRunConfig {
-            system_prompt: None,
-            tools: vec![],
-            server_tools: vec![],
-            model: make_test_model(),
-            reasoning: None,
-            thinking_adaptive: false,
-            max_tokens: None,
-            temperature: None,
-            cache_scope: None,
-            cache_ttl: None,
-            system_prompt_boundary: None,
-        };
-        let cancel = tokio_util::sync::CancellationToken::new();
-
-        // First call
-        use futures::StreamExt;
-        let stream = transport
-            .run(vec![], &config, cancel.clone())
-            .await
-            .unwrap();
-        let events: Vec<_> = stream.collect().await;
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::MessageEnd { .. }))
-        );
-
-        // Second call
-        let stream = transport.run(vec![], &config, cancel).await.unwrap();
-        let events: Vec<_> = stream.collect().await;
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::MessageEnd { .. }))
-        );
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "no more queued responses")]
-    async fn mock_transport_panics_when_exhausted() {
-        let transport = MockTransport::new().with_text_response("only one");
-
-        let config = AgentRunConfig {
-            system_prompt: None,
-            tools: vec![],
-            server_tools: vec![],
-            model: make_test_model(),
-            reasoning: None,
-            thinking_adaptive: false,
-            max_tokens: None,
-            temperature: None,
-            cache_scope: None,
-            cache_ttl: None,
-            system_prompt_boundary: None,
-        };
-        let cancel = tokio_util::sync::CancellationToken::new();
-
-        // First call succeeds
-        let _ = transport
-            .run(vec![], &config, cancel.clone())
-            .await
-            .unwrap();
-        // Second call panics
-        let _ = transport.run(vec![], &config, cancel).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn spawn_test_agent_prompt_and_collect() {
-        let transport = MockTransport::new().with_text_response("Hello from mock!");
-        let (handle, collector) = spawn_test_agent(transport, vec![]);
-
-        handle.prompt("test").await.unwrap();
-        collector.wait_for_end().await;
-
-        let events = collector.events();
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentStart)));
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
-        );
-
-        let messages = collector.assistant_messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text(), "Hello from mock!");
-    }
-
-    #[tokio::test]
-    async fn tool_execution_round_trip() {
-        let transport = MockTransport::new()
-            .with_tool_call_response("echo", "call_1", serde_json::json!({"text": "ping"}))
-            .with_text_response("Got: ping");
-
-        let echo_tool: BoxedTool = Arc::new(EchoTool);
-        let (handle, collector) = spawn_test_agent(transport, vec![echo_tool]);
-
-        handle.prompt("echo ping").await.unwrap();
-        collector.wait_for_end().await;
-
-        let events = collector.events();
-
-        // Should have tool execution events
-        assert!(events.iter().any(
-            |e| matches!(e, AgentEvent::ToolExecutionStart { tool_name, .. } if tool_name == "echo")
-        ));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } if tool_name == "echo" && !is_error)));
-
-        // Should have final text response
-        let messages = collector.assistant_messages();
-        assert!(messages.iter().any(|m| m.text() == "Got: ping"));
-    }
-
-    #[tokio::test]
-    async fn error_response_propagates() {
-        let transport = MockTransport::new().with_error("something went wrong");
-        let (handle, collector) = spawn_test_agent(transport, vec![]);
-
-        handle.prompt("test").await.unwrap();
-        collector.wait_for_end().await;
-
-        let events = collector.events();
-        // The error event from the stream gets forwarded
-        assert!(events.iter().any(|e| matches!(
-            e,
-            AgentEvent::Error { message } if message.contains("something went wrong")
-        )));
-    }
-
-    #[tokio::test]
-    async fn fail_tool_returns_error_result() {
-        let transport = MockTransport::new()
-            .with_tool_call_response("fail", "call_1", serde_json::json!({}))
-            .with_text_response("Acknowledged error");
-
-        let fail_tool: BoxedTool = Arc::new(FailTool);
-        let (handle, collector) = spawn_test_agent(transport, vec![fail_tool]);
-
-        handle.prompt("do something").await.unwrap();
-        collector.wait_for_end().await;
-
-        let events = collector.events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolExecutionEnd { is_error, .. } if *is_error))
-        );
-    }
-
-    #[tokio::test]
-    async fn event_names_are_human_readable() {
-        let transport = MockTransport::new().with_text_response("hi");
-        let (handle, collector) = spawn_test_agent(transport, vec![]);
-
-        handle.prompt("test").await.unwrap();
-        collector.wait_for_end().await;
-
-        let names = collector.event_names();
-        assert!(names.contains(&"AgentStart"));
-        assert!(names.contains(&"AgentEnd"));
-        assert!(names.contains(&"MessageEnd"));
-    }
-
-    #[tokio::test]
-    async fn take_events_clears_buffer() {
-        let transport = MockTransport::new().with_text_response("hi");
-        let (handle, collector) = spawn_test_agent(transport, vec![]);
-
-        handle.prompt("test").await.unwrap();
-        collector.wait_for_end().await;
-
-        let events = collector.take_events();
-        assert!(!events.is_empty());
-        assert_eq!(collector.count(), 0);
-    }
-
-    #[tokio::test]
-    async fn make_execution_context_works_for_tool_testing() {
-        let ctx = make_execution_context();
-        let tool = EchoTool;
-        let result = tool
-            .execute(serde_json::json!({"text": "hello"}), ctx)
-            .await;
-        assert!(!result.is_error);
-        assert_eq!(result.text_content(), "hello");
-    }
 }

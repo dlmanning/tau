@@ -1,51 +1,48 @@
-//! tau-agent: Actor-based agent runtime with tool execution
+//! tau-agent — clean-slate rewrite of `tau-agent`.
 //!
-//! This crate provides the agent loop using an actor-based architecture
-//! where the agent runs as a background task and consumers interact
-//! via channels (AgentHandle).
+//! Architecture (strict layering, top to bottom):
+//!
+//! ```text
+//! fleet/         — multi-agent management (registry, lifecycle, bus)
+//!   ↓ depends on
+//! core/          — single-agent actor: handle, state, transitions, I/O
+//!   ↓ depends on
+//! types/         — leaf types (events, errors, conversation, …)
+//! ```
+//!
+//! `core` knows nothing about subagents. `fleet` composes `core` agents.
+//! Code in `types` has no agent-runtime dependencies.
 
-pub(crate) mod actor;
-pub mod approval;
-pub mod builder;
-pub(crate) mod command;
-pub mod compaction;
-pub mod config;
-pub mod context;
-pub mod conversation;
-pub mod error;
-pub mod events;
-pub mod handle;
-pub mod interaction;
-pub(crate) mod logic;
-pub mod manager;
-pub(crate) mod overflow;
-pub mod prompts;
-pub(crate) mod state;
-pub mod stream;
-pub mod tool;
-pub(crate) mod tool_executor;
-pub mod transcript;
-pub mod transport;
-pub(crate) mod worktree;
-
-pub use approval::{
-    ApprovalDecision, ApprovalPolicy, AutoAcceptAllPolicy, DefaultApprovalPolicy, RulePolicy,
-    ToolApprovalOutcome, ToolRisk, ToolRule,
-};
-pub use builder::AgentBuilder;
-pub use command::PromptResult;
-pub use compaction::{CompactionConfig, CompactionReason};
-pub use config::{AgentConfig, DequeueMode};
-pub use conversation::Conversation;
-pub use error::Error;
-pub use events::{AgentEvent, ConsoleLevel, ConsoleLine, SubagentOutcome};
-pub use handle::AgentHandle;
-pub use interaction::{InteractionKind, InteractionRequest, InteractionResponse, QuestionOption};
-pub use manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts, SubagentResult};
-pub use tool::{
-    BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
-};
-pub use transport::Transport;
+pub mod core;
+pub mod fleet;
+pub mod types;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+// ─── Common re-exports ───────────────────────────────────────────────
+
+pub use crate::core::approval::{
+    ApprovalDecision, ApprovalPolicy, AutoAcceptAll, DefaultPolicy, RulePolicy, ToolRisk, ToolRule,
+};
+pub use crate::core::builder::AgentBuilder;
+pub use crate::core::compaction::{CompactionConfig, CompactionReason};
+pub use crate::core::config::{AgentConfig, DequeueMode};
+pub use crate::core::handle::AgentHandle;
+pub use crate::core::interaction::{
+    InteractionKind, InteractionRequest, InteractionResponse, QuestionOption,
+};
+pub use crate::core::tool::{
+    BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
+};
+pub use crate::core::transport::{AgentEventStream, AgentRunConfig, ProviderTransport, Transport};
+
+pub use crate::types::conversation::Conversation;
+pub use crate::types::error::{Error, Result};
+pub use crate::types::events::{
+    AgentEvent, ConsoleLevel, ConsoleLine, SubagentOutcome, ToolApprovalOutcome,
+};
+
+pub use crate::fleet::manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts};
+pub use crate::fleet::registry::Located;
+pub use crate::fleet::result::SubagentResult;

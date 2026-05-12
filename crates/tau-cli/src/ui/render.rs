@@ -39,15 +39,13 @@ impl TuiState {
         self.input
             .render(chunks[3], frame.buffer_mut(), &self.theme);
 
-        if self.pending_interaction.is_some() {
+        if self.pending_plan.is_some() {
+            self.render_plan_modal(frame, size);
+        } else if self.pending_interaction.is_some() {
             self.render_question_selector(frame, size);
-        }
-
-        if self.model_selector.visible {
+        } else if self.model_selector.visible {
             self.render_model_selector(frame, size);
-        }
-
-        if self.branch_selector.visible {
+        } else if self.branch_selector.visible {
             self.render_branch_selector(frame, size);
         }
     }
@@ -110,6 +108,179 @@ impl TuiState {
             .with_selected(self.branch_selector.selected);
 
         selector.render_centered(area, frame.buffer_mut());
+    }
+
+    /// Full-screen overlay rendering a `PendingPlan`. Three modes:
+    /// * `Reviewing` — plan body + footer `[A]pprove [E]xecute now [R]eject`.
+    /// * `EnteringReason` — body dimmed; user types reason in the main
+    ///   input box. The footer prompt switches accordingly.
+    fn render_plan_modal(&self, frame: &mut Frame, area: Rect) {
+        use super::types::PlanModalMode;
+        let Some(pp) = self.pending_plan.as_ref() else {
+            return;
+        };
+
+        // Clear the underlying area.
+        frame.render_widget(ratatui::widgets::Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border_style())
+            .title(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "Plan Review",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" ({} step(s)) ", pp.plan.items.len())),
+            ]));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.height < 4 {
+            return;
+        }
+
+        // Reserve last line for the footer.
+        let body = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height - 1,
+        };
+        let footer = Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        };
+
+        // Assemble body lines.
+        let dim = Style::default().fg(Color::DarkGray);
+        let label = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let mut lines: Vec<Line> = Vec::with_capacity(pp.plan.items.len() * 4 + 16);
+
+        lines.push(Line::from(Span::styled("ITEMS", label)));
+        lines.push(Line::from(Span::styled("─".repeat(body.width as usize), dim)));
+        for step in &pp.plan.items {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>4} │ ", step.id), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    step.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            for desc_line in step.description.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("       ", dim),
+                    Span::raw(desc_line.to_string()),
+                ]));
+            }
+            if !step.touches.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("       touches: ", dim),
+                    Span::styled(
+                        step.touches.join(", "),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+
+        if !pp.plan.files.is_empty() {
+            lines.push(Line::from(Span::styled("FILES", label)));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(body.width as usize),
+                dim,
+            )));
+            for f in &pp.plan.files {
+                let (sigil, color) = match f.op {
+                    tau_tools::PlanFileOp::Add => ("+", Color::Green),
+                    tau_tools::PlanFileOp::Modify => ("~", Color::Yellow),
+                    tau_tools::PlanFileOp::Delete => ("-", Color::Red),
+                };
+                let counts = if f.adds + f.dels > 0 {
+                    format!(" ({}/{})", f.adds, f.dels)
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", sigil), Style::default().fg(color)),
+                    Span::raw(f.path.clone()),
+                    Span::styled(counts, dim),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+
+        if !pp.plan.flags.is_empty() {
+            lines.push(Line::from(Span::styled("FLAGS", label)));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(body.width as usize),
+                dim,
+            )));
+            for flag in &pp.plan.flags {
+                let (sigil, color) = match flag.severity {
+                    tau_tools::PlanFlagSeverity::Info => ("ℹ", Color::Blue),
+                    tau_tools::PlanFlagSeverity::Warning => ("⚠", Color::Yellow),
+                    tau_tools::PlanFlagSeverity::Danger => ("☠", Color::Red),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", sigil), Style::default().fg(color)),
+                    Span::styled(
+                        flag.title.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                for desc_line in flag.description.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", dim),
+                        Span::raw(desc_line.to_string()),
+                    ]));
+                }
+            }
+        }
+
+        let total_lines = lines.len() as u16;
+        let scroll = pp.scroll.min(total_lines.saturating_sub(body.height));
+        let para = Paragraph::new(lines).scroll((scroll, 0));
+        frame.render_widget(para, body);
+
+        // Scrollbar
+        if total_lines > body.height {
+            let mut sb_state = ScrollbarState::new(total_lines.saturating_sub(body.height) as usize)
+                .position(scroll as usize);
+            let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+            frame.render_stateful_widget(sb, body, &mut sb_state);
+        }
+
+        // Footer
+        let footer_line = match pp.mode {
+            PlanModalMode::Reviewing => Line::from(vec![
+                Span::styled("[A]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw("pprove  "),
+                Span::styled("[E]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("xecute now  "),
+                Span::styled("[R]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::raw("eject  "),
+                Span::styled("[Esc]", dim),
+                Span::raw(" cancel  "),
+                Span::styled("↑/↓ PgUp/PgDn", dim),
+                Span::raw(" scroll"),
+            ]),
+            PlanModalMode::EnteringReason => Line::from(vec![
+                Span::styled(
+                    "Type rejection reason in the input box, then Enter. ",
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("[Esc]", dim),
+                Span::raw(" cancel reject"),
+            ]),
+        };
+        frame.render_widget(Paragraph::new(footer_line), footer);
     }
 
     fn render_conversation(&self, frame: &mut Frame, area: Rect) {

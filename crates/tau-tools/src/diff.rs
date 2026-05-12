@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
-use tau_agent::events::AgentEvent;
+use tau_agent::AgentEvent;
 
 /// Operation a `FileDiff` represents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,9 +296,10 @@ mod tests {
         assert_eq!(d.adds, 1);
         assert_eq!(d.dels, 1);
         assert!(
-            d.hunks.iter().any(|h| h.lines.iter().any(|l| {
-                l.kind == DiffLineKind::Del && l.content.contains('a')
-            })),
+            d.hunks.iter().any(|h| h
+                .lines
+                .iter()
+                .any(|l| { l.kind == DiffLineKind::Del && l.content.contains('a') })),
             "diff still references the original baseline 'a'"
         );
     }

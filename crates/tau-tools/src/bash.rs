@@ -6,8 +6,8 @@ use std::{collections::VecDeque, process::Stdio};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::approval::ToolRisk;
-use tau_agent::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::ToolRisk;
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -185,10 +185,8 @@ impl Tool for BashTool {
 
         // Echo the command being run as a muted header so the host UI can
         // visually anchor the streamed output below.
-        ctx.progress.send_at(
-            format!("$ {command}"),
-            tau_agent::events::ConsoleLevel::Muted,
-        );
+        ctx.progress
+            .send_at(format!("$ {command}"), tau_agent::ConsoleLevel::Muted);
 
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");

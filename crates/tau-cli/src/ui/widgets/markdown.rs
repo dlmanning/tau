@@ -122,8 +122,10 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                         let max_chars = width.saturating_sub(4);
                         let char_count = code_line.chars().count();
                         let display_line = if char_count > max_chars {
-                            let truncated: String =
-                                code_line.chars().take(max_chars.saturating_sub(1)).collect();
+                            let truncated: String = code_line
+                                .chars()
+                                .take(max_chars.saturating_sub(1))
+                                .collect();
                             format!("  {}…", truncated)
                         } else {
                             format!("  {}", code_line)

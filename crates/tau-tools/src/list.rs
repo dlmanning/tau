@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::tool::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Deserialize, JsonSchema)]

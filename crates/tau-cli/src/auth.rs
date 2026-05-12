@@ -107,8 +107,8 @@ pub(crate) fn show_auth_status() -> anyhow::Result<()> {
     }
 
     println!();
-    println!("Login with: tau --login <provider>");
-    println!("Logout with: tau --logout <provider>");
+    println!("Login with: tau auth login <provider>");
+    println!("Logout with: tau auth logout <provider>");
 
     Ok(())
 }
