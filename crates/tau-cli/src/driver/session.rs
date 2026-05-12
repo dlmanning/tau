@@ -435,7 +435,7 @@ impl Session {
     pub(crate) async fn compact(&mut self, frontend: &mut dyn Frontend) {
         frontend.show_system("Compacting context...").await;
         let handle = self.effective_handle().clone();
-        match handle.compact(CompactionReason::Manual).await {
+        match handle.compact(CompactionReason::Manual, None).await {
             Ok(rx) => match rx.await {
                 Ok(r) if r.result.is_ok() => {
                     let msg_count = handle.messages().await.map(|m| m.len()).unwrap_or(0);
