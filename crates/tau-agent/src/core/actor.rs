@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::approval::{ApprovalDecision, ToolRisk};
 use crate::core::command::{Command, PromptResult};
+use crate::core::compaction::estimate_total_tokens;
 use crate::core::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
 use crate::core::state::{Frame, State, ToolCall};
 use crate::core::stream::{StreamOutcome, StreamReducer};
@@ -39,6 +40,7 @@ use crate::core::tool::{ExecutionContext, ProgressSender, ToolResult, send_event
 use crate::core::transitions as t;
 use crate::core::transport::AgentEventStream;
 use crate::types::events::{AgentEvent, CompactionReason, ToolApprovalOutcome};
+use crate::types::info::ContextStats;
 
 /// Future yielded by a pending approval gate.
 type GateFuture = BoxFuture<
@@ -872,6 +874,17 @@ fn handle_busy_command(state: &mut State, cmd: Command) {
         }
         Command::GetState(reply) => {
             let _ = reply.send(state.conv.conversation.clone());
+        }
+        Command::GetContextStats(reply) => {
+            let used = estimate_total_tokens(&state.conv.conversation.messages);
+            let limit = u64::from(state.frame.config.model.context_window);
+            let remaining = limit.saturating_sub(used);
+            let _ = reply.send(ContextStats {
+                used,
+                remaining,
+                limit,
+                updated_at: chrono::Utc::now(),
+            });
         }
         Command::SetModel(m) => state.frame.config.model = m,
         Command::SetReasoning(l) => state.frame.config.reasoning = l,

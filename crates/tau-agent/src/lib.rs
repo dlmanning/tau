@@ -42,6 +42,7 @@ pub use crate::types::error::{Error, Result};
 pub use crate::types::events::{
     AgentEvent, ConsoleLevel, ConsoleLine, SubagentOutcome, ToolApprovalOutcome,
 };
+pub use crate::types::info::ContextStats;
 
 pub use crate::fleet::manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts};
 pub use crate::fleet::registry::Located;

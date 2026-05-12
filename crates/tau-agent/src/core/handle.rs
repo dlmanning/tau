@@ -28,6 +28,7 @@ use crate::core::state::Shared;
 use crate::types::conversation::Conversation;
 use crate::types::error::{Error, Result};
 use crate::types::events::{AgentEvent, CompactionReason};
+use crate::types::info::ContextStats;
 
 /// Channel-based handle into a running agent. **Pure-core**: this type
 /// does not know about the fleet. Spec transitions (`respec` /
@@ -138,6 +139,15 @@ impl AgentHandle {
     pub async fn state(&self) -> Option<Conversation> {
         let (tx, rx) = oneshot::channel();
         self.normal_tx.send(Command::GetState(tx)).await.ok()?;
+        rx.await.ok()
+    }
+
+    pub async fn context_stats(&self) -> Option<ContextStats> {
+        let (tx, rx) = oneshot::channel();
+        self.normal_tx
+            .send(Command::GetContextStats(tx))
+            .await
+            .ok()?;
         rx.await.ok()
     }
 
