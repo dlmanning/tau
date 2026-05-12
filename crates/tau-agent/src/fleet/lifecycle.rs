@@ -226,18 +226,25 @@ pub async fn send(
         },
     );
 
+    let forwarder_shutdown = CancellationToken::new();
     let event_task = bus::spawn_event_forwarder(
         entry.handle.subscribe(),
         ctx.parent_event_tx.clone(),
         agent_id.into(),
         description.clone(),
         Some(Arc::clone(&ctx.registry)),
+        forwarder_shutdown.clone(),
     );
     let cancel_bridge = spawn_cancel_bridge(entry.handle.clone(), parent_cancel.clone());
 
     let prompt_result = entry.handle.prompt_and_wait(message).await;
     cancel_bridge.abort();
-    event_task.abort();
+    // Signal then await the forwarder so it can drain any events
+    // (final `TurnEnd` / `ToolExecutionEnd`) still buffered in its
+    // broadcast receiver. See `spawn_event_forwarder` for the race
+    // this closes.
+    forwarder_shutdown.cancel();
+    let _ = event_task.await;
 
     let messages = entry.handle.messages().await.unwrap_or_default();
     let current_state = entry.handle.state().await.unwrap_or_default();
@@ -634,12 +641,14 @@ async fn run_agent_inner(
     let builder = configure_builder(ctx, spec, opts, agent_id, wt_cwd.as_deref()).await?;
     let handle = builder.spawn();
 
+    let forwarder_shutdown = CancellationToken::new();
     let event_task = bus::spawn_event_forwarder(
         handle.subscribe(),
         ctx.parent_event_tx.clone(),
         agent_id.into(),
         opts.description.clone(),
         Some(Arc::clone(&ctx.registry)),
+        forwarder_shutdown.clone(),
     );
     let cancel_bridge = spawn_cancel_bridge(handle.clone(), cancel.clone());
 
@@ -650,7 +659,12 @@ async fn run_agent_inner(
 
     let prompt_result = handle.prompt_and_wait(initial_prompt).await;
     cancel_bridge.abort();
-    event_task.abort();
+    // Signal then await the forwarder so it can drain any events
+    // (final `TurnEnd` / `ToolExecutionEnd`) still buffered in its
+    // broadcast receiver. See `spawn_event_forwarder` for the race
+    // this closes.
+    forwarder_shutdown.cancel();
+    let _ = event_task.await;
 
     let messages = handle.messages().await.unwrap_or_default();
     let text = extract_final_text(&messages);
