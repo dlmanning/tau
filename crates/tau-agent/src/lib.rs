@@ -33,7 +33,8 @@ pub use crate::core::interaction::{
     InteractionKind, InteractionRequest, InteractionResponse, QuestionOption,
 };
 pub use crate::core::tool::{
-    BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool, ToolResult,
+    BoxedTool, Concurrency, ExecutionContext, FileAccessTracker, ProgressSender, Tool,
+    ToolCategory, ToolResult,
 };
 pub use crate::core::transport::{AgentEventStream, AgentRunConfig, ProviderTransport, Transport};
 
@@ -42,7 +43,7 @@ pub use crate::types::error::{Error, Result};
 pub use crate::types::events::{
     AgentEvent, ConsoleLevel, ConsoleLine, SubagentOutcome, ToolApprovalOutcome,
 };
-pub use crate::types::info::ContextStats;
+pub use crate::types::info::{ContextStats, ToolInfo};
 
 pub use crate::fleet::manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts};
 pub use crate::fleet::registry::Located;

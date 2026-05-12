@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 use tau_agent::AgentEvent;
-use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolCategory, ToolResult};
 use tokio::fs;
 
 #[derive(Deserialize, JsonSchema)]
@@ -58,6 +58,10 @@ impl Tool for EditTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(EditArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Edit
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {

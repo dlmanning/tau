@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use glob::glob;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolCategory, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
 struct GlobArgs {
@@ -54,6 +54,10 @@ impl Tool for GlobTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(GlobArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {

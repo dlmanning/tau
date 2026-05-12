@@ -30,6 +30,8 @@ use tau_ai::Message;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use serde_json::Value as JsonValue;
+
 use crate::core::approval::{ApprovalDecision, ToolRisk};
 use crate::core::command::{Command, PromptResult};
 use crate::core::compaction::estimate_total_tokens;
@@ -40,7 +42,7 @@ use crate::core::tool::{ExecutionContext, ProgressSender, ToolResult, send_event
 use crate::core::transitions as t;
 use crate::core::transport::AgentEventStream;
 use crate::types::events::{AgentEvent, CompactionReason, ToolApprovalOutcome};
-use crate::types::info::ContextStats;
+use crate::types::info::{ContextStats, ToolInfo};
 
 /// Future yielded by a pending approval gate.
 type GateFuture = BoxFuture<
@@ -925,6 +927,36 @@ fn handle_busy_command(state: &mut State, cmd: Command) {
                 limit,
                 updated_at: chrono::Utc::now(),
             });
+        }
+        Command::ListTools(reply) => {
+            // `currently_allowed` = the policy would auto-dispatch a
+            // no-argument call. `Gate` and `Reject(_)` both surface as
+            // not auto-allowed.
+            let infos: Vec<ToolInfo> = state
+                .frame
+                .tools
+                .iter()
+                .map(|tool| {
+                    let risk = tool.risk(&JsonValue::Null);
+                    let default_allowed = matches!(risk, ToolRisk::Safe | ToolRisk::Local);
+                    let currently_allowed = matches!(
+                        state.frame.approval_policy.classify(
+                            tool.name(),
+                            &JsonValue::Null,
+                            risk,
+                        ),
+                        ApprovalDecision::Auto
+                    );
+                    ToolInfo {
+                        name: tool.name().to_string(),
+                        description: tool.description().to_string(),
+                        category: tool.category(),
+                        default_allowed,
+                        currently_allowed,
+                    }
+                })
+                .collect();
+            let _ = reply.send(infos);
         }
         Command::SetModel(m) => state.frame.config.model = m,
         Command::SetReasoning(l) => state.frame.config.reasoning = l,

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tau_agent::ToolRisk;
-use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolCategory, ToolResult};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -155,6 +155,10 @@ impl Tool for BashTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         cached_schema!(BashArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Execute
     }
 
     async fn execute(&self, arguments: serde_json::Value, ctx: ExecutionContext) -> ToolResult {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tau_agent::{ExecutionContext, Tool, ToolResult};
+use tau_agent::{ExecutionContext, Tool, ToolCategory, ToolResult};
 
 use super::LspManager;
 
@@ -53,6 +53,10 @@ impl Tool for LspTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         crate::cached_schema!(LspArgs)
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
     }
 
     async fn execute(&self, arguments: serde_json::Value, _ctx: ExecutionContext) -> ToolResult {

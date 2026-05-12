@@ -28,7 +28,7 @@ use crate::core::state::Shared;
 use crate::types::conversation::Conversation;
 use crate::types::error::{Error, Result};
 use crate::types::events::{AgentEvent, CompactionReason};
-use crate::types::info::ContextStats;
+use crate::types::info::{ContextStats, ToolInfo};
 
 /// Channel-based handle into a running agent. **Pure-core**: this type
 /// does not know about the fleet. Spec transitions (`respec` /
@@ -148,6 +148,15 @@ impl AgentHandle {
             .send(Command::GetContextStats(tx))
             .await
             .ok()?;
+        rx.await.ok()
+    }
+
+    /// Snapshot of every tool currently registered on the agent, with
+    /// its category and current approval status under the active
+    /// policy. Returns `None` if the actor is dead.
+    pub async fn list_tools(&self) -> Option<Vec<ToolInfo>> {
+        let (tx, rx) = oneshot::channel();
+        self.normal_tx.send(Command::ListTools(tx)).await.ok()?;
         rx.await.ok()
     }
 
