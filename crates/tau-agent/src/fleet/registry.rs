@@ -308,7 +308,15 @@ impl Registry {
     }
 
     /// Increment the tool-call counter on whichever bucket currently
-    /// holds the agent. Called from the bus on `ToolExecutionEnd`.
+    /// holds the agent. Called from the bus on `ToolExecutionEnd`
+    /// (success or failure — see [`crate::fleet::bus::spawn_event_forwarder`]).
+    ///
+    /// Note: this counter is updated as `ToolExecutionEnd` events
+    /// arrive; [`crate::fleet::SubagentResult::tool_use_count`]
+    /// independently counts `Content::ToolCall` blocks in the final
+    /// message log. The two should usually agree but are computed via
+    /// independent paths and can drift if (e.g.) a tool errors before
+    /// emitting `ToolExecutionEnd`.
     pub fn record_tool_use(&self, agent_id: &str) {
         let mut inner = self.inner.lock();
         if let Some(entry) = inner.running.get_mut(agent_id) {
