@@ -188,10 +188,7 @@ impl OllamaProvider {
             insert_opt(&mut opts_map, "temperature", opts.base.temperature);
             insert_opt(&mut opts_map, "num_predict", opts.base.max_tokens);
             if !opts.base.stop_sequences.is_empty() {
-                opts_map.insert(
-                    "stop".into(),
-                    serde_json::json!(opts.base.stop_sequences),
-                );
+                opts_map.insert("stop".into(), serde_json::json!(opts.base.stop_sequences));
             }
             // Runner options
             insert_opt(&mut opts_map, "num_ctx", opts.num_ctx);
@@ -1202,7 +1199,8 @@ mod tests {
 
     #[test]
     fn test_model_detail_capabilities() {
-        let json = r#"{"template":"","parameters":"","capabilities":["completion","vision","tools"]}"#;
+        let json =
+            r#"{"template":"","parameters":"","capabilities":["completion","vision","tools"]}"#;
         let detail: OllamaModelDetail = serde_json::from_str(json).unwrap();
         assert!(detail.supports_vision());
         assert!(detail.supports_tools());

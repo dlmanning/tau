@@ -640,7 +640,9 @@ mod tests {
             stop_sequences: vec!["END".to_string()],
             ..Default::default()
         };
-        let request = provider.build_request(&model, &context, Some(&options)).unwrap();
+        let request = provider
+            .build_request(&model, &context, Some(&options))
+            .unwrap();
         let config = request.generation_config.unwrap();
         assert_eq!(config.max_output_tokens, Some(2048));
         assert_eq!(config.temperature, Some(0.5));

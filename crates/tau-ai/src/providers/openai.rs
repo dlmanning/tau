@@ -216,14 +216,12 @@ fn convert_message(msg: &Message) -> Vec<OpenAIMessage> {
                         Content::Text { text } => {
                             Some(serde_json::json!({"type": "text", "text": text}))
                         }
-                        Content::Image { data, mime_type } => {
-                            Some(serde_json::json!({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": format!("data:{};base64,{}", mime_type, data)
-                                }
-                            }))
-                        }
+                        Content::Image { data, mime_type } => Some(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", mime_type, data)
+                            }
+                        })),
                         _ => None,
                     })
                     .collect();
@@ -673,7 +671,9 @@ mod tests {
             stop_sequences: vec!["STOP".to_string()],
             ..Default::default()
         };
-        let request = provider.build_request(&model, &context, Some(&options)).unwrap();
+        let request = provider
+            .build_request(&model, &context, Some(&options))
+            .unwrap();
         assert_eq!(request.max_tokens, Some(4096));
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.stop, Some(vec!["STOP".to_string()]));
