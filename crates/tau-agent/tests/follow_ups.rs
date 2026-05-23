@@ -4,14 +4,17 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
+use tau_agent::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn follow_up_processed_after_prompt() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
 
     handle.expect_follow_up();
     assert!(handle.has_pending_follow_ups());
@@ -36,7 +39,10 @@ async fn follow_up_processed_after_prompt() {
 
 #[tokio::test]
 async fn no_pending_follow_ups_finishes_immediately() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
     // No expect_follow_up — should finish immediately after LLM responds
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -106,7 +112,7 @@ async fn steering_during_tool_execution_skips_remaining() {
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(SlowTool { delay_ms: 100 }));
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let mut rx = handle.subscribe();
 
     let prompt_rx = handle.prompt("go").await.unwrap();
@@ -118,7 +124,7 @@ async fn steering_during_tool_execution_skips_remaining() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx).await;
     assert!(result.is_ok());
 
-    let events = collect_events(&mut rx);
+    let mut events = Vec::new(); while let Ok(e) = rx.try_recv() { events.push(e); }
     // The echo tool (c2) should show up as skipped
     let skipped = events.iter().any(|e| match e {
         AgentEvent::ToolExecutionEnd {
@@ -172,11 +178,10 @@ async fn max_turns_stops_infinite_tool_loop() {
         }
     }
 
-    let mut cfg = test_config();
-    cfg.max_turns = Some(3);
+    let cfg = test_config().into_builder().max_turns(3).build();
     let mut builder = AgentBuilder::new(cfg, Arc::new(AlwaysToolTransport) as Arc<dyn Transport>);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let mut rx = handle.subscribe();
 
     let r = tokio::time::timeout(
@@ -187,7 +192,7 @@ async fn max_turns_stops_infinite_tool_loop() {
     assert!(r.is_ok(), "should not hang");
     assert!(r.unwrap().is_ok());
 
-    let events = collect_events(&mut rx);
+    let mut events = Vec::new(); while let Ok(e) = rx.try_recv() { events.push(e); }
     if let Some(AgentEvent::AgentEnd { total_turns, .. }) = events
         .iter()
         .find(|e| matches!(e, AgentEvent::AgentEnd { .. }))

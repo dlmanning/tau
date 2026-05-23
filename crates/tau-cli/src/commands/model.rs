@@ -25,7 +25,7 @@ impl Command for ModelCommand {
             return;
         };
         if args.is_empty() {
-            let text = list_models(&config.model, session.available_models());
+            let text = list_models(config.model(), session.available_models());
             frontend.show_system(&text).await;
             return;
         }

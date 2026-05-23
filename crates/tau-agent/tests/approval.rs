@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tau_agent::core::approval::{
+use tau_agent::{
     ApprovalDecision, ApprovalPolicy, AutoAcceptAll, DefaultPolicy, ToolApprovalOutcome, ToolRisk,
 };
-use tau_agent::core::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
-use tau_agent::core::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::{InteractionKind, InteractionRequest, InteractionResponse};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
@@ -76,7 +76,7 @@ async fn auto_accept_policy_dispatches_elevated_without_gating() {
     builder.set_approval_policy(Arc::new(AutoAcceptAll));
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
     collector.wait_for_end().await;
@@ -102,7 +102,7 @@ async fn default_policy_local_risk_auto_approves() {
         .with_text_response("done");
 
     let echo: BoxedTool = Arc::new(EchoTool);
-    let (handle, collector) = spawn_test_agent(transport, vec![echo]);
+    let (handle, collector) = spawn_test_agent(transport, vec![echo]).await;
 
     handle.prompt_and_wait("go").await.unwrap();
     collector.wait_for_end().await;
@@ -147,7 +147,7 @@ async fn default_policy_elevated_without_interaction_channel_rejects() {
     builder.add_tool(tool);
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
     collector.wait_for_end().await;
@@ -198,7 +198,7 @@ async fn elevated_with_user_approval_dispatches() {
     builder.set_interaction_sender(interaction_tx);
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
     collector.wait_for_end().await;
@@ -239,7 +239,7 @@ async fn elevated_with_user_rejection_synth_errors() {
     builder.set_interaction_sender(interaction_tx);
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
     collector.wait_for_end().await;
@@ -279,9 +279,9 @@ async fn mixed_approval_preserves_tool_call_order() {
         async fn run(
             &self,
             _: Vec<Message>,
-            _: &tau_agent::core::transport::AgentRunConfig,
+            _: &tau_agent::AgentRunConfig,
             _: tokio_util::sync::CancellationToken,
-        ) -> tau_ai::Result<tau_agent::core::transport::AgentEventStream> {
+        ) -> tau_ai::Result<tau_agent::AgentEventStream> {
             let prev = self
                 .0
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -355,7 +355,7 @@ async fn mixed_approval_preserves_tool_call_order() {
     builder.set_interaction_sender(interaction_tx);
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
     collector.wait_for_end().await;
@@ -402,7 +402,7 @@ async fn set_approval_policy_takes_effect_for_subsequent_prompt() {
     builder.add_tool(tool);
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("first").await.unwrap();
     assert_eq!(invocations.load(Ordering::SeqCst), 0, "rejected on first");
@@ -449,7 +449,7 @@ async fn abort_during_pending_gate_terminates_cleanly() {
     builder.set_interaction_sender(interaction_tx);
     let handle = builder.handle();
     let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    builder.spawn().await.unwrap();
 
     let prompt_rx = handle.prompt("go").await.unwrap();
 
@@ -505,4 +505,124 @@ async fn default_policy_passes_through() {
         p.classify("x", &serde_json::Value::Null, ToolRisk::Local),
         ApprovalDecision::Auto
     ));
+}
+
+#[tokio::test]
+async fn interaction_timeout_synthesizes_rejection_when_host_silent() {
+    // Regression: before set_interaction_timeout existed, a host that
+    // never replied to a tool.confirm request would hang the actor
+    // indefinitely. With a timeout configured, the actor must
+    // synthesize a rejection and let the prompt finish.
+    let invocations = Arc::new(AtomicU32::new(0));
+    let tool = Arc::new(ElevatedTool {
+        name: "danger",
+        invocations: invocations.clone(),
+    });
+
+    let transport = MockTransport::new()
+        .with_tool_call_response("danger", "c1", serde_json::json!({}))
+        .with_text_response("acknowledged");
+
+    // Receiver that captures and never replies — drops the request on
+    // shutdown so the response_tx survives only as long as our handle.
+    let (interaction_tx, mut interaction_rx) =
+        tokio::sync::mpsc::channel::<InteractionRequest>(8);
+    let captured: Arc<tokio::sync::Mutex<Option<InteractionRequest>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _capturer = tokio::spawn(async move {
+        if let Some(req) = interaction_rx.recv().await {
+            *captured_clone.lock().await = Some(req);
+        }
+    });
+
+    let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
+    builder.add_tool(tool);
+    builder.set_interaction_sender(interaction_tx);
+    builder.set_interaction_timeout(std::time::Duration::from_millis(200));
+    let handle = builder.handle();
+    let collector = EventCollector::from_handle(&handle);
+    builder.spawn().await.unwrap();
+
+    // Bound the test itself well above the configured timeout.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.prompt_and_wait("go"),
+    )
+    .await
+    .expect("prompt did not finish — actor hung on the gate despite timeout")
+    .expect("prompt errored");
+    collector.wait_for_end().await;
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "timed-out tool must not run"
+    );
+
+    let timed_out = collector.events().into_iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::ToolApprovalResolved {
+                outcome: ToolApprovalOutcome::Rejected { reason },
+                ..
+            } if reason.contains("timed out")
+        )
+    });
+    assert!(
+        timed_out,
+        "expected a ToolApprovalResolved::Rejected with 'timed out' reason"
+    );
+
+    // Drop the captured request so the dangling response_tx is freed.
+    drop(captured.lock().await.take());
+}
+
+#[tokio::test]
+async fn interaction_timeout_does_not_fire_when_host_replies_in_time() {
+    // The timeout must not cancel a gate that resolved before the
+    // deadline. Otherwise hosts that reply promptly would still see
+    // spurious rejections — we want the timeout to be invisible on
+    // the happy path.
+    let invocations = Arc::new(AtomicU32::new(0));
+    let tool = Arc::new(ElevatedTool {
+        name: "danger",
+        invocations: invocations.clone(),
+    });
+
+    let transport = MockTransport::new()
+        .with_tool_call_response("danger", "c1", serde_json::json!({}))
+        .with_text_response("acknowledged");
+
+    let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(8);
+    let _handler = handle_confirm_with(interaction_rx, || InteractionResponse::Approved {
+        payload: None,
+    });
+
+    let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
+    builder.add_tool(tool);
+    builder.set_interaction_sender(interaction_tx);
+    // Generous timeout that won't fire if the host replies promptly.
+    builder.set_interaction_timeout(std::time::Duration::from_secs(60));
+    let handle = builder.handle();
+    let collector = EventCollector::from_handle(&handle);
+    builder.spawn().await.unwrap();
+
+    handle.prompt_and_wait("go").await.unwrap();
+    collector.wait_for_end().await;
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1, "tool should run");
+    let approved = collector.events().into_iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::ToolApprovalResolved {
+                outcome: ToolApprovalOutcome::Approved,
+                ..
+            }
+        )
+    });
+    assert!(
+        approved,
+        "expected ToolApprovalResolved::Approved, not a timeout"
+    );
 }

@@ -16,6 +16,7 @@ use crate::fleet::manager::AgentStatus;
 
 /// One agent's worth of snapshot data. Cheap to clone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AgentSnapshot {
     pub agent_id: String,
     pub description: String,
@@ -49,6 +50,7 @@ pub struct AgentSnapshot {
 /// hosts should sort by `started_at` or `agent_id` if a stable order is
 /// needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FleetSnapshot {
     pub agents: Vec<AgentSnapshot>,
 }

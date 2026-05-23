@@ -116,7 +116,7 @@ impl TuiState {
 
         let current_index = available_models
             .iter()
-            .position(|m| m.id == config.model.id)
+            .position(|m| m.id == config.model().id)
             .unwrap_or(0);
 
         let model_selector = SelectorState {
@@ -136,9 +136,9 @@ impl TuiState {
             status: "Ready".to_string(),
             theme: Theme::dark(),
             usage: UsageStats::default(),
-            model: config.model.clone(),
-            reasoning: config.reasoning,
-            thinking_adaptive: config.thinking_adaptive,
+            model: config.model().clone(),
+            reasoning: config.reasoning(),
+            thinking_adaptive: config.thinking_adaptive(),
             available_models,
             ui_tx,
             model_selector,
@@ -181,8 +181,8 @@ impl TuiState {
     /// mode) into the display. Called by the TUI frontend's
     /// `Frontend::on_config_change` impl after `/model` / `/thinking`.
     pub fn sync_from_config(&mut self, config: &AgentConfig) {
-        self.model = config.model.clone();
-        self.reasoning = config.reasoning;
+        self.model = config.model().clone();
+        self.reasoning = config.reasoning();
     }
 
     /// Reset token/cost counters and agent progress.

@@ -46,15 +46,8 @@ impl AgentHandle {
     // ─── Prompts ─────────────────────────────────────────────────────
 
     pub async fn prompt(&self, input: &str) -> Result<oneshot::Receiver<PromptResult>> {
-        let content = vec![tau_ai::Content::text(input)];
-        self.prompt_with_content(content).await
-    }
-
-    pub async fn prompt_with_content(
-        &self,
-        content: Vec<tau_ai::Content>,
-    ) -> Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let content = vec![tau_ai::Content::text(input)];
         if self
             .normal_tx
             .send(Command::Prompt {
@@ -97,26 +90,20 @@ impl AgentHandle {
 
     // ─── Config setters ──────────────────────────────────────────────
 
-    pub fn try_set_model(&self, m: tau_ai::Model) -> Result<()> {
-        self.try_send(Command::SetModel(m))
-    }
     pub async fn set_model(&self, m: tau_ai::Model) -> Result<()> {
         self.send(Command::SetModel(m)).await
-    }
-    pub fn try_set_reasoning(&self, l: tau_ai::ReasoningLevel) -> Result<()> {
-        self.try_send(Command::SetReasoning(l))
     }
     pub async fn set_reasoning(&self, l: tau_ai::ReasoningLevel) -> Result<()> {
         self.send(Command::SetReasoning(l)).await
     }
+    /// Non-blocking variant retained for tests that exercise the
+    /// urgent-channel backpressure path. Other config setters are
+    /// async-only.
     pub fn try_set_compaction_config(&self, c: CompactionConfig) -> Result<()> {
         self.try_send(Command::SetCompactionConfig(c))
     }
     pub async fn set_compaction_config(&self, c: CompactionConfig) -> Result<()> {
         self.send(Command::SetCompactionConfig(c)).await
-    }
-    pub fn try_set_approval_policy(&self, p: Arc<dyn ApprovalPolicy>) -> Result<()> {
-        self.try_send(Command::SetApprovalPolicy(p))
     }
     pub async fn set_approval_policy(&self, p: Arc<dyn ApprovalPolicy>) -> Result<()> {
         self.send(Command::SetApprovalPolicy(p)).await
@@ -187,12 +174,34 @@ impl AgentHandle {
         self.event_tx.subscribe()
     }
 
-    pub fn event_sender(&self) -> broadcast::Sender<AgentEvent> {
-        self.event_tx.clone()
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.shared.is_running.load(Ordering::Acquire)
+    /// Snapshot the agent's lifecycle state.
+    ///
+    /// Returns `Running` while a prompt is in flight, `Idle` when the
+    /// actor is alive and waiting for work, or `Dead { reason }` after
+    /// the actor task has terminated. Replaces the older `is_running()`
+    /// + `shutdown_reason()` pair.
+    ///
+    /// `is_terminated` is checked first so that a panic mid-prompt —
+    /// which unwinds without resetting `prompt_in_flight` — still reports
+    /// `Dead` rather than a stale `Running` once the supervisor records
+    /// termination. The one residual window is between the actor task
+    /// ending and the supervisor's `is_terminated` store: a reader there
+    /// can still observe `Running` for an already-dead-by-panic actor.
+    /// That window is inherent to recording termination from *outside*
+    /// the actor (the panicking task can't set its own terminal flag);
+    /// it closes as soon as the supervisor runs.
+    pub fn health(&self) -> crate::types::health::AgentHealth {
+        use crate::types::health::AgentHealth;
+        if self.shared.is_terminated.load(Ordering::Acquire) {
+            return AgentHealth::Dead {
+                reason: self.shared.panic_reason.lock().clone(),
+            };
+        }
+        if self.shared.prompt_in_flight.load(Ordering::Acquire) {
+            AgentHealth::Running
+        } else {
+            AgentHealth::Idle
+        }
     }
 
     /// Manager-assigned id when known. `None` for unmanaged handles.
@@ -205,10 +214,6 @@ impl AgentHandle {
     /// value silently fails — the first writer wins.
     pub fn set_agent_id(&self, id: String) -> std::result::Result<(), String> {
         self.shared.agent_id.set(id)
-    }
-
-    pub fn shutdown_reason(&self) -> Option<String> {
-        self.shared.shutdown_reason.lock().clone()
     }
 
     // ─── Abort / interrupt ───────────────────────────────────────────
@@ -296,11 +301,11 @@ impl AgentHandle {
     /// `Error::Other` instead of `Error::ActorPanic`.
     async fn dead_actor_error(&self, fallback: &str) -> Error {
         let notified = self.shared.shutdown_signaled.notified();
-        if let Some(reason) = self.shutdown_reason() {
+        if let Some(reason) = self.shared.panic_reason.lock().clone() {
             return Error::ActorPanic(reason);
         }
         let _ = tokio::time::timeout(Duration::from_millis(100), notified).await;
-        match self.shutdown_reason() {
+        match self.shared.panic_reason.lock().clone() {
             Some(reason) => Error::ActorPanic(reason),
             None => Error::Other(fallback.into()),
         }
@@ -310,7 +315,7 @@ impl AgentHandle {
     /// hasn't been recorded yet, even when one is in flight. Async
     /// callers should prefer `dead_actor_error`.
     fn dead_actor_error_sync(&self, fallback: &str) -> Error {
-        if let Some(reason) = self.shutdown_reason() {
+        if let Some(reason) = self.shared.panic_reason.lock().clone() {
             Error::ActorPanic(reason)
         } else {
             Error::Other(fallback.into())

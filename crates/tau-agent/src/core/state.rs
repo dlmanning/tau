@@ -14,7 +14,7 @@
 //! - [`Conv`] — mutable per-turn state (conversation, queues, cwd).
 //!   Borrowed `&mut Conv` by `apply_*` transitions.
 //! - [`Shared`] — atomics shared with [`AgentHandle`]. The actor
-//!   writes a few of these (e.g. `is_running`); tools read from them
+//!   writes a few of these (e.g. `prompt_in_flight`); tools read from them
 //!   via [`ExecutionContext`].
 //!
 //! All three live on the actor task. `Shared` is just `Arc`s — it
@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tau_ai::Message;
@@ -83,6 +84,17 @@ pub struct Frame {
     pub transport: Arc<dyn Transport>,
     pub event_tx: broadcast::Sender<AgentEvent>,
     pub interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
+    /// Maximum time the actor will wait on a pending
+    /// [`InteractionRequest`] response before synthesizing
+    /// [`InteractionResponse::Rejected`](crate::core::interaction::InteractionResponse::Rejected)
+    /// and unblocking the tool batch. `None` (the default) means wait
+    /// indefinitely — historical behavior, which lets a host that
+    /// never replies hang the agent.
+    ///
+    /// Also surfaced to tools via
+    /// [`ExecutionContext::interaction_timeout`](crate::core::tool::ExecutionContext::interaction_timeout)
+    /// so tool-initiated interactions can self-apply the same deadline.
+    pub interaction_timeout: Option<Duration>,
     pub approval_policy: Arc<dyn ApprovalPolicy>,
     pub transform_context: Option<Arc<TransformContextFn>>,
     /// File-access tracker. Logically "shared mutable" but it's owned
@@ -116,7 +128,16 @@ pub struct Conv {
 /// state) does not extend the actor's lifetime.
 #[derive(Clone)]
 pub struct Shared {
-    pub is_running: Arc<AtomicBool>,
+    /// `true` while a prompt is in flight (between `AgentStart` and
+    /// `AgentEnd`). Combined with `is_terminated` by
+    /// [`AgentHandle::health`](crate::core::handle::AgentHandle::health)
+    /// to compute `Running` / `Idle` / `Dead`.
+    pub prompt_in_flight: Arc<AtomicBool>,
+    /// `true` after the actor task has exited (clean shutdown OR
+    /// panic). Set by the supervisor wrapper in
+    /// [`AgentBuilder::spawn`](crate::core::builder::AgentBuilder::spawn).
+    /// Once set it never clears.
+    pub is_terminated: Arc<AtomicBool>,
     pub pending_follow_ups: Arc<AtomicU32>,
     /// The actor swaps the inner token at each prompt start under this
     /// mutex; `handle.abort()` cancels whichever token is current.
@@ -134,20 +155,23 @@ pub struct Shared {
     /// Recorded by the actor's `catch_unwind` wrapper if the actor
     /// task panics. `None` while the actor is alive or after a clean
     /// shutdown.
-    pub shutdown_reason: Arc<Mutex<Option<String>>>,
-    /// Notified after `shutdown_reason` is written.
+    pub panic_reason: Arc<Mutex<Option<String>>>,
+    /// Notified after `is_terminated` is set and `panic_reason` is
+    /// written. Used by `spawn()` to wait briefly for the supervisor
+    /// to record a panic payload when the readiness oneshot drops.
     pub shutdown_signaled: Arc<tokio::sync::Notify>,
 }
 
 impl Default for Shared {
     fn default() -> Self {
         Self {
-            is_running: Arc::new(AtomicBool::new(false)),
+            prompt_in_flight: Arc::new(AtomicBool::new(false)),
+            is_terminated: Arc::new(AtomicBool::new(false)),
             pending_follow_ups: Arc::new(AtomicU32::new(0)),
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
             interrupt_requested: Arc::new(AtomicBool::new(false)),
             agent_id: Arc::new(OnceLock::new()),
-            shutdown_reason: Arc::new(Mutex::new(None)),
+            panic_reason: Arc::new(Mutex::new(None)),
             shutdown_signaled: Arc::new(tokio::sync::Notify::new()),
         }
     }

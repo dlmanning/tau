@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
+use tau_agent::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
@@ -31,7 +31,9 @@ async fn empty_stream_completes_without_crash() {
         test_config(),
         Arc::new(EmptyStreamTransport) as Arc<dyn Transport>,
     )
-    .spawn();
+    .spawn()
+    .await
+    .unwrap();
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -96,7 +98,7 @@ async fn multi_group_sequential_then_parallel() {
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(SlowTool { delay_ms: 10 }));
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
 
@@ -123,7 +125,7 @@ async fn follow_up_during_tool_execution() {
     let transport = ToolCallTransport::create(1, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     let rx = handle.prompt("go").await.unwrap();
 
@@ -145,9 +147,14 @@ async fn follow_up_during_tool_execution() {
 
 #[tokio::test]
 async fn dequeue_mode_one_at_a_time() {
-    let mut cfg = test_config();
-    cfg.follow_up_mode = DequeueMode::OneAtATime;
-    let handle = AgentBuilder::new(cfg, TextTransport::create("ok")).spawn();
+    let cfg = test_config()
+        .into_builder()
+        .follow_up_mode(DequeueMode::OneAtATime)
+        .build();
+    let handle = AgentBuilder::new(cfg, TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
 
     // Queue up 2 follow-ups, then prompt
     handle.follow_up(Message::user("fu1")).await.unwrap();
@@ -181,7 +188,7 @@ async fn dequeue_mode_one_at_a_time() {
 async fn steer_while_idle_is_not_lost() {
     let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     // Steer while idle — the message should be queued
     handle.steer(Message::user("pre-steer")).await.unwrap();

@@ -74,6 +74,13 @@ pub struct AgentTool {
     /// Planners should not — inheriting another agent's history is an
     /// executor-handoff capability. Defaults to `true`.
     allow_inherit_history: bool,
+    /// Canonical (lowercase) spec names that may run in a git worktree
+    /// when the caller passes `isolation: worktree`. `None` (the
+    /// default) leaves worktree use unrestricted. The runtime no longer
+    /// gates worktree creation per-spec, so this host-side allowlist is
+    /// what keeps read-only/planning specs — which should never get an
+    /// isolated branch — from acquiring one.
+    worktree_specs: Option<Vec<String>>,
 }
 
 impl AgentTool {
@@ -88,6 +95,7 @@ impl AgentTool {
             inherited_policy: None,
             allow_background: true,
             allow_inherit_history: true,
+            worktree_specs: None,
         }
     }
 
@@ -119,6 +127,17 @@ impl AgentTool {
     ) -> Self {
         self.allow_background = allow_background;
         self.allow_inherit_history = allow_inherit_history;
+        self
+    }
+
+    /// Restrict which spawned spec types may run in a git worktree.
+    /// Names are matched case-insensitively against the canonical
+    /// `subagent_type`. A spawn that requests `isolation: worktree` for
+    /// a spec not in this list is rejected. `None` (the default) leaves
+    /// worktree use unrestricted — set this on every `AgentTool` whose
+    /// owner can reach a worktree-ineligible spec.
+    pub fn with_worktree_specs(mut self, names: Vec<String>) -> Self {
+        self.worktree_specs = Some(names.into_iter().map(|n| n.to_ascii_lowercase()).collect());
         self
     }
 }
@@ -212,6 +231,22 @@ impl Tool for AgentTool {
             ));
         }
 
+        // Worktree gate. The runtime honors `isolation: worktree` for any
+        // spec, so this host-side allowlist is the only thing stopping a
+        // read-only/planning spec from acquiring an isolated branch it was
+        // never meant to have.
+        if args.isolation == Some(Isolation::Worktree)
+            && let Some(ref worktree_specs) = self.worktree_specs
+            && !worktree_specs.iter().any(|s| s == &subagent_type)
+        {
+            return ToolResult::error(format!(
+                "isolation: worktree is not available for subagent_type '{}'. \
+                 Worktree isolation is an execution capability; drop the field \
+                 or omit it.",
+                args.subagent_type
+            ));
+        }
+
         let resolver = match self.spec_resolver.as_ref() {
             Some(r) => r,
             None => {
@@ -241,17 +276,20 @@ impl Tool for AgentTool {
 
         let run_in_background = args.run_in_background.unwrap_or(false);
 
+        let seed = match args.inherit_history_from {
+            Some(id) => tau_agent::AgentSeed::Inherit { agent_id: id },
+            None => tau_agent::AgentSeed::Empty,
+        };
         let opts = SpawnOpts {
             description: args.description.clone(),
             model,
             cwd: args.cwd,
             isolation: args.isolation,
-            inherit_history_from: args.inherit_history_from,
+            seed,
             // Propagate the parent's effective policy so a per-spawn
             // override at a higher level reaches deeper subagents.
             approval_policy: self.inherited_policy.clone(),
             spec_name: Some(args.subagent_type.clone()),
-            seed_messages: None,
             // Stamp the child's depth — one beyond ours.
             subagent_depth: depth + 1,
         };
@@ -319,15 +357,12 @@ fn format_result(result: &tau_agent::SubagentResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tau_agent::AgentEvent;
     use tau_agent::AgentManager;
     use tau_agent::test_utils::{MockTransport, make_test_config};
-    use tokio::sync::broadcast;
 
     fn make_manager() -> Arc<AgentManager> {
-        let (tx, _) = broadcast::channel::<AgentEvent>(16);
         let transport = Arc::new(MockTransport::new()) as Arc<dyn tau_agent::Transport>;
-        Arc::new(AgentManager::new(tx, make_test_config(), transport, 4))
+        Arc::new(AgentManager::new(make_test_config(), transport, 4))
     }
 
     /// Regression: an AgentTool inside an AgentSpec must not pin the
@@ -351,5 +386,49 @@ mod tests {
         // Tool itself is still usable as a value (would error on
         // execute, but doesn't crash on construction or drop).
         drop(tool);
+    }
+
+    /// Regression: the runtime no longer gates worktrees per-spec, so the
+    /// AgentTool's worktree allowlist must reject `isolation: worktree`
+    /// for a spec that isn't on it (e.g. a read-only `explore` agent).
+    /// The gate runs before the resolver, so no resolver is needed.
+    #[tokio::test]
+    async fn rejects_worktree_for_ineligible_spec() {
+        let manager = make_manager();
+        let tool = AgentTool::new(Arc::clone(&manager))
+            .with_worktree_specs(vec!["general-purpose".into()]);
+        let args = serde_json::json!({
+            "description": "look around",
+            "prompt": "explore the repo",
+            "subagent_type": "explore",
+            "isolation": "worktree",
+        });
+        let ctx = tau_agent::test_utils::make_execution_context();
+        let result = tool.execute(args, ctx).await;
+        assert!(result.is_error, "ineligible worktree spawn must be rejected");
+        assert!(
+            result.text_content().contains("worktree"),
+            "rejection should explain the worktree restriction, got: {}",
+            result.text_content()
+        );
+    }
+
+    /// The gate is keyed on the canonical (lowercased) subagent_type, so a
+    /// mixed-case request for an ineligible spec is still rejected.
+    #[tokio::test]
+    async fn worktree_gate_is_case_insensitive() {
+        let manager = make_manager();
+        let tool =
+            AgentTool::new(Arc::clone(&manager)).with_worktree_specs(vec!["general-purpose".into()]);
+        let args = serde_json::json!({
+            "description": "look around",
+            "prompt": "explore the repo",
+            "subagent_type": "EXPLORE",
+            "isolation": "worktree",
+        });
+        let ctx = tau_agent::test_utils::make_execution_context();
+        let result = tool.execute(args, ctx).await;
+        assert!(result.is_error, "case-variant ineligible spawn must be rejected");
+        assert!(result.text_content().contains("worktree"));
     }
 }

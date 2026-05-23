@@ -40,10 +40,6 @@ use crate::types::events::AgentEvent;
 
 // ─── Message constructors ────────────────────────────────────────────
 
-pub fn make_user_message(text: &str) -> Message {
-    Message::user(text)
-}
-
 pub fn make_assistant_message(text: &str) -> Message {
     Message::Assistant {
         content: vec![Content::text(text)],
@@ -56,10 +52,6 @@ pub fn make_tool_call_message(name: &str, id: &str, args: Value) -> Message {
         content: vec![Content::tool_call(id, name, args)],
         metadata: AssistantMetadata::default(),
     }
-}
-
-pub fn make_tool_result(id: &str, name: &str, text: &str) -> Message {
-    Message::tool_result(id, name, vec![Content::text(text)], false)
 }
 
 // ─── Test model & config ─────────────────────────────────────────────
@@ -112,6 +104,7 @@ pub fn make_execution_context() -> ExecutionContext {
         cancel: CancellationToken::new(),
         progress: ProgressSender::new(tx, "test_call", "test_tool"),
         interaction: None,
+        interaction_timeout: None,
         file_access: Arc::new(ParkingMutex::new(FileAccessTracker::default())),
         agent_id: None,
         subagent_depth: 0,
@@ -386,16 +379,12 @@ fn event_type_name(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecutionEnd { .. } => "ToolExecutionEnd",
         AgentEvent::ToolApprovalResolved { .. } => "ToolApprovalResolved",
         AgentEvent::FileChanged { .. } => "FileChanged",
-        AgentEvent::SubagentStarted { .. } => "SubagentStarted",
-        AgentEvent::SubagentResumed { .. } => "SubagentResumed",
-        AgentEvent::SubagentCompleted { .. } => "SubagentCompleted",
-        AgentEvent::SubagentReport { .. } => "SubagentReport",
+        AgentEvent::AgentReport { .. } => "AgentReport",
         AgentEvent::TurnEnd { .. } => "TurnEnd",
         AgentEvent::AgentEnd { .. } => "AgentEnd",
         AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionEnd { .. } => "CompactionEnd",
         AgentEvent::Error { .. } => "Error",
-        AgentEvent::Subagent { .. } => "Subagent",
     }
 }
 
@@ -747,15 +736,17 @@ impl Transport for ErrorTransport {
 
 // ─── Test-spawn helpers ──────────────────────────────────────────────
 
-/// Build and spawn an agent with a MockTransport + tools.
-pub fn spawn_test_agent(
+/// Build and spawn an agent with a MockTransport + tools. Async
+/// because [`AgentBuilder::spawn`] awaits the actor's readiness
+/// signal — see the API reference for the contract.
+pub async fn spawn_test_agent(
     transport: MockTransport,
     tools: Vec<BoxedTool>,
 ) -> (AgentHandle, EventCollector) {
-    spawn_test_agent_with_config(make_test_config(), transport, tools)
+    spawn_test_agent_with_config(make_test_config(), transport, tools).await
 }
 
-pub fn spawn_test_agent_with_config(
+pub async fn spawn_test_agent_with_config(
     config: AgentConfig,
     transport: MockTransport,
     tools: Vec<BoxedTool>,
@@ -763,19 +754,9 @@ pub fn spawn_test_agent_with_config(
     let mut builder = crate::core::builder::AgentBuilder::new(config, Arc::new(transport));
     builder.set_tools(tools);
 
-    let handle = builder.handle();
-    let collector = EventCollector::from_handle(&handle);
-    builder.spawn();
+    let collector = EventCollector::from_handle(&builder.handle());
+    let handle = builder.spawn().await.expect("test agent spawn");
 
     (handle, collector)
 }
 
-// ─── Event collection utility ────────────────────────────────────────
-
-pub fn collect_events(rx: &mut broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
-    let mut events = vec![];
-    while let Ok(e) = rx.try_recv() {
-        events.push(e);
-    }
-    events
-}

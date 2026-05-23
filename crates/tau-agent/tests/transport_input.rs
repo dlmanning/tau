@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
+use tau_agent::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
@@ -15,7 +15,7 @@ async fn system_prompt_sent_to_transport() {
     let transport = CapturingTransport::create("ok");
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.set_system_prompt("You are helpful.");
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("hi").await.unwrap();
 
@@ -28,7 +28,7 @@ async fn tool_definitions_sent_to_transport() {
     let transport = CapturingTransport::create("ok");
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("hi").await.unwrap();
 
@@ -44,7 +44,7 @@ async fn tool_definitions_sent_to_transport() {
 async fn model_id_sent_to_transport() {
     let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("hi").await.unwrap();
 
@@ -56,7 +56,7 @@ async fn model_id_sent_to_transport() {
 async fn user_message_in_first_call_context() {
     let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("what is 2+2").await.unwrap();
 
@@ -127,7 +127,7 @@ async fn tool_results_sent_to_transport_on_next_turn() {
     });
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
 
@@ -168,11 +168,11 @@ async fn tool_results_sent_to_transport_on_next_turn() {
 async fn model_change_reflected_in_subsequent_calls() {
     let transport = CapturingTransport::create("ok");
     let builder = AgentBuilder::new(test_config(), transport.clone());
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("first").await.unwrap();
 
-    let mut new_model = test_config().model;
+    let mut new_model = test_config().model().clone();
     new_model.id = "changed-model".into();
     handle.set_model(new_model).await.unwrap();
 
@@ -191,7 +191,7 @@ async fn transform_context_applied_before_transport() {
         msgs.push(Message::user("[injected by transform]"));
         msgs
     }));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("hello").await.unwrap();
 
@@ -268,7 +268,7 @@ async fn steering_during_tools_does_not_duplicate_tool_results() {
     let mut builder = AgentBuilder::new(test_config(), transport.clone());
     builder.add_tool(Arc::new(SlowTool { delay_ms: 100 }));
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     let rx = handle.prompt("go").await.unwrap();
 

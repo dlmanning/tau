@@ -1,23 +1,22 @@
 //! Integration tests for AgentManager subagent orchestration:
 //! spawn, resume, eviction, event forwarding, background agents,
-//! find_agent, send_to_running, cancel propagation.
+//! find_agent, cancel propagation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use futures::stream;
-use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
-use tau_agent::fleet::manager::{AgentManager, AgentSpec, AgentStatus, SpawnOpts};
+use tau_agent::{AgentEventStream, AgentRunConfig};
+use tau_agent::{AgentManager, AgentSpec, AgentStatus, SpawnOpts};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 use tokio_util::sync::CancellationToken;
 
 fn make_manager(transport: Arc<dyn Transport>) -> Arc<AgentManager> {
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let config = test_config();
-    Arc::new(AgentManager::new(event_tx, config, transport, 20))
+    Arc::new(AgentManager::new(config, transport, 20))
 }
 
 fn echo_spec() -> AgentSpec {
@@ -25,8 +24,6 @@ fn echo_spec() -> AgentSpec {
         system_prompt: String::new(),
         tools: vec![Arc::new(EchoTool)],
         max_turns: 200,
-        allows_worktree: false,
-        allowed_subagent_specs: None,
     }
 }
 
@@ -86,6 +83,51 @@ async fn spawn_foreground_stores_agent_for_resumption() {
     assert_eq!(located.status, AgentStatus::Idle);
 }
 
+#[tokio::test]
+async fn inherit_preserves_previous_summary() {
+    // Regression: AgentSeed::Inherit must carry the source agent's
+    // compaction summary, not just its messages — dropping it makes the
+    // inheritor's first compaction fall back to the initial-summarization
+    // path and lose continuity (the plan→execute handoff relies on this).
+    let manager = make_manager(TextTransport::create("unused"));
+
+    // A source agent seeded with a previous_summary, adopted so the
+    // Inherit resolver can find it in the registry.
+    let mut src_builder = AgentBuilder::new(test_config(), TextTransport::create("unused"));
+    src_builder.seed(AgentSeed::Messages {
+        messages: vec![
+            Message::user("earlier work"),
+            make_assistant_message("earlier reply"),
+        ],
+        previous_summary: Some("SOURCE-SUMMARY".into()),
+    });
+    let source = src_builder.spawn().await.unwrap();
+    let source_id = manager.adopt(&source, "source", echo_spec());
+
+    // spawn_interactive returns the handle directly and runs through the
+    // same configure_builder path as a real subagent spawn.
+    let opts = SpawnOpts {
+        description: "inheritor".into(),
+        seed: AgentSeed::Inherit {
+            agent_id: source_id,
+        },
+        ..Default::default()
+    };
+    let (inheritor, _id) = manager.spawn_interactive(echo_spec(), opts).await.unwrap();
+
+    let state = inheritor.state().await.expect("inheritor returns state");
+    assert_eq!(
+        state.previous_summary.as_deref(),
+        Some("SOURCE-SUMMARY"),
+        "inherit must carry the source's previous_summary, not drop it"
+    );
+    assert_eq!(
+        state.messages.len(),
+        2,
+        "inherit must also carry the source's messages"
+    );
+}
+
 // ─── Resume (send) ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -124,11 +166,10 @@ async fn send_to_nonexistent_agent_errors() {
     let cancel = CancellationToken::new();
 
     let result = manager.send("nonexistent-id", "hello", cancel).await;
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
+    let err = result.expect_err("send to missing agent must fail");
     assert!(
-        msg.contains("no agent with id"),
-        "expected 'no agent with id' in error, got: {msg}"
+        matches!(&err, tau_agent::Error::AgentNotFound { id } if id == "nonexistent-id"),
+        "expected Error::AgentNotFound {{ id: \"nonexistent-id\" }}, got: {err:?}"
     );
 }
 
@@ -136,11 +177,10 @@ async fn send_to_nonexistent_agent_errors() {
 
 #[tokio::test]
 async fn eviction_removes_oldest_agent() {
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let transport = TextTransport::create("ok");
     let config = test_config();
     // Max 2 agents
-    let manager = Arc::new(AgentManager::new(event_tx, config, transport, 2));
+    let manager = Arc::new(AgentManager::new(config, transport, 2));
     let cancel = CancellationToken::new();
 
     let a1 = manager
@@ -186,10 +226,10 @@ async fn eviction_removes_oldest_agent() {
 
 #[tokio::test]
 async fn subagent_events_forwarded_as_wrapped() {
-    let (event_tx, mut parent_rx) = tokio::sync::broadcast::channel(256);
     let transport = TextTransport::create("ok");
     let config = test_config();
-    let manager = Arc::new(AgentManager::new(event_tx, config, transport, 20));
+    let manager = Arc::new(AgentManager::new(config, transport, 20));
+    let mut fleet_rx = manager.subscribe();
     let cancel = CancellationToken::new();
 
     manager
@@ -204,12 +244,12 @@ async fn subagent_events_forwarded_as_wrapped() {
 
     // Collect forwarded events
     let mut subagent_events = vec![];
-    while let Ok(event) = parent_rx.try_recv() {
-        if let AgentEvent::Subagent {
+    while let Ok(event) = fleet_rx.try_recv() {
+        if let FleetEvent::Forwarded {
             description, event, ..
         } = event
         {
-            subagent_events.push((description, *event));
+            subagent_events.push((description, event));
         }
     }
 
@@ -258,12 +298,11 @@ async fn find_agent_not_found() {
 async fn spawn_background_posts_follow_up() {
     let transport = TextTransport::create("background result");
     let config = test_config();
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
+    let manager = Arc::new(AgentManager::new(config.clone(), transport, 20));
 
     // Create a parent agent to receive the follow-up
     let parent_builder = AgentBuilder::new(config, TextTransport::create("parent response"));
-    let parent_handle = parent_builder.spawn();
+    let parent_handle = parent_builder.spawn().await.unwrap();
 
     let parent_cancel = CancellationToken::new();
 
@@ -426,11 +465,14 @@ async fn multiple_background_agents_complete_at_different_times() {
     // They should all post follow-ups to the parent, and all be stored after completion.
     let transport: Arc<dyn Transport> = Arc::new(VariableDelayTransport::new());
     let config = test_config();
-    let (event_tx, mut parent_rx) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
+    let manager = Arc::new(AgentManager::new(config.clone(), transport, 20));
+    let mut fleet_rx = manager.subscribe();
 
     // Parent agent receives follow-ups
-    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent"))
+        .spawn()
+        .await
+        .unwrap();
     let parent_cancel = CancellationToken::new();
 
     let mut agent_ids = vec![];
@@ -461,8 +503,8 @@ async fn multiple_background_agents_complete_at_different_times() {
 
     // Parent should have received subagent events from all 6
     let mut subagent_ids = std::collections::HashSet::new();
-    while let Ok(event) = parent_rx.try_recv() {
-        if let AgentEvent::Subagent { agent_id, .. } = event {
+    while let Ok(event) = fleet_rx.try_recv() {
+        if let FleetEvent::Forwarded { agent_id, .. } = event {
             subagent_ids.insert(agent_id);
         }
     }
@@ -480,10 +522,12 @@ async fn cancel_all_concurrent_background_agents() {
     // All should terminate promptly.
     let transport = SlowTransport::create(10_000);
     let config = test_config();
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
+    let manager = Arc::new(AgentManager::new(config.clone(), transport, 20));
 
-    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent"))
+        .spawn()
+        .await
+        .unwrap();
     let parent_cancel = CancellationToken::new();
 
     for i in 0..4 {
@@ -517,10 +561,12 @@ async fn interleave_foreground_and_background_agents() {
     // All should complete without interfering.
     let transport: Arc<dyn Transport> = Arc::new(VariableDelayTransport::new());
     let config = test_config();
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
+    let manager = Arc::new(AgentManager::new(config.clone(), transport, 20));
 
-    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent"))
+        .spawn()
+        .await
+        .unwrap();
     let parent_cancel = CancellationToken::new();
     let cancel = CancellationToken::new();
 
@@ -582,10 +628,12 @@ async fn resume_while_background_agent_running() {
     // then resume the first agent while the background one is still running.
     let transport: Arc<dyn Transport> = Arc::new(VariableDelayTransport::new());
     let config = test_config();
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(event_tx, config.clone(), transport, 20));
+    let manager = Arc::new(AgentManager::new(config.clone(), transport, 20));
 
-    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent")).spawn();
+    let parent_handle = AgentBuilder::new(config, TextTransport::create("parent"))
+        .spawn()
+        .await
+        .unwrap();
     let parent_cancel = CancellationToken::new();
     let cancel = CancellationToken::new();
 
@@ -733,16 +781,13 @@ async fn abort_root_agent_cancels_all_subagents() {
         counter: cancel_count.clone(),
     });
     let config = test_config();
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AgentManager::new(
-        event_tx,
-        config.clone(),
-        sub_transport,
-        20,
-    ));
+    let manager = Arc::new(AgentManager::new(config.clone(), sub_transport, 20));
 
     // Root agent with a slow transport (simulates LLM streaming)
-    let root_handle = AgentBuilder::new(config, SlowTransport::create(60_000)).spawn();
+    let root_handle = AgentBuilder::new(config, SlowTransport::create(60_000))
+        .spawn()
+        .await
+        .unwrap();
     let prompt_rx = root_handle.prompt("start").await.unwrap();
 
     // Wait for root to enter AwaitingModel

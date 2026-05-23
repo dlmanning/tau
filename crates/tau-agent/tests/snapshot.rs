@@ -6,13 +6,7 @@ use std::sync::Arc;
 use tau_agent::*;
 
 fn make_manager(transport: Arc<dyn Transport>) -> Arc<AgentManager> {
-    let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-    Arc::new(AgentManager::new(
-        tx,
-        test_utils::test_config(),
-        transport,
-        4,
-    ))
+    Arc::new(AgentManager::new(test_utils::test_config(), transport, 4))
 }
 
 fn spec_with_tools(tools: Vec<BoxedTool>) -> AgentSpec {
@@ -20,8 +14,6 @@ fn spec_with_tools(tools: Vec<BoxedTool>) -> AgentSpec {
         system_prompt: String::new(),
         tools,
         max_turns: 5,
-        allows_worktree: false,
-        allowed_subagent_specs: None,
     }
 }
 

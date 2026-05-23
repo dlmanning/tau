@@ -86,9 +86,9 @@ impl Tool for SendMessageTool {
 
         match status {
             AgentStatus::Running => {
-                manager
-                    .send_to_running(&agent_id, tau_ai::Message::user(&wrapped))
-                    .await;
+                if let Some(handle) = manager.handle_for(&agent_id) {
+                    let _ = handle.steer(tau_ai::Message::user(&wrapped)).await;
+                }
                 ToolResult::text(format!(
                     "Message delivered to running agent '{}' ({})",
                     description, agent_id

@@ -26,7 +26,7 @@ impl Command for SessionCommand {
         };
         let messages = session.current_messages().await;
         let usage = session.current_usage().await;
-        let model = &config.model;
+        let model = config.model();
 
         let mut output = String::from("Session Info\n");
         output.push_str(&"-".repeat(40));
@@ -37,7 +37,7 @@ impl Command for SessionCommand {
             model.id,
             model.provider.name()
         ));
-        output.push_str(&format!("Reasoning:  {:?}\n", config.reasoning));
+        output.push_str(&format!("Reasoning:  {:?}\n", config.reasoning()));
         output.push('\n');
 
         let user_msgs = messages

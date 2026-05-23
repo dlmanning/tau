@@ -1,8 +1,11 @@
 //! `subagent_report` — a subagent self-labels its outcome before terminating.
 //!
-//! Emits [`AgentEvent::SubagentReport`] on the subagent's own stream. The
-//! parent's host receives it wrapped as `Subagent { event: SubagentReport }`
-//! and correlates with the eventual `SubagentCompleted` by `agent_id`.
+//! Emits [`AgentEvent::AgentReport`] on the agent's own stream. The fleet
+//! bus translates this into [`tau_agent::FleetEvent::AgentReport`] (stamped
+//! with the agent's id) when forwarding; hosts subscribed to
+//! [`tau_agent::AgentManager::subscribe`](tau_agent::AgentManager::subscribe)
+//! see it there and correlate with the eventual `FleetEvent::AgentCompleted`
+//! by `agent_id`.
 //!
 //! The `tag` is intentionally free-form — different host products want
 //! different vocabularies (`"passed"`/`"failed"`, `"approve"`/`"changes"`,
@@ -78,7 +81,7 @@ impl Tool for SubagentReportTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
         };
-        ctx.progress.emit(AgentEvent::SubagentReport {
+        ctx.progress.emit(AgentEvent::AgentReport {
             tag: args.tag,
             summary: args.summary,
         });

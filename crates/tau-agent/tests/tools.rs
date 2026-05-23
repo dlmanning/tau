@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
+use tau_agent::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
@@ -15,12 +15,12 @@ async fn single_tool_call_round_trip() {
     let transport = ToolCallTransport::create(1, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let mut rx = handle.subscribe();
 
     handle.prompt_and_wait("go").await.unwrap();
 
-    let events = collect_events(&mut rx);
+    let mut events = Vec::new(); while let Ok(e) = rx.try_recv() { events.push(e); }
     let starts: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
@@ -47,12 +47,12 @@ async fn multi_turn_tool_loop() {
     let transport = ToolCallTransport::create(3, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let mut rx = handle.subscribe();
 
     handle.prompt_and_wait("go").await.unwrap();
 
-    let events = collect_events(&mut rx);
+    let mut events = Vec::new(); while let Ok(e) = rx.try_recv() { events.push(e); }
     let tool_count = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
@@ -121,7 +121,7 @@ async fn parallel_tool_results_preserve_request_order() {
     let transport: Arc<dyn Transport> = Arc::new(ThreeToolTransport(AtomicU32::new(1)));
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
 
@@ -189,7 +189,7 @@ async fn tool_only_assistant_message_is_stored() {
     let transport: Arc<dyn Transport> = Arc::new(ToolOnlyTransport(AtomicU32::new(1)));
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("go").await.unwrap();
 
@@ -211,7 +211,7 @@ async fn tool_only_assistant_message_is_stored() {
 async fn context_includes_full_conversation_history() {
     let transport = CapturingTransport::create("response");
     let builder = AgentBuilder::new(test_config(), transport.clone());
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     handle.prompt_and_wait("first").await.unwrap();
     handle.prompt_and_wait("second").await.unwrap();

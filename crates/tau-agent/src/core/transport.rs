@@ -89,6 +89,7 @@ fn is_local_provider(provider: Provider) -> bool {
 // ─── Per-call configuration ──────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AgentRunConfig {
     pub system_prompt: Option<String>,
     pub tools: Vec<AiTool>,

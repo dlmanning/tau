@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use parking_lot::Mutex as ParkingMutex;
@@ -37,12 +38,40 @@ pub const DEFAULT_URGENT_CAPACITY: usize = 256;
 /// prompt requests). Smaller because volume is naturally bounded.
 pub const DEFAULT_NORMAL_CAPACITY: usize = 64;
 
+/// History to load into an agent at construction.
+///
+/// Used by both [`AgentBuilder::seed`] and
+/// [`SpawnOpts::seed`](crate::fleet::manager::SpawnOpts::seed). The
+/// `Inherit` variant is only meaningful inside `SpawnOpts` — the fleet
+/// resolves it against the registry at spawn time. Setting `Inherit`
+/// on [`AgentBuilder`] is a no-op (the builder has no registry to
+/// look up against) and emits a `tracing::warn!`.
+#[derive(Debug, Clone, Default)]
+pub enum AgentSeed {
+    /// Start fresh — no messages, no prior summary.
+    #[default]
+    Empty,
+    /// Restore from explicit history, optionally with a compaction tail.
+    /// `previous_summary` seeds [`Conversation::previous_summary`](crate::types::conversation::Conversation::previous_summary)
+    /// so the next compaction can thread continuity.
+    Messages {
+        messages: Vec<Message>,
+        previous_summary: Option<String>,
+    },
+    /// Clone another tracked agent's current message history at spawn
+    /// time. The named id must be in
+    /// [`AgentManager`](crate::fleet::AgentManager)'s registry (idle,
+    /// running, or adopted) when the fleet resolves this variant.
+    Inherit { agent_id: String },
+}
+
 pub struct AgentBuilder {
     config: AgentConfig,
     transport: Arc<dyn Transport>,
     tools: Vec<BoxedTool>,
     server_tools: Vec<ServerTool>,
     interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
+    interaction_timeout: Option<Duration>,
     approval_policy: Arc<dyn ApprovalPolicy>,
     cwd: Option<PathBuf>,
     transform_context: Option<Arc<TransformContextFn>>,
@@ -57,6 +86,11 @@ pub struct AgentBuilder {
     normal_tx: mpsc::Sender<Command>,
     normal_rx: Option<mpsc::Receiver<Command>>,
     shared: Shared,
+
+    /// Test-only: when set, the spawned actor task panics before
+    /// signalling readiness, exercising `spawn() -> Err(ActorPanic)`.
+    #[cfg(any(test, feature = "test-utils"))]
+    panic_at_startup: bool,
 }
 
 impl AgentBuilder {
@@ -86,6 +120,7 @@ impl AgentBuilder {
             tools: vec![],
             server_tools: vec![],
             interaction_tx: None,
+            interaction_timeout: None,
             approval_policy: Arc::new(DefaultPolicy),
             cwd: None,
             transform_context: None,
@@ -98,6 +133,8 @@ impl AgentBuilder {
             normal_tx,
             normal_rx: Some(normal_rx),
             shared,
+            #[cfg(any(test, feature = "test-utils"))]
+            panic_at_startup: false,
         }
     }
 
@@ -128,6 +165,31 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a deadline on every `InteractionRequest` the runtime emits
+    /// (today, that's the `tool.confirm` approval gate). If the host
+    /// hasn't responded within `timeout`, the actor synthesizes
+    /// [`InteractionResponse::Rejected`](crate::core::interaction::InteractionResponse::Rejected)
+    /// with an `"interaction timed out"` reason, rejects the tool call,
+    /// and continues the prompt — closing the "host never replies"
+    /// hang.
+    ///
+    /// The same value is exposed to tools via
+    /// [`ExecutionContext::interaction_timeout`](crate::core::tool::ExecutionContext::interaction_timeout)
+    /// so tool-initiated interactions can apply the same deadline.
+    /// Default (no call) is unbounded wait — preserves historical
+    /// behavior.
+    pub fn set_interaction_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.interaction_timeout = Some(timeout);
+        self
+    }
+
+    /// Clear any previously-set interaction timeout (revert to
+    /// unbounded waits).
+    pub fn clear_interaction_timeout(&mut self) -> &mut Self {
+        self.interaction_timeout = None;
+        self
+    }
+
     pub fn set_approval_policy(&mut self, policy: Arc<dyn ApprovalPolicy>) -> &mut Self {
         self.approval_policy = policy;
         self
@@ -138,13 +200,31 @@ impl AgentBuilder {
         self
     }
 
-    pub fn set_messages(&mut self, messages: Vec<Message>) -> &mut Self {
-        self.initial_messages = messages;
-        self
-    }
-
-    pub fn set_previous_summary(&mut self, summary: Option<String>) -> &mut Self {
-        self.previous_summary = summary;
+    /// Seed the agent's conversation history. See [`AgentSeed`] for the
+    /// variants. Replaces any prior seed; pass [`AgentSeed::Empty`] to
+    /// clear back to a fresh agent.
+    pub fn seed(&mut self, seed: AgentSeed) -> &mut Self {
+        match seed {
+            AgentSeed::Empty => {
+                self.initial_messages = vec![];
+                self.previous_summary = None;
+            }
+            AgentSeed::Messages {
+                messages,
+                previous_summary,
+            } => {
+                self.initial_messages = messages;
+                self.previous_summary = previous_summary;
+            }
+            AgentSeed::Inherit { agent_id } => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "AgentSeed::Inherit ignored on AgentBuilder (no registry to look up); use SpawnOpts::seed via AgentManager instead"
+                );
+                self.initial_messages = vec![];
+                self.previous_summary = None;
+            }
+        }
         self
     }
 
@@ -177,6 +257,16 @@ impl AgentBuilder {
         self.event_tx.clone()
     }
 
+    /// Subscribe to the agent's event stream before [`Self::spawn`]
+    /// starts the actor. Mirrors [`broadcast::Sender::subscribe`].
+    ///
+    /// Subscribing before `spawn` is the only way to guarantee
+    /// receipt of `AgentStart` — receivers created after the actor
+    /// task is running may miss it depending on scheduling.
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.event_tx.subscribe()
+    }
+
     /// Get a working `AgentHandle` before calling [`Self::spawn`].
     ///
     /// The returned handle shares all primitives with the eventual
@@ -201,11 +291,29 @@ impl AgentBuilder {
         }
     }
 
-    /// Consume the builder, spawn the actor task, return the handle.
+    /// Test-only: configure the actor to panic at startup before
+    /// signalling readiness. Used by `spawn().await -> Err(ActorPanic)`
+    /// tests. The panic is injected by wrapping the actor future in
+    /// `spawn()` itself; the actor task and `Frame` see no test hook.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_panic_at_startup(&mut self, panic: bool) -> &mut Self {
+        self.panic_at_startup = panic;
+        self
+    }
+
+    /// Consume the builder, spawn the actor task, and wait for the
+    /// actor to signal readiness before returning the handle.
+    ///
+    /// Returns `Err(Error::ActorPanic)` if the actor task panicked
+    /// before signalling — i.e. before reaching `Idle` for the first
+    /// time. The actor itself currently has no fallible async setup,
+    /// but the contract leaves room for future startup checks
+    /// (transport pre-warm, tool init) to surface their errors here
+    /// rather than via a side-channel.
     ///
     /// The returned handle is interchangeable with one from
     /// [`Self::handle`] — same channels, same shared atomics.
-    pub fn spawn(mut self) -> AgentHandle {
+    pub async fn spawn(mut self) -> crate::types::error::Result<AgentHandle> {
         let urgent_rx = self.urgent_rx.take().expect("spawn() consumes self");
         let normal_rx = self.normal_rx.take().expect("spawn() consumes self");
 
@@ -245,6 +353,7 @@ impl AgentBuilder {
             transport: self.transport,
             event_tx: self.event_tx.clone(),
             interaction_tx: self.interaction_tx,
+            interaction_timeout: self.interaction_timeout,
             approval_policy: self.approval_policy,
             transform_context: self.transform_context,
             file_access: Arc::new(ParkingMutex::new(FileAccessTracker::default())),
@@ -262,23 +371,34 @@ impl AgentBuilder {
             shared: self.shared.clone(),
         };
 
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
         // Wrap the actor future in `catch_unwind` so we record the
         // panic reason from *inside* the actor task before tokio drops
         // the spawn. Closes the race where a handle's send returns
         // `Closed` (from receivers dropping during unwind) before any
-        // supervisor would have written `shutdown_reason`.
+        // supervisor would have written `panic_reason`.
         let event_tx_for_supervisor = self.event_tx.clone();
-        let shutdown_reason = self.shared.shutdown_reason.clone();
+        let panic_reason = self.shared.panic_reason.clone();
         let shutdown_signaled = self.shared.shutdown_signaled.clone();
+        let is_terminated = self.shared.is_terminated.clone();
+        #[cfg(any(test, feature = "test-utils"))]
+        let panic_at_startup = self.panic_at_startup;
         tokio::spawn(async move {
-            let actor_future =
-                AssertUnwindSafe(crate::core::actor::run_actor(state, urgent_rx, normal_rx));
-            match actor_future.catch_unwind().await {
+            // Both the test-fixture panic and the actor's runtime
+            // panic must be inside the same `catch_unwind` so the
+            // supervisor records `panic_reason` and `spawn().await`
+            // surfaces `Err(ActorPanic)` either way.
+            let task = AssertUnwindSafe(async move {
+                #[cfg(any(test, feature = "test-utils"))]
+                if panic_at_startup {
+                    panic!("tau-agent test fixture: panic_at_startup");
+                }
+                crate::core::actor::run_actor(state, urgent_rx, normal_rx, ready_tx).await;
+            });
+            match task.catch_unwind().await {
                 Ok(()) => {
-                    // Clean shutdown — leave shutdown_reason as None.
-                    // Still notify so any concurrent `dead_actor_error`
-                    // wakes and falls through to the fallback.
-                    shutdown_signaled.notify_waiters();
+                    // Clean shutdown — leave panic_reason as None.
                 }
                 Err(payload) => {
                     let reason = payload
@@ -287,20 +407,53 @@ impl AgentBuilder {
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "<non-string panic payload>".to_string());
                     tracing::error!(reason = %reason, "agent actor task panicked");
-                    *shutdown_reason.lock() = Some(reason.clone());
-                    shutdown_signaled.notify_waiters();
+                    *panic_reason.lock() = Some(reason.clone());
                     let _ = event_tx_for_supervisor.send(AgentEvent::Error {
                         message: format!("Actor panicked: {reason}"),
                     });
                 }
             }
+            // Always: mark terminated and notify waiters, on both
+            // clean exit and panic. `spawn().await` listens on this
+            // notification to disambiguate "RecvError from dropped
+            // ready_tx" vs "still waiting for setup."
+            is_terminated.store(true, std::sync::atomic::Ordering::Release);
+            shutdown_signaled.notify_waiters();
         });
 
-        AgentHandle {
-            urgent_tx: self.urgent_tx,
-            normal_tx: self.normal_tx,
-            event_tx: self.event_tx,
-            shared: self.shared,
+        // Wait for the actor to signal readiness. If the actor panics
+        // before signalling, `ready_tx` is dropped and `ready_rx`
+        // returns `RecvError`. Wait briefly for the supervisor to
+        // record the panic payload so we can return a meaningful
+        // `Error::ActorPanic` rather than a generic "channel closed".
+        match ready_rx.await {
+            Ok(Ok(())) => Ok(AgentHandle {
+                urgent_tx: self.urgent_tx,
+                normal_tx: self.normal_tx,
+                event_tx: self.event_tx,
+                shared: self.shared,
+            }),
+            Ok(Err(setup_err)) => Err(setup_err),
+            Err(_recv_err) => {
+                // `ready_tx` was dropped without a signal — the actor
+                // panicked during startup. The supervisor records
+                // `panic_reason` and *then* notifies; on a multi-threaded
+                // runtime that write can land after we observe RecvError,
+                // so register for the notification before reading (mirrors
+                // `AgentHandle::dead_actor_error`) and wait briefly so we
+                // surface the real reason instead of the generic fallback.
+                let notified = self.shared.shutdown_signaled.notified();
+                if self.shared.panic_reason.lock().is_none() {
+                    let _ = tokio::time::timeout(Duration::from_millis(100), notified).await;
+                }
+                let reason = self
+                    .shared
+                    .panic_reason
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "actor died during startup".to_string());
+                Err(crate::types::error::Error::ActorPanic(reason))
+            }
         }
     }
 }

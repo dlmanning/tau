@@ -24,7 +24,7 @@ pub struct SessionSnapshot {
     pub info: SessionInfo,
     pub messages: Vec<Message>,
     /// Compaction continuity: the summary the agent had when it was
-    /// last hibernated, restored via `AgentHandle::set_previous_summary`.
+    /// last hibernated, restored via `AgentSeed::Messages { previous_summary, .. }`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_summary: Option<String>,
     /// Host-opaque payload (composer text, scroll position, expanded

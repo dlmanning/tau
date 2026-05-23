@@ -209,28 +209,48 @@ impl Config {
     /// Build the runtime [`AgentConfig`] from this config plus CLI-supplied
     /// `model` and `reasoning` (which override any config values).
     pub fn to_agent_config(&self, model: Model, reasoning: ReasoningLevel) -> AgentConfig {
+        // Start from the runtime default (fraction-scaled across model
+        // sizes) and only override what the user explicitly pinned in
+        // their TOML. Setting `reserve_tokens` or `keep_recent_tokens`
+        // switches that knob to an absolute count — a sensible
+        // interpretation of "the user wrote a number, they meant that
+        // number." Leaving them unset means the fraction default
+        // applies and the values scale with the model's context window.
         let compaction = match self.compaction.as_ref() {
-            Some(c) => CompactionConfig {
-                enabled: c.enabled.unwrap_or(true),
-                reserve_tokens: c.reserve_tokens.unwrap_or(16384),
-                keep_recent_tokens: c.keep_recent_tokens.unwrap_or(20000),
-            },
+            Some(c) => {
+                let mut cfg = CompactionConfig::default();
+                if let Some(enabled) = c.enabled {
+                    cfg.enabled = enabled;
+                }
+                if let Some(n) = c.reserve_tokens {
+                    cfg.reserve = tau_agent::CompactionThreshold::Tokens(n);
+                }
+                if let Some(n) = c.keep_recent_tokens {
+                    cfg.keep_recent = tau_agent::CompactionThreshold::Tokens(n);
+                }
+                cfg
+            }
             None => CompactionConfig::default(),
         };
-        AgentConfig {
-            system_prompt: None,
-            model,
-            reasoning,
-            thinking_adaptive: self.thinking_adaptive.unwrap_or(false),
-            max_tokens: None,
-            max_turns: Some(200),
-            compaction,
-            steering_mode: DequeueMode::All,
-            follow_up_mode: DequeueMode::All,
-            cache_scope: self.cache.as_ref().and_then(|c| c.scope.clone()),
-            cache_ttl: self.cache.as_ref().and_then(|c| c.ttl.clone()),
-            system_prompt_boundary: self.cache.as_ref().and_then(|c| c.prompt_boundary.clone()),
+        let mut builder = AgentConfig::builder(model)
+            .reasoning(reasoning)
+            .thinking_adaptive(self.thinking_adaptive.unwrap_or(false))
+            .max_turns(200)
+            .compaction(compaction)
+            .steering_mode(DequeueMode::All)
+            .follow_up_mode(DequeueMode::All);
+        if let Some(cache) = &self.cache {
+            if let Some(scope) = &cache.scope {
+                builder = builder.cache_scope(scope.clone());
+            }
+            if let Some(ttl) = &cache.ttl {
+                builder = builder.cache_ttl(ttl.clone());
+            }
+            if let Some(boundary) = &cache.prompt_boundary {
+                builder = builder.system_prompt_boundary(boundary.clone());
+            }
         }
+        builder.build()
     }
 
     /// Get API key for a provider, checking OAuth first, then config, then env
@@ -279,7 +299,11 @@ tui = true
 # openai = "sk-..."
 # google = "..."
 
-# Context compaction settings (optional)
+# Context compaction settings (optional). By default these scale with
+# the model's context window (8% reserve / 10% kept-recent), so a
+# 200K-context model gets ~16K headroom and a 32K-context model gets
+# ~2.5K — small models won't reserve half their window. Pin absolute
+# counts here only if you need explicit control across all models.
 # [compaction]
 # enabled = true
 # reserve_tokens = 16384

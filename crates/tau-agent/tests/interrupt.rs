@@ -25,7 +25,7 @@ async fn interrupt_stops_after_current_turn() {
     // Slow tool: gives the test time to observe TurnStart and call
     // interrupt() before the actor races into the next turn.
     builder.add_tool(Arc::new(SlowTool { delay_ms: 200 }));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let collector = EventCollector::from_handle(&handle);
 
     let rx = handle.prompt("go").await.unwrap();
@@ -101,7 +101,7 @@ async fn normal_flow_not_interrupted() {
     let transport = ToolCallTransport::create(2, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let collector = EventCollector::from_handle(&handle);
 
     handle.prompt_and_wait("go").await.unwrap();
@@ -140,7 +140,7 @@ async fn interrupt_does_not_latch_across_prompts() {
     // Slow tool: gives the test time to observe TurnStart and call
     // interrupt() before the actor races into the next turn.
     builder.add_tool(Arc::new(SlowTool { delay_ms: 200 }));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     // First prompt: interrupt as soon as the first turn starts.
     let collector1 = EventCollector::from_handle(&handle);

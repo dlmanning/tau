@@ -1,10 +1,10 @@
-//! Fleet event bus: child→parent event forwarding and child→parent
+//! Fleet event bus: child→manager event forwarding and child→parent
 //! interaction routing.
 //!
-//! Subagents broadcast events on their own channel. The bus spawns a
-//! forwarder task per spawn that wraps each event as
-//! `AgentEvent::Subagent { agent_id, description, event }` and posts
-//! it to the parent's broadcast.
+//! Subagents broadcast events on their own [`AgentEvent`] channel. The
+//! bus spawns a forwarder task per spawn that translates each event
+//! into a [`FleetEvent`] (`Forwarded`, or `AgentReport` for self-labels)
+//! and posts it on the manager's fleet channel.
 //!
 //! Subagents that emit `InteractionRequest`s (e.g. via `AskUserQuestion`
 //! tools) send them on a per-spawn `mpsc` channel. The bus drains
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::interaction::InteractionRequest;
 use crate::fleet::registry::Registry;
-use crate::types::events::AgentEvent;
+use crate::types::events::{AgentEvent, FleetEvent};
 
 /// Default capacity of the per-subagent interaction router's mpsc
 /// channel. Reached when a subagent issues many concurrent gated tool
@@ -57,14 +57,14 @@ pub const DEFAULT_INTERACTION_ROUTER_CAPACITY: usize = 64;
 /// bookkeeping; in normal fleet flows it is always present.
 pub fn spawn_event_forwarder(
     mut child_rx: broadcast::Receiver<AgentEvent>,
-    parent_tx: broadcast::Sender<AgentEvent>,
+    fleet_tx: broadcast::Sender<FleetEvent>,
     agent_id: String,
     description: String,
     registry: Option<Arc<Registry>>,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Helper: apply registry bookkeeping + forward upstream.
+        // Helper: apply registry bookkeeping + translate to FleetEvent.
         let forward = |event: AgentEvent| {
             if let Some(reg) = registry.as_ref() {
                 match &event {
@@ -77,11 +77,20 @@ pub fn spawn_event_forwarder(
                     _ => {}
                 }
             }
-            let _ = parent_tx.send(AgentEvent::Subagent {
-                agent_id: agent_id.clone(),
-                description: description.clone(),
-                event: Box::new(event),
-            });
+            let fleet_event = match event {
+                AgentEvent::AgentReport { tag, summary } => FleetEvent::AgentReport {
+                    agent_id: agent_id.clone(),
+                    description: description.clone(),
+                    tag,
+                    summary,
+                },
+                event => FleetEvent::Forwarded {
+                    agent_id: agent_id.clone(),
+                    description: description.clone(),
+                    event,
+                },
+            };
+            let _ = fleet_tx.send(fleet_event);
         };
 
         loop {

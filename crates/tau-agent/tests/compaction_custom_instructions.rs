@@ -39,8 +39,8 @@ fn seed_messages() -> Vec<Message> {
 fn small_compaction_config() -> CompactionConfig {
     CompactionConfig {
         enabled: true,
-        reserve_tokens: 100,
-        keep_recent_tokens: 50,
+        reserve: tau_agent::CompactionThreshold::Tokens(100),
+        keep_recent: tau_agent::CompactionThreshold::Tokens(50),
     }
 }
 
@@ -72,18 +72,23 @@ fn extract_prompt(transport: &Arc<CapturingTransport>) -> String {
         .expect("summarization call should include a user message")
 }
 
-fn build_handle(transport: Arc<CapturingTransport>) -> tau_agent::AgentHandle {
-    let mut cfg = test_config();
-    cfg.compaction = small_compaction_config();
+async fn build_handle(transport: Arc<CapturingTransport>) -> tau_agent::AgentHandle {
+    let cfg = test_config()
+        .into_builder()
+        .compaction(small_compaction_config())
+        .build();
     let mut builder = AgentBuilder::new(cfg, transport as Arc<dyn Transport>);
-    builder.set_messages(seed_messages());
-    builder.spawn()
+    builder.seed(tau_agent::AgentSeed::Messages {
+        messages: seed_messages(),
+        previous_summary: None,
+    });
+    builder.spawn().await.unwrap()
 }
 
 #[tokio::test]
 async fn with_instructions() {
     let transport = CapturingTransport::create("SUMMARY-OK");
-    let handle = build_handle(transport.clone());
+    let handle = build_handle(transport.clone()).await;
 
     let rx = handle
         .compact(CompactionReason::Manual, Some("be terse".into()))
@@ -110,7 +115,7 @@ async fn with_instructions() {
 #[tokio::test]
 async fn without_instructions() {
     let transport = CapturingTransport::create("SUMMARY-OK");
-    let handle = build_handle(transport.clone());
+    let handle = build_handle(transport.clone()).await;
 
     let rx = handle
         .compact(CompactionReason::Manual, None)
@@ -133,7 +138,7 @@ async fn without_instructions() {
 #[tokio::test]
 async fn whitespace_only() {
     let transport = CapturingTransport::create("SUMMARY-OK");
-    let handle = build_handle(transport.clone());
+    let handle = build_handle(transport.clone()).await;
 
     let rx = handle
         .compact(CompactionReason::Manual, Some("   \n  ".into()))

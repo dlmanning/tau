@@ -7,13 +7,7 @@ use std::sync::Arc;
 use tau_agent::*;
 
 fn make_manager(transport: Arc<dyn Transport>) -> Arc<AgentManager> {
-    let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(64);
-    Arc::new(AgentManager::new(
-        tx,
-        test_utils::test_config(),
-        transport,
-        4,
-    ))
+    Arc::new(AgentManager::new(test_utils::test_config(), transport, 4))
 }
 
 fn empty_spec() -> AgentSpec {
@@ -21,8 +15,6 @@ fn empty_spec() -> AgentSpec {
         system_prompt: String::new(),
         tools: vec![],
         max_turns: 5,
-        allows_worktree: false,
-        allowed_subagent_specs: None,
     }
 }
 
@@ -163,16 +155,16 @@ async fn respec_concurrent_with_send_sees_running_not_missing() {
         .await;
     let send_result = send_task.await.expect("send task joins");
 
-    // The respec must have failed (agent was running mid-resume) but
-    // the error must say so explicitly, not "missing".
+    // The respec must have failed (agent was running mid-resume) and
+    // surface the structured AgentBusy variant — callers branch on
+    // this to decide whether to abort+retry or skip.
     let err = match respec_result {
         Err(e) => e,
         Ok(_) => panic!("respec must reject while agent is resuming"),
     };
-    let msg = format!("{err}");
     assert!(
-        msg.contains("currently running"),
-        "respec error mentions running, got: {msg}"
+        matches!(&err, tau_agent::Error::AgentBusy { id: agent_id } if *agent_id == id),
+        "expected Error::AgentBusy with matching id, got: {err:?}"
     );
     assert!(send_result.is_ok(), "send completes despite race");
     assert!(mgr.spec_for(&id).is_some(), "spec preserved through race");
@@ -187,7 +179,7 @@ async fn adopt_records_spec_and_allows_respec() {
         test_utils::test_config(),
         test_utils::TextTransport::create("ok"),
     );
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let adopted_id = mgr.adopt(&handle, "root", empty_spec());
 
     assert!(mgr.spec_for(&adopted_id).is_some(), "spec recorded");

@@ -14,10 +14,11 @@
 //! check-and-mutate operations (e.g. respec's "verify-not-running,
 //! then detach from idle") are atomic by construction.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tau_ai::Usage;
@@ -96,16 +97,28 @@ struct Inner {
     /// Idle agents in LRU-eviction order. Newest pushed back; oldest
     /// popped front when at capacity.
     idle: VecDeque<(String, AgentEntry)>,
-    /// Currently executing agents.
-    running: HashMap<String, AgentEntry>,
+    /// Currently executing agents. `IndexMap` (insertion-ordered) so
+    /// [`Registry::find`]'s substring scan and [`Registry::snapshot`]
+    /// are deterministic — see the find/snapshot determinism note on
+    /// those methods.
+    running: IndexMap<String, AgentEntry>,
     /// Externally-built handles registered via `adopt`. The fleet
     /// doesn't manage their actor lifecycle (the host does); they're
     /// here only so `spec_for` and `respec` can find them. Not subject
-    /// to LRU eviction.
-    adopted: HashMap<String, AgentEntry>,
+    /// to LRU eviction. `IndexMap` for the same reason as `running`.
+    adopted: IndexMap<String, AgentEntry>,
     /// Specs keyed by agent id. Maintained in lockstep with
-    /// `idle ∪ running ∪ adopted`.
+    /// `idle ∪ running ∪ adopted`. Only queried by id (`.get`) — never
+    /// iterated for lookup — so a plain `HashMap` is fine here.
     specs: HashMap<String, Arc<AgentSpec>>,
+    /// Ids currently detached for a `respec`. `detach_for_respec` removes
+    /// the entry from `idle`/`adopted` and then the caller does async
+    /// work (build + spawn the new actor) before committing or restoring.
+    /// During that window the id is in no entry bucket, so a concurrent
+    /// lookup would otherwise report "not found" for an agent that's only
+    /// mid-respec. This set lets `detach_for_respec` and the resume path
+    /// distinguish "respec in progress" (busy) from "gone" (not found).
+    respec_in_progress: HashSet<String>,
     max_agents: usize,
 }
 
@@ -118,9 +131,10 @@ impl Registry {
         Self {
             inner: Mutex::new(Inner {
                 idle: VecDeque::new(),
-                running: HashMap::new(),
-                adopted: HashMap::new(),
+                running: IndexMap::new(),
+                adopted: IndexMap::new(),
                 specs: HashMap::new(),
+                respec_in_progress: HashSet::new(),
                 max_agents,
             }),
         }
@@ -176,7 +190,7 @@ impl Registry {
     /// stamped here.
     pub fn finish_to_idle(&self, agent_id: &str, mut entry: AgentEntry) {
         let mut inner = self.inner.lock();
-        if let Some(running) = inner.running.remove(agent_id) {
+        if let Some(running) = inner.running.shift_remove(agent_id) {
             // Preserve fields the bus mutated during the run.
             entry.usage = running.usage;
             entry.tool_use_count = running.tool_use_count;
@@ -209,7 +223,7 @@ impl Registry {
     /// event stream instead.
     pub fn drop_running(&self, agent_id: &str) {
         let mut inner = self.inner.lock();
-        inner.running.remove(agent_id);
+        inner.running.shift_remove(agent_id);
         let in_idle = inner.idle.iter().any(|(id, _)| id == agent_id);
         if !in_idle {
             inner.specs.remove(agent_id);
@@ -261,30 +275,49 @@ impl Registry {
     /// [`Self::drop_respec_source`].
     pub fn detach_for_respec(&self, agent_id: &str) -> Result<AgentEntry, &'static str> {
         let mut inner = self.inner.lock();
+        // A concurrent respec already detached this id and is awaiting its
+        // new actor. Report it as busy, not missing.
+        if inner.respec_in_progress.contains(agent_id) {
+            return Err("running");
+        }
         if inner.running.contains_key(agent_id) {
             return Err("running");
         }
-        if let Some(pos) = inner.idle.iter().position(|(k, _)| k == agent_id) {
-            return Ok(inner.idle.remove(pos).expect("position was found").1);
-        }
-        if let Some(entry) = inner.adopted.remove(agent_id) {
-            return Ok(entry);
-        }
-        Err("missing")
+        let entry = if let Some(pos) = inner.idle.iter().position(|(k, _)| k == agent_id) {
+            inner.idle.remove(pos).expect("position was found").1
+        } else if let Some(entry) = inner.adopted.shift_remove(agent_id) {
+            entry
+        } else {
+            return Err("missing");
+        };
+        // Mark the window: the id is now in no entry bucket until the
+        // caller commits the new actor or restores the old one.
+        inner.respec_in_progress.insert(agent_id.to_string());
+        Ok(entry)
     }
 
-    /// On successful respec, drop the old spec.
+    /// Whether `agent_id` is mid-respec (detached, awaiting its new
+    /// actor). Lets the resume path return "busy" rather than "not found"
+    /// for the brief window during which the id is in no entry bucket.
+    pub fn respec_in_progress(&self, agent_id: &str) -> bool {
+        self.inner.lock().respec_in_progress.contains(agent_id)
+    }
+
+    /// On successful respec, drop the old spec and clear the in-progress
+    /// marker (the new actor is committed under the same id).
     pub fn drop_respec_source(&self, agent_id: &str) {
-        self.inner.lock().specs.remove(agent_id);
+        let mut inner = self.inner.lock();
+        inner.specs.remove(agent_id);
+        inner.respec_in_progress.remove(agent_id);
     }
 
-    /// On failed respec, restore the original idle entry. Push to the
-    /// back (treats the recovered entry as freshly-used).
+    /// On failed respec, restore the original idle entry and clear the
+    /// in-progress marker. Push to the back (treats the recovered entry
+    /// as freshly-used).
     pub fn restore_respec_source(&self, agent_id: &str, entry: AgentEntry) {
-        self.inner
-            .lock()
-            .idle
-            .push_back((agent_id.to_string(), entry));
+        let mut inner = self.inner.lock();
+        inner.respec_in_progress.remove(agent_id);
+        inner.idle.push_back((agent_id.to_string(), entry));
     }
 
     // ─── Bus bookkeeping ────────────────────────────────────────────
@@ -358,8 +391,13 @@ impl Registry {
 
     /// Locate an agent by id or by case-insensitive description
     /// substring. Running wins over idle wins over adopted; exact-id
-    /// matches win over substring matches. First match wins; substring
-    /// ambiguity across `HashMap` is unspecified.
+    /// matches win over substring matches. First match wins.
+    ///
+    /// Substring iteration walks `running` and `adopted` in **insertion
+    /// order** (both buckets are `IndexMap`s); `idle` is a `VecDeque`
+    /// in LRU order. The resolution is therefore deterministic across
+    /// runs given the same insertion sequence — equal-description ties
+    /// resolve to the oldest entry within the bucket.
     pub fn find(&self, name_or_id: &str) -> Option<Located> {
         let inner = self.inner.lock();
         if let Some(entry) = inner.running.get(name_or_id) {
@@ -483,8 +521,6 @@ mod tests {
             system_prompt: String::new(),
             tools: vec![],
             max_turns: 1,
-            allows_worktree: false,
-            allowed_subagent_specs: None,
         });
         r.begin_spawn("a1", spec);
         assert!(r.spec_for("a1").is_some());
@@ -499,8 +535,6 @@ mod tests {
             system_prompt: String::new(),
             tools: vec![],
             max_turns: 1,
-            allows_worktree: false,
-            allowed_subagent_specs: None,
         });
         r.begin_spawn("a1", spec);
         let entry = AgentEntry::new(dummy_handle(), "first".into());
@@ -519,8 +553,6 @@ mod tests {
                 system_prompt: String::new(),
                 tools: vec![],
                 max_turns: 1,
-                allows_worktree: false,
-                allowed_subagent_specs: None,
             });
             r.begin_spawn(id, spec);
             let entry = AgentEntry::new(dummy_handle(), id.to_string());
@@ -541,8 +573,6 @@ mod tests {
             system_prompt: String::new(),
             tools: vec![],
             max_turns: 1,
-            allows_worktree: false,
-            allowed_subagent_specs: None,
         });
         r.begin_spawn("a", spec);
         r.commit_running("a", AgentEntry::new(dummy_handle(), "x".into()));
@@ -556,8 +586,6 @@ mod tests {
             system_prompt: String::new(),
             tools: vec![],
             max_turns: 1,
-            allows_worktree: false,
-            allowed_subagent_specs: None,
         });
         r.begin_spawn("a", spec);
         r.commit_running("a", AgentEntry::new(dummy_handle(), "x".into()));
@@ -568,5 +596,96 @@ mod tests {
         assert!(r.spec_for("a").is_some());
         r.drop_respec_source("a");
         assert!(r.spec_for("a").is_none());
+    }
+
+    #[test]
+    fn respec_in_progress_marks_window_and_blocks_concurrent_respec() {
+        let r = Registry::new(4);
+        let spec = Arc::new(AgentSpec {
+            system_prompt: String::new(),
+            tools: vec![],
+            max_turns: 1,
+        });
+        r.begin_spawn("a", spec);
+        r.commit_running("a", AgentEntry::new(dummy_handle(), "x".into()));
+        r.finish_to_idle("a", AgentEntry::new(dummy_handle(), "x".into()));
+
+        assert!(!r.respec_in_progress("a"));
+        let entry = r.detach_for_respec("a").expect("idle agent detaches");
+        // During the window the id is in no entry bucket, but is flagged.
+        assert!(r.respec_in_progress("a"), "marker set after detach");
+        // A concurrent respec must see "busy", not "missing".
+        assert!(matches!(r.detach_for_respec("a"), Err("running")));
+
+        // Failure path clears the marker and restores the entry.
+        r.restore_respec_source("a", entry);
+        assert!(!r.respec_in_progress("a"), "marker cleared on restore");
+        assert!(r.detach_for_respec("a").is_ok(), "respec available again");
+    }
+
+    #[test]
+    fn drop_respec_source_clears_in_progress_marker() {
+        let r = Registry::new(4);
+        let spec = Arc::new(AgentSpec {
+            system_prompt: String::new(),
+            tools: vec![],
+            max_turns: 1,
+        });
+        r.begin_spawn("a", spec);
+        r.commit_running("a", AgentEntry::new(dummy_handle(), "x".into()));
+        r.finish_to_idle("a", AgentEntry::new(dummy_handle(), "x".into()));
+        let _ = r.detach_for_respec("a").expect("detaches");
+        assert!(r.respec_in_progress("a"));
+        // Success path: marker cleared so a stale lookup no longer reports busy.
+        r.drop_respec_source("a");
+        assert!(!r.respec_in_progress("a"), "marker cleared on success");
+    }
+
+    #[test]
+    fn find_substring_returns_first_inserted_among_running_ties() {
+        // Two running agents share a description prefix. find()'s
+        // substring scan must resolve to the first-inserted one,
+        // deterministically — not whatever HashMap iteration happens
+        // to land on. This is the bug the IndexMap switch fixes.
+        let r = Registry::new(4);
+        for id in &["alpha", "beta"] {
+            let spec = Arc::new(AgentSpec {
+                system_prompt: String::new(),
+                tools: vec![],
+                max_turns: 1,
+            });
+            r.begin_spawn(id, spec);
+            r.commit_running(id, AgentEntry::new(dummy_handle(), "research agent".into()));
+        }
+        // `alpha` inserted first; substring match on "research" must
+        // resolve to it on every run.
+        for _ in 0..20 {
+            let located = r.find("research").expect("substring resolves");
+            assert_eq!(
+                located.agent_id, "alpha",
+                "find() must return the oldest insertion on description ties"
+            );
+        }
+    }
+
+    #[test]
+    fn find_substring_returns_first_inserted_among_adopted_ties() {
+        let r = Registry::new(4);
+        for id in &["one", "two"] {
+            let spec = Arc::new(AgentSpec {
+                system_prompt: String::new(),
+                tools: vec![],
+                max_turns: 1,
+            });
+            r.adopt(
+                id,
+                AgentEntry::new(dummy_handle(), "shared label".into()),
+                spec,
+            );
+        }
+        for _ in 0..20 {
+            let located = r.find("shared").expect("substring resolves");
+            assert_eq!(located.agent_id, "one");
+        }
     }
 }

@@ -8,27 +8,33 @@ use tau_ai::Message;
 async fn spawn_and_query_config() {
     let mut builder = AgentBuilder::new(test_config(), TextTransport::create("hi"));
     builder.set_system_prompt("custom");
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     let cfg = handle.config().await.unwrap();
-    assert_eq!(cfg.system_prompt.as_deref(), Some("custom"));
+    assert_eq!(cfg.system_prompt(), Some("custom"));
 }
 
 #[tokio::test]
 async fn set_model_via_handle() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("hi")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("hi"))
+        .spawn()
+        .await
+        .unwrap();
 
-    let mut m = test_config().model;
+    let mut m = test_config().model().clone();
     m.id = "new-model".into();
     handle.set_model(m).await.unwrap();
 
     let cfg = handle.config().await.unwrap();
-    assert_eq!(cfg.model.id, "new-model");
+    assert_eq!(cfg.model().id, "new-model");
 }
 
 #[tokio::test]
 async fn prompt_returns_assistant_message() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("Hello!")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("Hello!"))
+        .spawn()
+        .await
+        .unwrap();
 
     handle.prompt_and_wait("hi").await.unwrap();
 
@@ -40,12 +46,15 @@ async fn prompt_returns_assistant_message() {
 
 #[tokio::test]
 async fn prompt_emits_start_and_end_events() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
 
     handle.prompt_and_wait("go").await.unwrap();
 
-    let events = collect_events(&mut rx);
+    let mut events = Vec::new(); while let Ok(e) = rx.try_recv() { events.push(e); }
     assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentStart)));
     assert!(
         events
@@ -56,7 +65,10 @@ async fn prompt_emits_start_and_end_events() {
 
 #[tokio::test]
 async fn usage_is_accumulated() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
 
     handle.prompt_and_wait("a").await.unwrap();
     let s1 = handle.state().await.unwrap();
@@ -67,23 +79,16 @@ async fn usage_is_accumulated() {
     assert_eq!(s2.total_usage.input, 200);
 }
 
-#[tokio::test]
-async fn is_streaming_false_after_prompt() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
-    handle.prompt_and_wait("go").await.unwrap();
-
-    let state = handle.state().await.unwrap();
-    assert!(!state.is_streaming);
-    assert!(state.error.is_none());
-}
-
 // `clear_messages` and `set_messages` were removed from the handle in the
 // runtime refactor — conversation mutation is no longer a runtime
 // capability. Tests for them are dropped.
 
 #[tokio::test]
 async fn timestamps_are_milliseconds() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
     handle.prompt_and_wait("go").await.unwrap();
 
     for msg in handle.messages().await.unwrap() {
@@ -106,7 +111,10 @@ async fn handle_is_clone_send_sync() {
 
 #[tokio::test]
 async fn dropping_all_handles_makes_queries_return_none() {
-    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok")).spawn();
+    let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
+        .spawn()
+        .await
+        .unwrap();
     // Clone to keep one alive, drop the original
     let h2 = handle.clone();
     drop(handle);
@@ -125,13 +133,13 @@ struct GatedTransport {
 }
 
 #[async_trait::async_trait]
-impl tau_agent::core::transport::Transport for GatedTransport {
+impl tau_agent::Transport for GatedTransport {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _config: &tau_agent::core::transport::AgentRunConfig,
+        _config: &tau_agent::AgentRunConfig,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> tau_ai::Result<tau_agent::core::transport::AgentEventStream> {
+    ) -> tau_ai::Result<tau_agent::AgentEventStream> {
         self.release.notified().await;
         // After release, return an empty stream so the prompt completes.
         let s = async_stream::stream! {
@@ -168,7 +176,7 @@ async fn try_send_returns_err_when_channel_full() {
         /* urgent */ 2,
         /* normal */ 2,
     );
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     // Kick off a prompt. The actor parks in `transport.run().await`,
     // so it cannot drain the normal channel.
@@ -210,7 +218,7 @@ async fn async_send_blocks_then_succeeds_when_channel_full() {
     });
 
     let builder = AgentBuilder::with_channel_capacities(test_config(), transport, 2, 2);
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     let rx = handle.prompt("go").await.unwrap();
 
@@ -252,10 +260,10 @@ async fn actor_panic_surfaces_via_shutdown_reason_and_error_event() {
     let builder = AgentBuilder::new(test_config(), PanicTransport::create());
     let pre_handle: tau_agent::AgentHandle = builder.handle();
     let collector = EventCollector::from_handle(&pre_handle);
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     // Fire the prompt that triggers the panic. The catch_unwind wrapper
-    // records `shutdown_reason` and notifies before returning, so we don't
+    // records the shutdown reason and notifies before returning, so we don't
     // need to poll.
     let _ = handle.prompt_and_wait("trigger panic").await;
 
@@ -271,12 +279,13 @@ async fn actor_panic_surfaces_via_shutdown_reason_and_error_event() {
         "expected Error::ActorPanic with panic message, got: {err:?}"
     );
 
-    let reason = handle
-        .shutdown_reason()
-        .expect("supervisor should have recorded panic reason by now");
+    let reason = match handle.health() {
+        AgentHealth::Dead { reason: Some(r) } => r,
+        other => panic!("expected AgentHealth::Dead with reason, got {other:?}"),
+    };
     assert!(
         reason.contains("intentional panic in transport"),
-        "expected panic message in shutdown_reason, got: {reason}"
+        "expected panic message in shutdown reason, got: {reason}"
     );
 
     // The collector should have observed an AgentEvent::Error carrying the
@@ -289,4 +298,48 @@ async fn actor_panic_surfaces_via_shutdown_reason_and_error_event() {
         )),
         "expected an AgentEvent::Error with the panic text"
     );
+}
+
+#[tokio::test]
+async fn spawn_returns_err_when_actor_panics_at_startup() {
+    // The test fixture `set_panic_at_startup` makes the actor panic
+    // before signalling readiness. `spawn().await` must surface this
+    // as `Error::ActorPanic`, not return a half-alive handle.
+    let mut builder = AgentBuilder::new(test_config(), TextTransport::create("unused"));
+    builder.set_panic_at_startup(true);
+
+    let err = match builder.spawn().await {
+        Ok(_) => panic!("spawn must fail when actor panics before readiness"),
+        Err(e) => e,
+    };
+
+    let reason = match err {
+        Error::ActorPanic(r) => r,
+        other => panic!("expected Error::ActorPanic, got {other:?}"),
+    };
+    assert!(
+        reason.contains("panic_at_startup"),
+        "expected the test fixture's panic message, got: {reason}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_surfaces_real_panic_reason_on_multi_thread() {
+    // Regression: on a multi-threaded runtime, `ready_tx` drops during
+    // the actor's unwind (waking `spawn`'s `ready_rx`) before the
+    // supervisor records `panic_reason`. `spawn()` must wait for that
+    // write rather than racing it and returning the generic
+    // "actor died during startup" fallback.
+    for _ in 0..50 {
+        let mut builder = AgentBuilder::new(test_config(), TextTransport::create("unused"));
+        builder.set_panic_at_startup(true);
+        match builder.spawn().await {
+            Ok(_) => panic!("spawn must fail when actor panics before readiness"),
+            Err(Error::ActorPanic(reason)) => assert!(
+                reason.contains("panic_at_startup"),
+                "spawn raced the panic_reason write; got generic reason: {reason}"
+            ),
+            Err(other) => panic!("expected Error::ActorPanic, got {other:?}"),
+        }
+    }
 }

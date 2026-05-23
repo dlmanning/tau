@@ -158,11 +158,21 @@ pub(crate) async fn run_actor(
     mut state: State,
     mut urgent_rx: mpsc::Receiver<Command>,
     mut normal_rx: mpsc::Receiver<Command>,
+    ready_tx: oneshot::Sender<crate::types::error::Result<()>>,
 ) {
     let mut phase = Phase::Idle;
     let mut prompt_reply: Option<oneshot::Sender<PromptResult>> = None;
     let mut turn_number: u32 = 0;
     let mut prompt_cancel = CancellationToken::new();
+
+    // Any fallible async setup happens here, before we signal
+    // readiness. Today there is none — the actor is ready as soon as
+    // it enters the loop — but the channel exists so future startup
+    // checks (transport pre-warm, tool init) can surface failures to
+    // `AgentBuilder::spawn` without a side-channel.
+
+    // Drop on RecvError is fine — the caller may have given up.
+    let _ = ready_tx.send(Ok(()));
 
     loop {
         phase = match phase {
@@ -205,8 +215,7 @@ fn emit_end_and_idle(
     prompt_reply: &mut Option<oneshot::Sender<PromptResult>>,
     turn_number: &mut u32,
 ) -> Phase {
-    state.shared.is_running.store(false, Ordering::Release);
-    state.conv.conversation.is_streaming = false;
+    state.shared.prompt_in_flight.store(false, Ordering::Release);
     // `interrupted` is true when a graceful interrupt was observed at
     // the top of a turn. We swap the flag atomically so the reset is
     // observable even if a stale `interrupt()` raced the prompt end.
@@ -853,7 +862,7 @@ fn handle_idle_command(
     match cmd {
         Command::Prompt { content, reply } => {
             *prompt_reply = Some(reply);
-            state.shared.is_running.store(true, Ordering::Release);
+            state.shared.prompt_in_flight.store(true, Ordering::Release);
             // Clear any stale graceful-interrupt request so it does
             // not latch across prompts.
             state
@@ -870,7 +879,6 @@ fn handle_idle_command(
                 *guard = fresh;
             }
             *turn_number = 0;
-            state.conv.conversation.is_streaming = true;
             state.conv.conversation.error = None;
             send_event(&state.frame.event_tx, AgentEvent::AgentStart);
 
@@ -1077,8 +1085,9 @@ fn classify_and_enter_approval(
                     Ok(()) => {
                         let id = tc.id.clone();
                         let name = tc.name.clone();
+                        let timeout = state.frame.interaction_timeout;
                         pending_gates.push(Box::pin(async move {
-                            let resp = response_rx.await;
+                            let resp = await_gate_response(response_rx, timeout).await;
                             (idx, id, name, resp)
                         }));
                     }
@@ -1105,6 +1114,38 @@ fn classify_and_enter_approval(
         pre_results,
         dispatch,
         pending_gates,
+    }
+}
+
+/// Await a gate's response receiver, optionally bounded by a timeout.
+///
+/// On timeout, returns `Ok(Rejected { reason })` so the gate is
+/// rejected with a clear attribution rather than getting mixed in with
+/// user-initiated cancellations or channel-closed errors. The tool is
+/// fed back the same synthesized error path used for any other
+/// rejection — the host doesn't have to special-case timeouts.
+///
+/// The `response_rx` is dropped on timeout. If the host eventually
+/// calls `send` on its `response_tx`, the send fails silently, matching
+/// the existing "host replied after the actor moved on" semantics.
+async fn await_gate_response(
+    response_rx: oneshot::Receiver<InteractionResponse>,
+    timeout: Option<std::time::Duration>,
+) -> std::result::Result<InteractionResponse, oneshot::error::RecvError> {
+    match timeout {
+        Some(dur) => match tokio::time::timeout(dur, response_rx).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = dur.as_millis() as u64,
+                    "interaction request timed out; rejecting tool call"
+                );
+                Ok(InteractionResponse::Rejected {
+                    reason: format!("interaction timed out after {dur:?}"),
+                })
+            }
+        },
+        None => response_rx.await,
     }
 }
 
@@ -1237,6 +1278,7 @@ fn spawn_group(
             cancel,
             progress,
             interaction: interaction_tx,
+            interaction_timeout: state.frame.interaction_timeout,
             file_access,
             agent_id,
             subagent_depth,

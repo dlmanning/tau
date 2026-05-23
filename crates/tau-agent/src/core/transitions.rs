@@ -126,8 +126,9 @@ pub fn decide_proactive_compaction(frame: &Frame, usage: &Usage) -> bool {
         return false;
     }
     let used = usage.input + usage.cache_read;
-    let limit = (frame.config.model.context_window as u64)
-        .saturating_sub(frame.config.compaction.reserve_tokens);
+    let cw = frame.config.model.context_window as u64;
+    let reserve = frame.config.compaction.reserve.resolve(cw);
+    let limit = cw.saturating_sub(reserve);
     used > limit
 }
 

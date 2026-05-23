@@ -9,10 +9,11 @@
 //! one type a host imports.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
-use tau_ai::{Message, Model};
+use tau_ai::Model;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +29,7 @@ use crate::fleet::registry::{Located, Registry};
 use crate::fleet::result::SubagentResult;
 use crate::fleet::snapshot::FleetSnapshot;
 use crate::types::error::Result;
-use crate::types::events::AgentEvent;
+use crate::types::events::FleetEvent;
 
 /// Immutable per-agent input. To change any field, spawn a new agent
 /// (typically via [`AgentManager::respec`]).
@@ -43,20 +44,14 @@ pub struct AgentSpec {
     pub system_prompt: String,
     pub tools: Vec<BoxedTool>,
     pub max_turns: u32,
-    /// Per-spec opt-in for [`Isolation::Worktree`]. Ignored unless the
-    /// spawn opts request worktree isolation.
-    pub allows_worktree: bool,
-    /// Spec names this agent may spawn as subagents. Carried through
-    /// to the host's spawn-time resolver / `AgentTool`. The runtime
-    /// does not enforce this directly.
-    pub allowed_subagent_specs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
-    /// Run inside a fresh git worktree on a per-agent branch. Honored
-    /// only when the spec sets `allows_worktree = true`.
+    /// Run inside a fresh git worktree on a per-agent branch.
+    /// Requested per-spawn via [`SpawnOpts::isolation`]; the host decides
+    /// when to opt in. The runtime does not gate this by the spec.
     Worktree,
 }
 
@@ -66,15 +61,11 @@ pub struct SpawnOpts {
     pub model: Option<Model>,
     pub cwd: Option<String>,
     pub isolation: Option<Isolation>,
-    /// Inherit another stored agent's full message history, then
-    /// apply the spawn prompt as a follow-up. The named agent must
-    /// already be stored or running.
-    pub inherit_history_from: Option<String>,
     pub approval_policy: Option<Arc<dyn ApprovalPolicy>>,
     pub spec_name: Option<String>,
-    /// Lower-level: explicit message vector. Wins over
-    /// `inherit_history_from` when both are set.
-    pub seed_messages: Option<Vec<Message>>,
+    /// History to load into the spawned agent. See [`AgentSeed`] for
+    /// the variants. Defaults to [`AgentSeed::Empty`].
+    pub seed: crate::core::builder::AgentSeed,
     /// Depth to stamp on the spawned agent's
     /// [`ExecutionContext::subagent_depth`](crate::ExecutionContext::subagent_depth).
     /// Callers that originate spawns from inside a tool should set this
@@ -82,11 +73,16 @@ pub struct SpawnOpts {
     pub subagent_depth: u32,
 }
 
+/// Default capacity of the manager's [`FleetEvent`] broadcast channel.
+/// Sized for bursty multi-agent fan-in; tune via
+/// [`AgentManager::with_event_capacity`].
+pub const DEFAULT_FLEET_EVENT_CAPACITY: usize = 256;
+
 pub struct AgentManager {
     registry: Arc<Registry>,
     transport: Arc<dyn Transport>,
     parent_config: AgentConfig,
-    parent_event_tx: broadcast::Sender<AgentEvent>,
+    fleet_event_tx: broadcast::Sender<FleetEvent>,
     parent_interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
     /// Default approval policy for spawned subagents. Swapped at
     /// runtime via [`Self::set_default_approval_policy`]; in-flight
@@ -95,24 +91,69 @@ pub struct AgentManager {
     /// Per-subagent interaction-router channel capacity. See
     /// [`crate::fleet::bus::DEFAULT_INTERACTION_ROUTER_CAPACITY`].
     interaction_router_capacity: usize,
+    /// Deadline applied to every subagent's
+    /// [`InteractionRequest`] gate awaits, mirroring
+    /// [`AgentBuilder::set_interaction_timeout`](crate::core::builder::AgentBuilder::set_interaction_timeout).
+    /// `None` means subagents inherit the actor-builder default
+    /// (unbounded); set via [`Self::with_interaction_timeout`].
+    interaction_timeout: Option<Duration>,
 }
 
 impl AgentManager {
     pub fn new(
-        parent_event_tx: broadcast::Sender<AgentEvent>,
         parent_config: AgentConfig,
         transport: Arc<dyn Transport>,
         max_agents: usize,
     ) -> Self {
+        let (fleet_event_tx, _) = broadcast::channel(DEFAULT_FLEET_EVENT_CAPACITY);
         Self {
             registry: Arc::new(Registry::new(max_agents)),
             transport,
             parent_config,
-            parent_event_tx,
+            fleet_event_tx,
             parent_interaction_tx: None,
             default_approval: ParkingMutex::new(Arc::new(DefaultPolicy)),
             interaction_router_capacity: crate::fleet::bus::DEFAULT_INTERACTION_ROUTER_CAPACITY,
+            interaction_timeout: None,
         }
+    }
+
+    /// Override the [`FleetEvent`] broadcast channel capacity.
+    ///
+    /// **Must be called before any subscribers attach.** It replaces the
+    /// channel wholesale (tokio broadcast channels can't be resized), so
+    /// any receiver already obtained via [`Self::subscribe`] is orphaned
+    /// on the old channel and will only ever see `Closed`. As a builder
+    /// method that takes `self` by value, the intended use is to chain it
+    /// directly off [`Self::new`] before subscribing. If receivers
+    /// already exist this logs a warning and (in debug builds) panics,
+    /// turning a silent drop into a loud one.
+    pub fn with_event_capacity(mut self, capacity: usize) -> Self {
+        let orphaned = self.fleet_event_tx.receiver_count();
+        debug_assert_eq!(
+            orphaned, 0,
+            "with_event_capacity() called after {orphaned} subscriber(s) attached; \
+             those receivers are now orphaned on the replaced channel"
+        );
+        if orphaned > 0 {
+            tracing::warn!(
+                orphaned_receivers = orphaned,
+                "AgentManager::with_event_capacity replaced the fleet channel after \
+                 subscribers attached; they will see Closed. Call it before subscribe()."
+            );
+        }
+        let (tx, _) = broadcast::channel(capacity);
+        self.fleet_event_tx = tx;
+        self
+    }
+
+    /// Subscribe to the manager's [`FleetEvent`] stream. The channel
+    /// carries `AgentStarted` / `AgentResumed` / `AgentCompleted` (the
+    /// manager's own lifecycle events), `AgentReport` (translated from
+    /// tool-emitted [`AgentEvent::AgentReport`]), and `Forwarded` (every
+    /// other event a tracked agent emits).
+    pub fn subscribe(&self) -> broadcast::Receiver<FleetEvent> {
+        self.fleet_event_tx.subscribe()
     }
 
     pub fn with_parent_interaction_sender(mut self, tx: mpsc::Sender<InteractionRequest>) -> Self {
@@ -134,6 +175,21 @@ impl AgentManager {
         self
     }
 
+    /// Deadline every spawned subagent will apply to its own
+    /// `InteractionRequest` gate awaits (today, that's `tool.confirm`).
+    /// Each subagent's builder receives this via
+    /// [`AgentBuilder::set_interaction_timeout`](crate::core::builder::AgentBuilder::set_interaction_timeout).
+    /// Unset means subagents wait indefinitely — historical behavior.
+    ///
+    /// Hosts that already wire their own root-agent timeout via the
+    /// builder typically pass the same value here so subagents inherit
+    /// the same deadline rather than having to be configured
+    /// per-spawn.
+    pub fn with_interaction_timeout(mut self, timeout: Duration) -> Self {
+        self.interaction_timeout = Some(timeout);
+        self
+    }
+
     pub fn set_default_approval_policy(&self, policy: Arc<dyn ApprovalPolicy>) {
         *self.default_approval.lock() = policy;
     }
@@ -143,10 +199,11 @@ impl AgentManager {
             registry: Arc::clone(&self.registry),
             transport: Arc::clone(&self.transport),
             parent_config: self.parent_config.clone(),
-            parent_event_tx: self.parent_event_tx.clone(),
+            fleet_event_tx: self.fleet_event_tx.clone(),
             parent_interaction_tx: self.parent_interaction_tx.clone(),
             default_approval: self.default_approval.lock().clone(),
             interaction_router_capacity: self.interaction_router_capacity,
+            interaction_timeout: self.interaction_timeout,
         }
     }
 
@@ -265,13 +322,4 @@ impl AgentManager {
         }
     }
 
-    // ─── Steering shortcut for "find by id, then steer" ──────────────
-
-    pub async fn send_to_running(&self, id: &str, message: Message) -> bool {
-        let Some(handle) = self.registry.handle_for(id) else {
-            return false;
-        };
-        let _ = handle.steer(message).await;
-        true
-    }
 }

@@ -3,9 +3,11 @@
 //! Hosts feed [`SessionDiffOverlay::observe`] each [`AgentEvent`] from the
 //! agent stream; the overlay tracks (baseline, current) per path and computes
 //! a [`FileDiff`] on demand. The diff pane in the host renders from
-//! [`SessionDiffOverlay::snapshot`]. `Subagent`-wrapped events are unwrapped
-//! transitively, so file changes from any depth in the subagent tree
-//! aggregate into the same overlay.
+//! [`SessionDiffOverlay::snapshot`]. Subagent file changes arrive on the
+//! fleet channel as [`FleetEvent::Forwarded`](tau_agent::FleetEvent::Forwarded);
+//! feed those to [`SessionDiffOverlay::observe_fleet`], which unwraps the
+//! inner event so changes from any depth in the subagent tree aggregate into
+//! the same overlay.
 //!
 //! **Live-session only.** `FileChanged` events live on the broadcast
 //! channel and are not stored in `conversation.messages`. A subscriber that
@@ -25,7 +27,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
-use tau_agent::AgentEvent;
+use tau_agent::{AgentEvent, FleetEvent};
 
 /// Operation a `FileDiff` represents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,10 +96,11 @@ impl SessionDiffOverlay {
         Self::default()
     }
 
-    /// Observe an agent event. Non-`FileChanged` events are ignored.
-    /// `Subagent { event: FileChanged { … }, … }` is unwrapped recursively
-    /// so file changes from any depth in the subagent tree are aggregated
-    /// into the same overlay.
+    /// Observe an agent event. Only `FileChanged` mutates the overlay;
+    /// every other variant is ignored. To aggregate a subagent's file
+    /// changes (which arrive on the fleet channel), use
+    /// [`Self::observe_fleet`] instead — this method sees only one
+    /// agent's own `AgentEvent` stream.
     ///
     /// Returns the cumulative diff for the affected path on `FileChanged`,
     /// or `None` for any other event or when the cumulative diff is empty
@@ -110,7 +113,6 @@ impl SessionDiffOverlay {
                 after,
                 ..
             } => (path.clone(), before.clone(), after.clone()),
-            AgentEvent::Subagent { event, .. } => return self.observe(event),
             _ => return None,
         };
 
@@ -124,6 +126,18 @@ impl SessionDiffOverlay {
         entry.current = after;
 
         compute_diff(&path, entry)
+    }
+
+    /// Observe a fleet event. [`FleetEvent::Forwarded`] carries a child
+    /// agent's [`AgentEvent`]; its `FileChanged`s are unwrapped and
+    /// aggregated into the same overlay as the root agent's, so file
+    /// changes from any depth in the subagent tree are tracked. Other
+    /// fleet variants (lifecycle, self-reports) are ignored.
+    pub fn observe_fleet(&mut self, event: &FleetEvent) -> Option<FileDiff> {
+        match event {
+            FleetEvent::Forwarded { event, .. } => self.observe(event),
+            _ => None,
+        }
     }
 
     /// Snapshot of every tracked file's cumulative diff. Skips entries
@@ -343,44 +357,42 @@ mod tests {
     }
 
     #[test]
-    fn unwraps_subagent_wrapped_file_changed() {
+    fn ignores_non_file_changed_events() {
+        let mut o = SessionDiffOverlay::new();
+        let d = o.observe(&AgentEvent::AgentStart);
+        assert!(d.is_none());
+        assert_eq!(o.tracked_count(), 0);
+    }
+
+    #[test]
+    fn observe_fleet_unwraps_forwarded_file_changed() {
+        // Subagent file changes arrive wrapped in FleetEvent::Forwarded;
+        // observe_fleet must unwrap and aggregate them like a direct
+        // FileChanged.
         let mut o = SessionDiffOverlay::new();
         let inner = fc("nested.rs", None, Some("hi\n"));
-        let wrapped = AgentEvent::Subagent {
+        let forwarded = FleetEvent::Forwarded {
             agent_id: "sub-1".into(),
-            description: "test".into(),
-            event: Box::new(inner),
+            description: "worker".into(),
+            event: inner,
         };
-        let d = o.observe(&wrapped).expect("subagent file change observed");
+        let d = o
+            .observe_fleet(&forwarded)
+            .expect("forwarded file change observed");
         assert_eq!(d.op, FileOp::Add);
         assert_eq!(d.path, PathBuf::from("nested.rs"));
         assert_eq!(o.tracked_count(), 1);
     }
 
     #[test]
-    fn unwraps_subagent_recursively() {
-        // depth-2 subagent emits FileChanged
+    fn observe_fleet_ignores_lifecycle_events() {
         let mut o = SessionDiffOverlay::new();
-        let inner = fc("deep.rs", None, Some("deep\n"));
-        let depth_2 = AgentEvent::Subagent {
-            agent_id: "sub-2".into(),
-            description: "depth 2".into(),
-            event: Box::new(inner),
-        };
-        let depth_1 = AgentEvent::Subagent {
+        let started = FleetEvent::Forwarded {
             agent_id: "sub-1".into(),
-            description: "depth 1".into(),
-            event: Box::new(depth_2),
+            description: "worker".into(),
+            event: AgentEvent::AgentStart,
         };
-        let d = o.observe(&depth_1).expect("nested subagent observed");
-        assert_eq!(d.op, FileOp::Add);
-    }
-
-    #[test]
-    fn ignores_non_file_changed_events() {
-        let mut o = SessionDiffOverlay::new();
-        let d = o.observe(&AgentEvent::AgentStart);
-        assert!(d.is_none());
+        assert!(o.observe_fleet(&started).is_none());
         assert_eq!(o.tracked_count(), 0);
     }
 }

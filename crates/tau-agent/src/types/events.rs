@@ -22,6 +22,7 @@ pub enum ConsoleLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConsoleLine {
     pub content: String,
     pub level: ConsoleLevel,
@@ -62,6 +63,13 @@ pub enum ToolApprovalOutcome {
     Rejected { reason: String },
 }
 
+/// Events emitted on a single agent's broadcast channel.
+///
+/// Only this agent's own activity appears here — no subagent events.
+/// For fleet-level events (which agent started, which one finished,
+/// forwarded child events) subscribe to
+/// [`AgentManager`](crate::fleet::AgentManager)'s
+/// [`FleetEvent`] channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -130,13 +138,6 @@ pub enum AgentEvent {
         message: String,
     },
 
-    /// Event from a subagent, wrapped with identity by the fleet bus.
-    Subagent {
-        agent_id: String,
-        description: String,
-        event: Box<AgentEvent>,
-    },
-
     /// File mutation reported by a tool. Hosts feed these into a diff
     /// overlay. `before = None` means new file (Add); `after = None`
     /// means removed (Delete). Binary files intentionally not reported.
@@ -149,8 +150,40 @@ pub enum AgentEvent {
         tool_call_id: String,
     },
 
-    /// Parent dispatched a subagent spawn (parent-timeline event).
-    SubagentStarted {
+    /// Tool-emitted self-label. The fleet bus translates this into
+    /// [`FleetEvent::AgentReport`] when forwarding, stamping the
+    /// emitting agent's id; consumers subscribed directly to a single
+    /// agent's channel see it here without an id.
+    AgentReport {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        summary: String,
+    },
+}
+
+/// Events emitted on [`AgentManager`](crate::fleet::AgentManager)'s
+/// broadcast channel.
+///
+/// Three kinds:
+///
+/// - **Lifecycle** (`AgentStarted` / `AgentResumed` / `AgentCompleted`)
+///   — emitted by the manager itself when an agent crosses a
+///   lifecycle boundary.
+/// - **Self-reports** (`AgentReport`) — translated from
+///   [`AgentEvent::AgentReport`] when the fleet bus forwards a child's
+///   event. The originating agent's id is stamped on the variant.
+/// - **Forwarded** (`Forwarded`) — every other [`AgentEvent`] a tracked
+///   agent emits, stamped with `agent_id` and `description`.
+///
+/// Nesting is structurally impossible: `Forwarded::event` is an
+/// [`AgentEvent`], not a `FleetEvent`. A grandchild's events arrive on
+/// the same manager channel with the grandchild's `agent_id` — they do
+/// not re-wrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FleetEvent {
+    /// Parent dispatched an agent spawn.
+    AgentStarted {
         agent_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spec_name: Option<String>,
@@ -158,15 +191,15 @@ pub enum AgentEvent {
         prompt: String,
         started_at: DateTime<Utc>,
     },
-    /// Previously-paused subagent reactivated (parent-timeline event).
-    SubagentResumed {
+    /// Previously-paused agent reactivated.
+    AgentResumed {
         agent_id: String,
         description: String,
         prompt: String,
         resumed_at: DateTime<Utc>,
     },
-    /// Subagent terminated (parent-timeline event).
-    SubagentCompleted {
+    /// Agent terminated (success, abort, or failure).
+    AgentCompleted {
         agent_id: String,
         description: String,
         outcome: SubagentOutcome,
@@ -180,11 +213,19 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         worktree_branch: Option<String>,
     },
-    /// Subagent self-labels its outcome (child-timeline event).
-    SubagentReport {
+    /// Tool inside the named agent emitted a self-report.
+    AgentReport {
+        agent_id: String,
+        description: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tag: Option<String>,
         summary: String,
+    },
+    /// Forwarded child event, stamped with the originating agent's id.
+    Forwarded {
+        agent_id: String,
+        description: String,
+        event: AgentEvent,
     },
 }
 
@@ -197,9 +238,7 @@ pub enum SubagentOutcome {
 }
 
 impl AgentEvent {
-    /// Whether this event terminates the agent's own timeline. A
-    /// `Subagent { event }` is never terminal for the parent even if
-    /// the inner event is.
+    /// Whether this event terminates the agent's own timeline.
     pub fn is_terminal(&self) -> bool {
         matches!(self, AgentEvent::AgentEnd { .. } | AgentEvent::Error { .. })
     }

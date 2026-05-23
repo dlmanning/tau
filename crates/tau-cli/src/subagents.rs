@@ -41,9 +41,16 @@ struct SubagentDef {
     /// Extra tool names to include beyond what `tools` selects. Used to
     /// add `subagent_report` / `submit_plan` to whitelist-based specs.
     extras: &'static [&'static str],
+    /// Whether this spec may run in a git worktree. The runtime no longer
+    /// gates worktree creation per-spec; this host-side flag is enforced
+    /// by the `AgentTool`'s worktree allowlist (see [`build_resolver`]).
+    /// Read-only/planning specs set this `false` so the model can't put
+    /// them on an isolated branch.
     allows_worktree: bool,
     /// Spec names this agent is allowed to spawn. `None` means it cannot
-    /// spawn subagents at all.
+    /// spawn subagents at all. Host-side allowlist — the runtime does
+    /// not enforce it; the resolver uses it to install nested
+    /// `AgentTool`s with the right allowlist.
     can_spawn: Option<&'static [&'static str]>,
 }
 
@@ -86,6 +93,23 @@ const SPECS: &[SubagentDef] = &[
     },
 ];
 
+/// Canonical (lowercase) names of specs that may run in a git worktree.
+/// Passed to every [`AgentTool`](tau_tools::AgentTool) so a spawn that
+/// requests `isolation: worktree` for an ineligible spec is rejected.
+pub fn worktree_specs() -> Vec<String> {
+    SPECS
+        .iter()
+        .filter(|def| def.allows_worktree)
+        .map(|def| def.name.to_string())
+        .collect()
+}
+
+/// A materialized spec plus its host-side allowlist for further spawns.
+struct ResolvedSpec {
+    spec: AgentSpec,
+    can_spawn: Option<Vec<String>>,
+}
+
 /// Build the spec resolver. Captures `manager` (weakly via the closure
 /// it returns to the caller) and the precomputed spec map; isolates the
 /// `Arc<OnceLock<Weak<...>>>` self-reference trick needed for the
@@ -107,8 +131,9 @@ pub fn build_resolver(
         // covers direct callers (`Session::enter_plan_mode`, etc.) and
         // future entry points.
         let key = name.to_ascii_lowercase();
-        let mut spec = base_specs.get(key.as_str()).cloned()?;
-        if let Some(ref allowed) = spec.allowed_subagent_specs
+        let resolved = base_specs.get(key.as_str())?;
+        let mut spec = resolved.spec.clone();
+        if let Some(ref allowed) = resolved.can_spawn
             && depth + 1 < MAX_DEPTH
         {
             let recursive: tau_tools::SpecResolver = resolver_self_for_closure
@@ -125,7 +150,8 @@ pub fn build_resolver(
             // the host-side recursion guard.
             let mut nested = tau_tools::AgentTool::new(manager.clone())
                 .with_spec_resolver(recursive)
-                .with_allowed_specs(allowed.clone());
+                .with_allowed_specs(allowed.clone())
+                .with_worktree_specs(worktree_specs());
             if is_planner {
                 nested = nested.with_restrictions(false, false);
             }
@@ -137,14 +163,14 @@ pub fn build_resolver(
     resolver
 }
 
-fn materialize_specs(all_tools: &[BoxedTool], cwd: &str) -> HashMap<String, AgentSpec> {
+fn materialize_specs(all_tools: &[BoxedTool], cwd: &str) -> HashMap<String, ResolvedSpec> {
     SPECS
         .iter()
         .map(|def| (def.name.to_string(), materialize(def, all_tools, cwd)))
         .collect()
 }
 
-fn materialize(def: &SubagentDef, all_tools: &[BoxedTool], cwd: &str) -> AgentSpec {
+fn materialize(def: &SubagentDef, all_tools: &[BoxedTool], cwd: &str) -> ResolvedSpec {
     let tools = pick_tools(&def.tools, def.extras, all_tools);
     let bare_prompt = match def.prompt_suffix {
         Some(suffix) => format!("{}\n\n{}", def.prompt, suffix),
@@ -153,12 +179,13 @@ fn materialize(def: &SubagentDef, all_tools: &[BoxedTool], cwd: &str) -> AgentSp
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     let system_prompt = crate::prompts::build_subagent_prompt(&bare_prompt, &tool_names, cwd);
 
-    AgentSpec {
-        system_prompt,
-        tools,
-        max_turns: 200,
-        allows_worktree: def.allows_worktree,
-        allowed_subagent_specs: def.can_spawn.map(|s| s.iter().map(|n| n.to_string()).collect()),
+    ResolvedSpec {
+        spec: AgentSpec {
+            system_prompt,
+            tools,
+            max_turns: 200,
+        },
+        can_spawn: def.can_spawn.map(|s| s.iter().map(|n| n.to_string()).collect()),
     }
 }
 
@@ -198,32 +225,52 @@ mod tests {
             .get("general-purpose:executor")
             .expect("executor spec registered");
         assert!(
-            exec.system_prompt.contains("Plan Executor Mode"),
+            exec.spec.system_prompt.contains("Plan Executor Mode"),
             "executor spec carries the executor prompt suffix"
         );
         let general = map
             .get("general-purpose")
             .expect("general-purpose registered");
         assert!(
-            !general.system_prompt.contains("Plan Executor Mode"),
+            !general.spec.system_prompt.contains("Plan Executor Mode"),
             "non-executor spec does NOT carry the suffix"
         );
     }
 
     #[test]
-    fn plan_spec_lacks_worktree_and_can_spawn_explore_plan() {
+    fn plan_can_spawn_explore_plan() {
         let map = materialize_specs(&[], &cwd());
         let plan = map.get("plan").unwrap();
-        assert!(!plan.allows_worktree);
-        let allowed = plan.allowed_subagent_specs.as_ref().unwrap();
+        let allowed = plan.can_spawn.as_ref().unwrap();
         assert_eq!(allowed, &vec!["explore".to_string(), "plan".to_string()]);
+    }
+
+    #[test]
+    fn worktree_specs_excludes_read_only_agents() {
+        let wt = worktree_specs();
+        assert!(
+            wt.contains(&"general-purpose".to_string()),
+            "general-purpose must be worktree-eligible"
+        );
+        assert!(
+            wt.contains(&"general-purpose:executor".to_string()),
+            "executor must be worktree-eligible"
+        );
+        assert!(
+            !wt.contains(&"explore".to_string()),
+            "explore must not be worktree-eligible"
+        );
+        assert!(
+            !wt.contains(&"plan".to_string()),
+            "plan must not be worktree-eligible"
+        );
     }
 
     #[test]
     fn explore_spec_cannot_spawn() {
         let map = materialize_specs(&[], &cwd());
         let explore = map.get("explore").unwrap();
-        assert!(explore.allowed_subagent_specs.is_none());
+        assert!(explore.can_spawn.is_none());
     }
 
     #[test]
@@ -233,9 +280,8 @@ mod tests {
         use std::sync::Arc;
         use tau_agent::AgentManager;
         use tau_agent::test_utils::{MockTransport, make_test_config};
-        let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let transport = Arc::new(MockTransport::new()) as Arc<dyn tau_agent::Transport>;
-        let manager = Arc::new(AgentManager::new(event_tx, make_test_config(), transport, 4));
+        let manager = Arc::new(AgentManager::new(make_test_config(), transport, 4));
         let resolver = build_resolver(manager, &[], &cwd());
 
         // Each of these should resolve to the same spec.

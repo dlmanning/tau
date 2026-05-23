@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use tau_agent::core::command::PromptResult;
+use tau_agent::PromptResult;
 use tau_agent::{AgentBuilder, AgentConfig, ApprovalPolicy, FileAccessTracker, Transport};
 use tau_agent::{BoxedTool, ExecutionContext, ProgressSender};
 use tau_session::{ActiveSession, NewSessionRequest, SessionId, SessionManager, SessionStatus};
@@ -604,6 +604,7 @@ impl DeskAgent {
                 draft.tool_name.clone(),
             ),
             interaction: None,
+            interaction_timeout: None,
             file_access: Arc::new(parking_lot::Mutex::new(FileAccessTracker::default())),
             agent_id: None,
             subagent_depth: 0,
@@ -886,7 +887,10 @@ impl DeskAgent {
         builder.set_tools(tools);
         builder.set_approval_policy(self.approval.clone());
 
-        let handle = builder.spawn();
+        let handle = builder
+            .spawn()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("task `{name}` spawn failed: {e}")))?;
         let prompt_fut = handle.prompt_and_wait(&prompt);
 
         let outcome = tokio::select! {

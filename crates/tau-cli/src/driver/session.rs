@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use tau_agent::{
-    AgentEvent, AgentHandle, AgentManager, AutoAcceptAll, CompactionReason, InteractionRequest,
-    SpawnOpts,
+    AgentEvent, AgentHandle, AgentManager, AutoAcceptAll, CompactionReason, FleetEvent,
+    InteractionRequest, SpawnOpts,
 };
 use tau_ai::{Message, Model, Usage};
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
@@ -46,6 +47,12 @@ pub struct Session {
     manager: Arc<AgentManager>,
     spec_resolver: tau_tools::SpecResolver,
     interaction_rx: mpsc::Receiver<InteractionRequest>,
+    /// Long-lived fleet-event subscription. Subscribed once at session
+    /// construction (not per-prompt) so subagent lifecycle/forwarded
+    /// events that fire while the user is idle — notably a background
+    /// agent finishing between turns — still reach the frontend. Drained
+    /// by both the idle loop and `submit_prompt`.
+    fleet_events: broadcast::Receiver<FleetEvent>,
     available_models: Vec<Model>,
     persistence: Option<SessionManager>,
     prev_usage: Usage,
@@ -57,11 +64,16 @@ pub struct Session {
 
 impl Session {
     pub fn new(cfg: SessionConfig) -> Self {
+        // Subscribe before `cfg.manager` is moved into the struct, and
+        // before any prompt, so no fleet event is missed from session
+        // start onward.
+        let fleet_events = cfg.manager.subscribe();
         Self {
             handle: cfg.handle,
             manager: cfg.manager,
             spec_resolver: cfg.spec_resolver,
             interaction_rx: cfg.interaction_rx,
+            fleet_events,
             available_models: cfg.available_models,
             persistence: cfg.persistence,
             prev_usage: Usage::default(),
@@ -164,7 +176,7 @@ impl Session {
         let session_id = self.persistence.as_ref().map(|s| &s.id()[..8]);
         frontend
             .on_session_start(SessionStart {
-                model: &config.model,
+                model: config.model(),
                 session_id,
             })
             .await;
@@ -182,6 +194,19 @@ impl Session {
                 input = frontend.next_input() => input,
                 Some(req) = self.interaction_rx.recv() => {
                     frontend.handle_interaction(req).await;
+                    continue;
+                }
+                fleet_ev = self.fleet_events.recv() => {
+                    // Background subagents can emit lifecycle/forwarded
+                    // events while we're sitting idle between prompts;
+                    // render them so the agent tree stays current.
+                    match fleet_ev {
+                        Ok(event) => frontend.render_fleet_event(event).await,
+                        Err(RecvError::Closed) => {}
+                        Err(RecvError::Lagged(n)) => {
+                            tracing::warn!(dropped = n, "fleet event stream lagged (idle)");
+                        }
+                    }
                     continue;
                 }
             };
@@ -246,9 +271,12 @@ impl Session {
             .config()
             .await
             .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
-        let model = config.model.clone();
+        let model = config.model().clone();
 
-        // Subscribe before we send so we don't miss the opening events.
+        // Subscribe to the root agent's own stream per-prompt (it only
+        // emits during its own turn). Fleet events use the session-long
+        // `self.fleet_events` so nothing emitted before this prompt — or
+        // by a still-running background agent — is missed.
         let mut events = handle.subscribe();
         let msgs_before = handle.messages().await.map(|m| m.len()).unwrap_or(0);
 
@@ -283,6 +311,13 @@ impl Session {
                         tracing::warn!(dropped = n, "session event stream lagged");
                     }
                 },
+                fleet_ev = self.fleet_events.recv() => match fleet_ev {
+                    Ok(event) => frontend.render_fleet_event(event).await,
+                    Err(RecvError::Closed) => {}
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(dropped = n, "fleet event stream lagged");
+                    }
+                },
                 Some(req) = self.interaction_rx.recv() => {
                     frontend.handle_interaction(req).await;
                 }
@@ -314,6 +349,9 @@ impl Session {
                         }
                         frontend.render_event(event).await;
                         if is_end { break; }
+                    }
+                    while let Ok(event) = self.fleet_events.try_recv() {
+                        frontend.render_fleet_event(event).await;
                     }
                     break;
                 }
@@ -590,7 +628,9 @@ impl Session {
         let cancel = tokio_util::sync::CancellationToken::new();
         let opts = SpawnOpts {
             description: "Executor: approved plan".into(),
-            inherit_history_from: Some(plan_agent_id.clone()),
+            seed: tau_agent::AgentSeed::Inherit {
+                agent_id: plan_agent_id.clone(),
+            },
             spec_name: Some("general-purpose:executor".into()),
             ..Default::default()
         };
@@ -638,7 +678,7 @@ impl Session {
         let messages = self.handle.messages().await.unwrap_or_default();
         let messages = messages.as_slice();
         let model_id = match self.handle.config().await {
-            Some(c) => c.model.id.clone(),
+            Some(c) => c.model().id.clone(),
             None => {
                 frontend.show_error("Agent shut down.").await;
                 return;
@@ -662,7 +702,7 @@ impl Session {
             ))
             .await;
 
-        // Truncate the in-process conversation by respawning with seed_messages.
+        // Truncate the in-process conversation by respawning with an explicit seed.
         let old_id = self.handle.agent_id().map(str::to_string);
         let spec = old_id.as_deref().and_then(|id| self.manager.spec_for(id));
         let truncated: Vec<Message> = match index {
@@ -682,7 +722,10 @@ impl Session {
         self.handle.abort();
         let opts = SpawnOpts {
             description: "main".into(),
-            seed_messages: Some(truncated),
+            seed: tau_agent::AgentSeed::Messages {
+                messages: truncated,
+                previous_summary: None,
+            },
             ..Default::default()
         };
         match self.manager.spawn_interactive(spec, opts).await {

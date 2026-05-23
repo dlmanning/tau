@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tau-ai",
+    "crates/tau-history",
     "crates/tau-agent",
     "crates/tau-tools",
     "crates/tau-session",
@@ -65,9 +66,12 @@ url = "2.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
+indexmap = "2.7"
+sha2 = "0.10"
 
 # Internal crates
 tau-ai = { path = "crates/tau-ai" }
+tau-history = { path = "crates/tau-history" }
 tau-agent = { path = "crates/tau-agent" }
 tau-tools = { path = "crates/tau-tools" }
 tau-session = { path = "crates/tau-session" }

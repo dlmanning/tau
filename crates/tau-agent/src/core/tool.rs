@@ -22,7 +22,7 @@ use crate::core::approval::ToolRisk;
 use crate::types::events::{AgentEvent, ConsoleLevel, ConsoleLine};
 
 /// Helper: send an event on a broadcast channel; ignore "no subscribers".
-pub(crate) fn send_event(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
+pub(crate) fn send_event<E: Clone>(tx: &broadcast::Sender<E>, event: E) {
     let _ = tx.send(event);
 }
 
@@ -232,6 +232,18 @@ pub struct ExecutionContext {
     pub progress: ProgressSender,
     pub interaction:
         Option<tokio::sync::mpsc::Sender<crate::core::interaction::InteractionRequest>>,
+    /// Deadline tools should apply to their own
+    /// [`InteractionRequest`](crate::core::interaction::InteractionRequest)
+    /// round-trips, mirroring the one the actor uses internally for
+    /// `tool.confirm` gates. `None` means unbounded — the historical
+    /// behavior. Configured on the agent via
+    /// [`AgentBuilder::set_interaction_timeout`](crate::core::builder::AgentBuilder::set_interaction_timeout).
+    ///
+    /// The runtime enforces this on its own gates; tools that
+    /// originate custom interactions are expected to honor it
+    /// themselves (e.g. wrap their `response_rx.await` in
+    /// `tokio::time::timeout(ctx.interaction_timeout?, ..)`).
+    pub interaction_timeout: Option<std::time::Duration>,
     pub file_access: Arc<Mutex<FileAccessTracker>>,
     /// Identity of the agent running this tool, when it has one.
     /// `None` for builder-spawned root agents that haven't been adopted

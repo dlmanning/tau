@@ -1,14 +1,14 @@
 //! End-to-end smoke test: build an agent, prompt it, verify the
 //! response and the event stream.
 
-use tau_agent::core::builder::AgentBuilder;
+use tau_agent::AgentBuilder;
 use tau_agent::test_utils::*;
 
 #[tokio::test]
 async fn text_response_round_trip() {
     let transport = TextTransport::create("hello from v2");
     let builder = AgentBuilder::new(test_config(), transport);
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let collector = EventCollector::from_handle(&handle);
 
     handle
@@ -34,7 +34,7 @@ async fn tool_call_round_trip() {
     let transport = ToolCallTransport::create(1, "echo");
     let mut builder = AgentBuilder::new(test_config(), transport);
     builder.add_tool(Arc::new(EchoTool));
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let collector = EventCollector::from_handle(&handle);
 
     handle

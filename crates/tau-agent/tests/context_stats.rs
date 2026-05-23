@@ -4,14 +4,14 @@
 //! `context_stats()` and asserts the snapshot reflects the messages
 //! that landed in `state.conv.conversation.messages`.
 
-use tau_agent::core::builder::AgentBuilder;
+use tau_agent::AgentBuilder;
 use tau_agent::test_utils::*;
 
 #[tokio::test]
 async fn context_stats_reports_used_against_model_limit() {
     let transport = TextTransport::create("hello from v2");
     let builder = AgentBuilder::new(test_config(), transport);
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
     let collector = EventCollector::from_handle(&handle);
 
     handle
@@ -41,7 +41,7 @@ async fn context_stats_reports_used_against_model_limit() {
 async fn context_stats_before_any_prompt_is_empty() {
     let transport = TextTransport::create("unused");
     let builder = AgentBuilder::new(test_config(), transport);
-    let handle = builder.spawn();
+    let handle = builder.spawn().await.unwrap();
 
     let stats = handle
         .context_stats()

@@ -1,7 +1,7 @@
 //! The [`Frontend`] trait — what stdout / TUI must implement.
 
 use async_trait::async_trait;
-use tau_agent::{AgentEvent, InteractionRequest};
+use tau_agent::{AgentEvent, FleetEvent, InteractionRequest};
 use tau_ai::{Model, Usage};
 
 /// Snapshot of context passed once at session start so frontends can
@@ -51,6 +51,11 @@ pub trait Frontend: Send {
 
     /// Render one agent event during an in-flight turn.
     async fn render_event(&mut self, event: AgentEvent);
+
+    /// Render one fleet event (subagent lifecycle, forwarded child
+    /// events) during an in-flight turn. Default: no-op for frontends
+    /// that don't surface fleet activity.
+    async fn render_fleet_event(&mut self, _event: FleetEvent) {}
 
     /// Called after each turn completes, with the run's total usage so
     /// the frontend can show a cost summary.

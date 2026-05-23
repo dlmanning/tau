@@ -161,13 +161,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let manager = Arc::new(
-        tau_agent::AgentManager::new(
-            builder.event_sender(),
-            builder.config().clone(),
-            transport.clone(),
-            20,
-        )
-        .with_parent_interaction_sender(interaction_tx),
+        tau_agent::AgentManager::new(builder.config().clone(), transport.clone(), 20)
+            .with_parent_interaction_sender(interaction_tx),
     );
 
     let cwd = std::env::current_dir()
@@ -176,7 +171,9 @@ async fn main() -> anyhow::Result<()> {
     let resolver = subagents::build_resolver(manager.clone(), builder.tools(), &cwd);
     let resolver_for_host = resolver.clone();
 
-    let agent_tool = tau_tools::AgentTool::new(manager.clone()).with_spec_resolver(resolver);
+    let agent_tool = tau_tools::AgentTool::new(manager.clone())
+        .with_spec_resolver(resolver)
+        .with_worktree_specs(subagents::worktree_specs());
     builder.add_tool(Arc::new(agent_tool));
     builder.add_tool(Arc::new(tau_tools::SendMessageTool::new(manager.clone())));
 
@@ -217,8 +214,10 @@ async fn main() -> anyhow::Result<()> {
                         ""
                     }
                 );
-                builder.set_messages(messages);
-                builder.set_previous_summary(previous_summary);
+                builder.seed(tau_agent::AgentSeed::Messages {
+                    messages,
+                    previous_summary,
+                });
                 resumed_session = Some(session_mgr);
             }
             Err(e) => {
@@ -234,16 +233,10 @@ async fn main() -> anyhow::Result<()> {
         system_prompt: parent_system_prompt,
         tools: root_tools,
         max_turns: 200,
-        allows_worktree: true,
-        allowed_subagent_specs: Some(vec![
-            "general-purpose".into(),
-            "explore".into(),
-            "plan".into(),
-        ]),
     };
 
     // Spawn the agent actor — from here on we use the handle
-    let handle = builder.spawn();
+    let handle = builder.spawn().await?;
     // Register the root with the manager so handle.respec works.
     let _root_id = manager.adopt(&handle, "root", root_spec);
 

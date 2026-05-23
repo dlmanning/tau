@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tau_agent::core::approval::{AutoAcceptAll, DefaultPolicy, ToolRisk};
-use tau_agent::core::tool::{Concurrency, ExecutionContext, Tool, ToolCategory, ToolResult};
+use tau_agent::{AutoAcceptAll, DefaultPolicy, ToolRisk};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolCategory, ToolResult};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 
@@ -62,7 +62,7 @@ impl Tool for DangerTool {
     }
 }
 
-fn spawn_with_policy(policy: Arc<dyn ApprovalPolicy>) -> AgentHandle {
+async fn spawn_with_policy(policy: Arc<dyn ApprovalPolicy>) -> AgentHandle {
     let transport = MockTransport::new();
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(Arc::new(ReadyTool));
@@ -72,13 +72,13 @@ fn spawn_with_policy(policy: Arc<dyn ApprovalPolicy>) -> AgentHandle {
     builder.add_tool(Arc::new(EchoTool));
     builder.set_approval_policy(policy);
     let handle = builder.handle();
-    builder.spawn();
+    builder.spawn().await.unwrap();
     handle
 }
 
 #[tokio::test]
 async fn list_tools_reports_categories_and_descriptions() {
-    let handle = spawn_with_policy(Arc::new(DefaultPolicy));
+    let handle = spawn_with_policy(Arc::new(DefaultPolicy)).await;
     let infos = handle.list_tools().await.expect("list_tools");
 
     assert_eq!(infos.len(), 3);
@@ -97,7 +97,7 @@ async fn list_tools_reports_categories_and_descriptions() {
 
 #[tokio::test]
 async fn default_policy_marks_elevated_as_not_currently_allowed() {
-    let handle = spawn_with_policy(Arc::new(DefaultPolicy));
+    let handle = spawn_with_policy(Arc::new(DefaultPolicy)).await;
     let infos = handle.list_tools().await.unwrap();
 
     let ready = infos.iter().find(|i| i.name == "ready").unwrap();
@@ -133,7 +133,7 @@ async fn default_policy_marks_elevated_as_not_currently_allowed() {
 
 #[tokio::test]
 async fn auto_accept_marks_everything_currently_allowed() {
-    let handle = spawn_with_policy(Arc::new(AutoAcceptAll));
+    let handle = spawn_with_policy(Arc::new(AutoAcceptAll)).await;
     let infos = handle.list_tools().await.unwrap();
 
     for info in &infos {

@@ -7,4 +7,5 @@
 pub mod conversation;
 pub mod error;
 pub mod events;
+pub mod health;
 pub mod info;

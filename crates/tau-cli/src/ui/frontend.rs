@@ -390,6 +390,11 @@ impl Frontend for TuiFrontend {
         self.maybe_redraw();
     }
 
+    async fn render_fleet_event(&mut self, event: tau_agent::FleetEvent) {
+        self.state.handle_fleet_event(event);
+        self.maybe_redraw();
+    }
+
     async fn render_turn_end(&mut self, _total_usage: &Usage, _model: &Model) {
         self.state.is_processing = false;
         self.state.status = "Ready".to_string();

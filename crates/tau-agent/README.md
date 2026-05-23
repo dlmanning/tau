@@ -114,11 +114,11 @@ use tau_agent::{AgentBuilder, AgentConfig, ProviderTransport};
 
 #[tokio::main]
 async fn main() -> tau_agent::Result<()> {
-    let config = AgentConfig {
-        system_prompt: Some("You are a helpful assistant.".into()),
-        /* model, reasoning, compaction, etc. — see config.rs */
-        .. /* fields */
-    };
+    let model = tau_ai::get_model_by_id("claude-opus-4-7").expect("model exists");
+    let config = AgentConfig::builder(model)
+        .system_prompt("You are a helpful assistant.")
+        // .reasoning(ReasoningLevel::Medium), .compaction(...), etc.
+        .build();
 
     let transport = Arc::new(ProviderTransport::new());
     let handle = AgentBuilder::new(config, transport).spawn();
@@ -219,10 +219,12 @@ builder.set_approval_policy(Arc::new(AutoAcceptAll));
 // "Gate" tools whose risk is Elevated (Bash, network posts).
 builder.set_approval_policy(Arc::new(DefaultPolicy));
 
-// Per-tool / per-argument rules with a fallback.
+// Per-tool / per-argument rules with a fallback. Patterns match
+// against typed JSON string values with whitespace normalization —
+// see API.md §5 for the full matching model.
 let policy = RulePolicy::new(Arc::new(DefaultPolicy))
-    .allow(ToolRule { tool: "bash".into(), arg_substrings: vec!["git status".into()] })
-    .deny(ToolRule { tool: "bash".into(), arg_substrings: vec!["rm -rf".into()] });
+    .allow(ToolRule::contains_at("bash", "command", "git status"))
+    .deny(ToolRule::contains_at("bash", "command", "rm -rf"));
 builder.set_approval_policy(Arc::new(policy));
 ```
 
@@ -256,15 +258,13 @@ composition of a registry, a lifecycle, and an event bus:
 ```rust
 use tau_agent::{AgentManager, AgentSpec, SpawnOpts};
 
-let (event_tx, _) = tokio::sync::broadcast::channel(256);
-let manager = Arc::new(AgentManager::new(event_tx, config, transport, /* max_agents */ 20));
+let manager = Arc::new(AgentManager::new(config, transport, /* max_agents */ 20));
+let mut fleet_events = manager.subscribe();
 
 let spec = AgentSpec {
     system_prompt: "You are a focused research agent.".into(),
     tools: vec![Arc::new(EchoTool)],
     max_turns: 50,
-    allows_worktree: false,
-    allowed_subagent_specs: None,
 };
 
 let result = manager

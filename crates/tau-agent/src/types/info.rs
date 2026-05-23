@@ -18,6 +18,7 @@ use crate::core::tool::ToolCategory;
 /// model's advertised context window. `remaining` is `limit - used`
 /// saturated at zero.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ContextStats {
     pub used: u64,
     pub remaining: u64,
@@ -38,6 +39,7 @@ pub struct ContextStats {
 /// `DefaultPolicy`: `Safe` and `Local` are allowed by default,
 /// `Elevated` is not.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolInfo {
     pub name: String,
     pub description: String,

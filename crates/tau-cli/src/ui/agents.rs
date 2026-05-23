@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::widgets::message_list::ChatMessage;
-use tau_agent::AgentEvent;
+use tau_agent::{AgentEvent, FleetEvent, SubagentOutcome};
 
 use super::constants;
 use super::state::{AgentProgress, TuiState};
@@ -169,41 +169,86 @@ impl TuiState {
                 )));
                 self.scroll_to_bottom();
             }
-            AgentEvent::Subagent {
+            AgentEvent::TurnStart { .. }
+            | AgentEvent::MessageStart { .. }
+            | AgentEvent::ToolApprovalResolved { .. }
+            | AgentEvent::FileChanged { .. }
+            | AgentEvent::AgentReport { .. } => {}
+        }
+    }
+
+    /// Handle fleet events (per-subagent lifecycle and forwarded child events).
+    pub fn handle_fleet_event(&mut self, event: FleetEvent) {
+        match event {
+            FleetEvent::AgentStarted {
                 agent_id,
                 description,
-                event,
-            } => match *event {
-                AgentEvent::AgentStart => {
-                    let progress = AgentProgress::new(description);
-                    self.agent_progress.insert(agent_id.clone(), progress);
-                    self.agent_order.push(agent_id);
-                    self.update_agent_tree();
+                ..
+            } => {
+                let progress = AgentProgress::new(description);
+                self.agent_progress.insert(agent_id.clone(), progress);
+                self.agent_order.push(agent_id);
+                self.update_agent_tree();
+            }
+            FleetEvent::AgentResumed { agent_id, description, .. } => {
+                self.agent_progress
+                    .entry(agent_id.clone())
+                    .or_insert_with(|| {
+                        self.agent_order.push(agent_id);
+                        AgentProgress::new(description)
+                    });
+                self.update_agent_tree();
+            }
+            FleetEvent::AgentCompleted {
+                agent_id, outcome, ..
+            } => {
+                // A subagent that fails at setup (e.g. worktree creation)
+                // or is aborted emits AgentCompleted with a Failed/Aborted
+                // outcome and no forwarded AgentEvent::Error, so the error
+                // indicator must come from the outcome here — otherwise a
+                // failed agent renders with a success ✓.
+                let error_reason = match &outcome {
+                    SubagentOutcome::Failed { reason } | SubagentOutcome::Aborted { reason } => {
+                        Some(reason.clone())
+                    }
+                    SubagentOutcome::Completed => None,
+                };
+                if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
+                    progress.finished = true;
+                    if let Some(reason) = &error_reason {
+                        progress.activity = format!("error: {}", reason);
+                    }
                 }
-                AgentEvent::ToolExecutionStart { ref activity, .. } => {
+                self.update_agent_tree();
+                if self.agent_progress.values().all(|p| p.finished) {
+                    let any_error = self
+                        .agent_progress
+                        .values()
+                        .any(|p| p.activity.starts_with("error:"));
+                    self.finalize_agent_progress(any_error);
+                }
+            }
+            FleetEvent::AgentReport { .. } => {}
+            FleetEvent::Forwarded {
+                agent_id,
+                event: inner,
+                ..
+            } => match inner {
+                AgentEvent::ToolExecutionStart { activity, .. } => {
                     if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
                         progress.tool_count += 1;
-                        progress.activity = activity.clone();
+                        progress.activity = activity;
                     }
                     self.update_agent_tree();
                 }
-                AgentEvent::TurnEnd { ref usage, .. } => {
+                AgentEvent::TurnEnd { usage, .. } => {
                     if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
                         progress.input_tokens += usage.input;
                         progress.output_tokens += usage.output;
                     }
-                    self.usage.accumulate(usage, &self.model);
+                    self.usage.accumulate(&usage, &self.model);
                 }
-                AgentEvent::AgentEnd { .. } => {
-                    if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
-                        progress.finished = true;
-                    }
-                    self.update_agent_tree();
-                    if self.agent_progress.values().all(|p| p.finished) {
-                        self.finalize_agent_progress(false);
-                    }
-                }
-                AgentEvent::Error { ref message } => {
+                AgentEvent::Error { message } => {
                     if let Some(progress) = self.agent_progress.get_mut(&agent_id) {
                         progress.finished = true;
                         progress.activity = format!("error: {}", message);
@@ -215,14 +260,6 @@ impl TuiState {
                 }
                 _ => {}
             },
-            AgentEvent::TurnStart { .. }
-            | AgentEvent::MessageStart { .. }
-            | AgentEvent::ToolApprovalResolved { .. }
-            | AgentEvent::FileChanged { .. }
-            | AgentEvent::SubagentStarted { .. }
-            | AgentEvent::SubagentResumed { .. }
-            | AgentEvent::SubagentCompleted { .. }
-            | AgentEvent::SubagentReport { .. } => {}
         }
     }
 

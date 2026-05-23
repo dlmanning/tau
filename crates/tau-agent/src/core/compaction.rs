@@ -21,25 +21,83 @@ use crate::types::events::AgentEvent;
 // imports from this module.
 pub use crate::types::events::CompactionReason;
 
+/// A token budget that can be expressed as either an absolute count
+/// or a fraction of the model's context window.
+///
+/// **Prefer `Fraction` for defaults that must work across model
+/// sizes.** Absolute counts that are sensible on a 200K-context model
+/// can swallow half the window on a 32K-context model — a `Tokens(16_384)`
+/// reserve is ~8% of Opus's window but ~50% of GPT-3.5's. `Fraction(0.08)`
+/// scales correctly and produces the same headroom on Opus.
+///
+/// `Tokens` is the right choice when you want explicit control that's
+/// independent of which model the agent ends up running — e.g.
+/// "always keep at least the last 5000 tokens, regardless of window
+/// size."
+#[derive(Debug, Clone, Copy)]
+pub enum CompactionThreshold {
+    /// Fraction of `model.context_window`. Clamped to `[0.0, 1.0]`
+    /// before use.
+    Fraction(f32),
+    /// Absolute token count.
+    Tokens(u64),
+}
+
+impl CompactionThreshold {
+    /// Resolve to an absolute token count against a model's
+    /// `context_window`. `Fraction` values are clamped to `[0.0, 1.0]`
+    /// before scaling, so out-of-range inputs degrade gracefully
+    /// (negative → zero, > 1.0 → the full window).
+    pub fn resolve(&self, context_window: u64) -> u64 {
+        match self {
+            Self::Fraction(f) => {
+                // NaN propagates through clamp as NaN, so guard it
+                // explicitly — degrade to zero rather than producing
+                // garbage.
+                if f.is_nan() {
+                    return 0;
+                }
+                let clamped = f.clamp(0.0, 1.0) as f64;
+                // Round, not truncate: with f32 0.08 the exact product
+                // is 15_999.999... on a 200K window, which truncates to
+                // 15_999 and would silently disagree with the intuitive
+                // "8% of 200K = 16K". Rounding lands on 16_000.
+                (context_window as f64 * clamped).round() as u64
+            }
+            Self::Tokens(n) => *n,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     pub enabled: bool,
     /// Trigger proactive compaction when `(input + cache_read)` is
-    /// within this many tokens of the model's `context_window`.
-    pub reserve_tokens: u64,
+    /// within this much of the model's `context_window`. Expressed as
+    /// a [`CompactionThreshold`] so the same default scales correctly
+    /// across model sizes — see the [`CompactionThreshold`] docs for
+    /// why fractions are preferred over absolute counts here.
+    pub reserve: CompactionThreshold,
     /// Lower bound on how many tokens of recent messages survive a
     /// compaction pass — the cut-point search walks back until it has
     /// accumulated at least this much, then continues to the next
     /// message boundary.
-    pub keep_recent_tokens: u64,
+    pub keep_recent: CompactionThreshold,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            reserve_tokens: 16384,
-            keep_recent_tokens: 20000,
+            // 0.08 of 200K (Opus) = 16_000 tokens — close to the old
+            // absolute default of 16_384. On a 32K-context model,
+            // 0.08 = 2_560 tokens (vs the old default of 16_384, which
+            // would have reserved 50% of the window before any work
+            // could start).
+            reserve: CompactionThreshold::Fraction(0.08),
+            // 0.10 of 200K = 20_000 tokens — matches the old absolute
+            // default. Scales sensibly on smaller models.
+            keep_recent: CompactionThreshold::Fraction(0.10),
         }
     }
 }
@@ -461,7 +519,10 @@ pub async fn compact(
     if cancel.is_cancelled() {
         return Err("Compaction cancelled".into());
     }
-    let cut = find_cut_point(messages, config.keep_recent_tokens, cancel).ok_or_else(|| {
+    let keep_recent_tokens = config
+        .keep_recent
+        .resolve(agent_config.model.context_window as u64);
+    let cut = find_cut_point(messages, keep_recent_tokens, cancel).ok_or_else(|| {
         if cancel.is_cancelled() {
             "Compaction cancelled".to_string()
         } else {
@@ -635,6 +696,55 @@ mod tests {
     fn estimate_tokens_char_quarter() {
         // 12 chars / 4 = 3 tokens
         assert_eq!(estimate_tokens(&user("Hello world!")), 3);
+    }
+
+    #[test]
+    fn threshold_fraction_scales_with_context_window() {
+        // Same fraction, different windows → different absolute counts.
+        // This is the whole point of using fractions in defaults: the
+        // 8% reserve produces 16K on Opus and 2.56K on a 32K model,
+        // rather than reserving half a small model's window.
+        let t = CompactionThreshold::Fraction(0.08);
+        assert_eq!(t.resolve(200_000), 16_000);
+        assert_eq!(t.resolve(32_000), 2_560);
+        assert_eq!(t.resolve(0), 0);
+    }
+
+    #[test]
+    fn threshold_tokens_ignores_context_window() {
+        // Absolute counts pass through unchanged — for callers that
+        // want explicit control regardless of which model runs.
+        let t = CompactionThreshold::Tokens(5_000);
+        assert_eq!(t.resolve(200_000), 5_000);
+        assert_eq!(t.resolve(32_000), 5_000);
+    }
+
+    #[test]
+    fn threshold_fraction_clamps_out_of_range() {
+        // Negative / > 1.0 inputs degrade gracefully rather than
+        // producing nonsense token counts.
+        assert_eq!(CompactionThreshold::Fraction(-0.5).resolve(100_000), 0);
+        assert_eq!(
+            CompactionThreshold::Fraction(2.0).resolve(100_000),
+            100_000
+        );
+        assert_eq!(CompactionThreshold::Fraction(f32::NAN).resolve(100_000), 0);
+    }
+
+    #[test]
+    fn compaction_default_matches_legacy_on_opus_context() {
+        // The fraction defaults were chosen to mirror the old absolute
+        // defaults on a 200K-context model — within rounding error —
+        // so existing Opus deployments don't see a behavior change.
+        let cfg = CompactionConfig::default();
+        let reserve = cfg.reserve.resolve(200_000);
+        let keep = cfg.keep_recent.resolve(200_000);
+        // Old absolute defaults were 16_384 and 20_000.
+        assert!(
+            (15_500..=16_500).contains(&reserve),
+            "reserve ≈ old default on Opus: got {reserve}"
+        );
+        assert_eq!(keep, 20_000);
     }
 
     #[test]

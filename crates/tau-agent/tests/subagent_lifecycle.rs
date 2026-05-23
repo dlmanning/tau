@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
-use tau_agent::core::approval::{ApprovalDecision, ApprovalPolicy, AutoAcceptAll, ToolRisk};
-use tau_agent::core::tool::{Concurrency, ExecutionContext, Tool, ToolResult};
-use tau_agent::core::transport::Transport;
-use tau_agent::fleet::manager::{AgentManager, AgentSpec, SpawnOpts};
+use tau_agent::{ApprovalDecision, ApprovalPolicy, AutoAcceptAll, ToolRisk};
+use tau_agent::{Concurrency, ExecutionContext, Tool, ToolResult};
+use tau_agent::Transport;
+use tau_agent::{AgentManager, AgentSpec, SpawnOpts};
 use tau_agent::test_utils::*;
-use tau_agent::{AgentEvent, BoxedTool, SubagentOutcome};
+use tau_agent::{AgentEvent, BoxedTool, FleetEvent, SubagentOutcome};
 // SubagentReportTool replicated inline below (v1 had it in tau-tools;
 // v2 has no host-tools dep, so we fixture it locally).
 struct SubagentReportTool;
@@ -50,27 +50,24 @@ impl Tool for SubagentReportTool {
             .unwrap_or("")
             .to_string();
         ctx.progress
-            .emit(AgentEvent::SubagentReport { tag, summary });
+            .emit(AgentEvent::AgentReport { tag, summary });
         ToolResult::text("reported")
     }
 }
 
 fn make_manager(transport: Arc<dyn Transport>) -> Arc<AgentManager> {
-    let (tx, _rx) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-    Arc::new(AgentManager::new(tx, test_config(), transport, 4))
+    Arc::new(AgentManager::new(test_config(), transport, 4))
 }
 
 fn make_manager_with_rx(
     transport: Arc<dyn Transport>,
 ) -> (
     Arc<AgentManager>,
-    tokio::sync::broadcast::Receiver<AgentEvent>,
+    tokio::sync::broadcast::Receiver<FleetEvent>,
 ) {
-    let (tx, rx) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-    (
-        Arc::new(AgentManager::new(tx, test_config(), transport, 4)),
-        rx,
-    )
+    let manager = Arc::new(AgentManager::new(test_config(), transport, 4));
+    let rx = manager.subscribe();
+    (manager, rx)
 }
 
 fn echo_spec() -> AgentSpec {
@@ -78,8 +75,6 @@ fn echo_spec() -> AgentSpec {
         system_prompt: String::new(),
         tools: vec![],
         max_turns: 200,
-        allows_worktree: false,
-        allowed_subagent_specs: None,
     }
 }
 
@@ -88,8 +83,6 @@ fn echo_spec_with_tools(tools: Vec<BoxedTool>) -> AgentSpec {
         system_prompt: String::new(),
         tools,
         max_turns: 200,
-        allows_worktree: false,
-        allowed_subagent_specs: None,
     }
 }
 
@@ -120,8 +113,8 @@ async fn spawn_emits_started_then_completed() {
     let mut completed_outcome: Option<SubagentOutcome> = None;
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            AgentEvent::SubagentStarted { agent_id, .. } => started_id = Some(agent_id),
-            AgentEvent::SubagentCompleted {
+            FleetEvent::AgentStarted { agent_id, .. } => started_id = Some(agent_id),
+            FleetEvent::AgentCompleted {
                 agent_id, outcome, ..
             } => {
                 completed_id = Some(agent_id);
@@ -130,7 +123,7 @@ async fn spawn_emits_started_then_completed() {
             _ => {}
         }
     }
-    assert!(started_id.is_some(), "SubagentStarted emitted");
+    assert!(started_id.is_some(), "AgentStarted emitted");
     assert_eq!(started_id, completed_id, "ids match across bracket");
     assert!(matches!(
         completed_outcome,
@@ -158,10 +151,10 @@ async fn aborted_spawn_emits_completed_with_aborted_outcome() {
             .await;
     });
 
-    // Wait for SubagentStarted to confirm it's in flight.
+    // Wait for AgentStarted to confirm it's in flight.
     let started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if let Ok(AgentEvent::SubagentStarted { .. }) = rx.recv().await {
+            if let Ok(FleetEvent::AgentStarted { .. }) = rx.recv().await {
                 return;
             }
         }
@@ -174,7 +167,7 @@ async fn aborted_spawn_emits_completed_with_aborted_outcome() {
 
     let mut found_aborted = false;
     while let Ok(ev) = rx.try_recv() {
-        if let AgentEvent::SubagentCompleted {
+        if let FleetEvent::AgentCompleted {
             outcome: SubagentOutcome::Aborted { .. },
             ..
         } = ev
@@ -212,21 +205,22 @@ async fn subagent_report_tool_emits_wrapped_event() {
 
     let mut found = false;
     while let Ok(ev) = rx.try_recv() {
-        if let AgentEvent::Subagent {
-            agent_id, event, ..
+        if let FleetEvent::AgentReport {
+            agent_id,
+            tag,
+            summary,
+            ..
         } = ev
         {
             if agent_id == result.agent_id {
-                if let AgentEvent::SubagentReport { tag, summary } = *event {
-                    assert_eq!(tag.as_deref(), Some("passed"));
-                    assert_eq!(summary, "all green");
-                    found = true;
-                    break;
-                }
+                assert_eq!(tag.as_deref(), Some("passed"));
+                assert_eq!(summary, "all green");
+                found = true;
+                break;
             }
         }
     }
-    assert!(found, "SubagentReport reaches parent wrapped");
+    assert!(found, "AgentReport reaches the fleet channel");
 }
 
 // ─── Approval policy inheritance ─────────────────────────────────────
@@ -343,10 +337,10 @@ async fn resume_emits_subagent_resumed_then_completed() {
     let mut saw_completed_after_resume = false;
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            AgentEvent::SubagentResumed { agent_id, .. } => {
+            FleetEvent::AgentResumed { agent_id, .. } => {
                 saw_resumed_id = Some(agent_id);
             }
-            AgentEvent::SubagentCompleted { agent_id, .. } => {
+            FleetEvent::AgentCompleted { agent_id, .. } => {
                 if saw_resumed_id.as_deref() == Some(agent_id.as_str()) {
                     saw_completed_after_resume = true;
                     break;
@@ -357,11 +351,11 @@ async fn resume_emits_subagent_resumed_then_completed() {
     }
     assert!(
         saw_resumed_id.is_some(),
-        "SubagentResumed emitted on send()"
+        "AgentResumed emitted on send()"
     );
     assert!(
         saw_completed_after_resume,
-        "SubagentCompleted bracketed the resume"
+        "AgentCompleted bracketed the resume"
     );
 }
 
@@ -460,8 +454,6 @@ async fn execution_context_carries_owning_agent_id() {
         system_prompt: String::new(),
         tools: vec![recorder.clone()],
         max_turns: 200,
-        allows_worktree: false,
-        allowed_subagent_specs: None,
     };
 
     let mgr1 = make_manager(ToolCallTransport::create(1, "id_recorder"));
@@ -525,8 +517,6 @@ async fn respec_transitions_old_id_to_new() {
                 system_prompt: "new prompt".to_string(),
                 tools: vec![],
                 max_turns: 200,
-                allows_worktree: false,
-                allowed_subagent_specs: None,
             },
         )
         .await
@@ -591,8 +581,6 @@ async fn respec_concurrent_with_send_does_not_drop_live_spec() {
                 system_prompt: "new".into(),
                 tools: vec![],
                 max_turns: 200,
-                allows_worktree: false,
-                allowed_subagent_specs: None,
             },
         )
         .await;
@@ -610,5 +598,33 @@ async fn respec_concurrent_with_send_does_not_drop_live_spec() {
     assert!(
         manager.spec_for(&id).is_some(),
         "spec preserved through race"
+    );
+}
+
+/// `respec` against an id that isn't in the registry surfaces a
+/// structured `AgentNotFound` — callers can branch on it without
+/// string-matching the Display impl.
+#[tokio::test]
+async fn respec_missing_id_returns_agent_not_found() {
+    let transport: Arc<dyn Transport> = TextTransport::create("done");
+    let manager = make_manager(transport);
+
+    let err = match manager
+        .respec(
+            "definitely-not-an-agent",
+            AgentSpec {
+                system_prompt: "x".into(),
+                tools: vec![],
+                max_turns: 1,
+            },
+        )
+        .await
+    {
+        Ok(_) => panic!("respec on missing id must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, tau_agent::Error::AgentNotFound { id } if id == "definitely-not-an-agent"),
+        "expected Error::AgentNotFound, got: {err:?}"
     );
 }

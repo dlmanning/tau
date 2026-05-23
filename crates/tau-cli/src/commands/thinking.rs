@@ -24,7 +24,7 @@ impl Command for ThinkingCommand {
             let current = session
                 .current_config()
                 .await
-                .map(|c| c.reasoning)
+                .map(|c| c.reasoning())
                 .unwrap_or(ReasoningLevel::Off);
             frontend.show_system(&show_levels(current)).await;
             return;

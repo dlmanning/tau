@@ -5,8 +5,8 @@
 //!
 //! 1. `create` — new id, write `info.json`, build an `AgentBuilder` with
 //!    the host's tools/transport, spawn the agent, wire the persister.
-//! 2. `activate` — read snapshot, build agent with `set_messages` +
-//!    `set_previous_summary`, spawn, wire persister.
+//! 2. `activate` — read snapshot, build agent with
+//!    `builder.seed(AgentSeed::Messages { … })`, spawn, wire persister.
 //! 3. `hibernate` — abort the agent, flush a snapshot, drop the handle.
 //! 4. `close` — soft-delete: status flips to `Closed`, info kept.
 //! 5. `evict_idle` — hibernate idle sessions older than a threshold.
@@ -161,16 +161,16 @@ impl SessionManager {
         for tool in &req.tools {
             builder.add_tool(tool.clone());
         }
-        if !req.seed_messages.is_empty() {
-            builder.set_messages(req.seed_messages);
-        }
-        if req.previous_summary.is_some() {
-            builder.set_previous_summary(req.previous_summary);
+        if !req.seed_messages.is_empty() || req.previous_summary.is_some() {
+            builder.seed(tau_agent::AgentSeed::Messages {
+                messages: req.seed_messages,
+                previous_summary: req.previous_summary,
+            });
         }
         if let Some(customize) = req.customize {
             customize(&mut builder);
         }
-        let handle = builder.spawn();
+        let handle = builder.spawn().await?;
 
         // Wire persister.
         let persister_cancel = tokio_util::sync::CancellationToken::new();
@@ -274,13 +274,13 @@ impl SessionManager {
         for tool in &tools {
             builder.add_tool(tool.clone());
         }
-        if !snapshot.messages.is_empty() {
-            builder.set_messages(snapshot.messages.clone());
+        if !snapshot.messages.is_empty() || snapshot.previous_summary.is_some() {
+            builder.seed(tau_agent::AgentSeed::Messages {
+                messages: snapshot.messages.clone(),
+                previous_summary: snapshot.previous_summary.clone(),
+            });
         }
-        if let Some(ref s) = snapshot.previous_summary {
-            builder.set_previous_summary(Some(s.clone()));
-        }
-        let handle = builder.spawn();
+        let handle = builder.spawn().await?;
 
         let persister_cancel = tokio_util::sync::CancellationToken::new();
         let persister_task = spawn_persister(

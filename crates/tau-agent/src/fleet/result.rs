@@ -1,6 +1,7 @@
 //! `SubagentResult` — what `spawn` / `send` return to the caller.
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SubagentResult {
     pub agent_id: String,
     /// Final assistant text (the literal last assistant turn's text;

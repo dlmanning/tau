@@ -5,14 +5,17 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tau_agent::core::transport::{AgentEventStream, AgentRunConfig};
+use tau_agent::{AgentEventStream, AgentRunConfig};
 use tau_agent::test_utils::*;
 use tau_agent::*;
 use tau_ai::{AssistantMetadata, Content, Message, Usage};
 
 #[tokio::test]
 async fn reject_concurrent_prompt() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::create(200)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(200))
+        .spawn()
+        .await
+        .unwrap();
 
     let rx1 = handle.prompt("first").await.unwrap();
     let _ = handle.config().await; // ensure actor picked it up
@@ -28,25 +31,31 @@ async fn reject_concurrent_prompt() {
 
 #[tokio::test]
 async fn is_running_tracks_lifecycle() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::create(100)).spawn();
-    assert!(!handle.is_running());
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(100))
+        .spawn()
+        .await
+        .unwrap();
+    assert!(matches!(handle.health(), AgentHealth::Idle));
 
     let rx = handle.prompt("go").await.unwrap();
     let _ = handle.config().await;
-    assert!(handle.is_running());
+    assert!(matches!(handle.health(), AgentHealth::Running));
 
     let _ = rx.await;
     let _ = handle.config().await;
-    assert!(!handle.is_running());
+    assert!(matches!(handle.health(), AgentHealth::Idle));
 }
 
 #[tokio::test]
 async fn abort_stops_active_prompt() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::create(5000)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(5000))
+        .spawn()
+        .await
+        .unwrap();
 
     let rx = handle.prompt("go").await.unwrap();
     let _ = handle.config().await;
-    assert!(handle.is_running());
+    assert!(matches!(handle.health(), AgentHealth::Running));
 
     handle.abort();
 
@@ -97,8 +106,10 @@ async fn abort_then_new_prompt_succeeds() {
         }
     }
 
-    let handle =
-        AgentBuilder::new(test_config(), Arc::new(SwitchTransport(AtomicU32::new(0)))).spawn();
+    let handle = AgentBuilder::new(test_config(), Arc::new(SwitchTransport(AtomicU32::new(0))))
+        .spawn()
+        .await
+        .unwrap();
 
     let rx1 = handle.prompt("first").await.unwrap();
     let _ = handle.config().await;
@@ -115,7 +126,10 @@ async fn abort_then_new_prompt_succeeds() {
 
 #[tokio::test]
 async fn queries_work_during_streaming() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::create(200)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(200))
+        .spawn()
+        .await
+        .unwrap();
     let rx = handle.prompt("go").await.unwrap();
 
     // These should not hang — the actor select!s on cmd_rx during AwaitingModel
@@ -131,7 +145,10 @@ async fn queries_work_during_streaming() {
 
 #[tokio::test]
 async fn config_mutation_during_streaming_takes_effect_next_turn() {
-    let handle = AgentBuilder::new(test_config(), SlowTransport::create(100)).spawn();
+    let handle = AgentBuilder::new(test_config(), SlowTransport::create(100))
+        .spawn()
+        .await
+        .unwrap();
     let rx = handle.prompt("go").await.unwrap();
 
     handle
@@ -141,7 +158,7 @@ async fn config_mutation_during_streaming_takes_effect_next_turn() {
     let _ = rx.await;
 
     let cfg = handle.config().await.unwrap();
-    assert_eq!(cfg.reasoning, tau_ai::ReasoningLevel::High);
+    assert_eq!(cfg.reasoning(), tau_ai::ReasoningLevel::High);
 }
 
 #[tokio::test]
@@ -212,7 +229,10 @@ async fn steer_arrives_during_slow_stream() {
         call_count: AtomicU32::new(0),
         captured: std::sync::Mutex::new(vec![]),
     });
-    let handle = AgentBuilder::new(test_config(), transport.clone()).spawn();
+    let handle = AgentBuilder::new(test_config(), transport.clone())
+        .spawn()
+        .await
+        .unwrap();
 
     let rx = handle.prompt("initial").await.unwrap();
 

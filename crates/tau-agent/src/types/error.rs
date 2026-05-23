@@ -1,4 +1,10 @@
 //! Error types for the agent runtime.
+//!
+//! `Error` separates conditions callers may want to branch on
+//! (`AgentNotFound`, `AgentBusy`, `Busy`, `ChannelFull`, …) from the
+//! catch-all `Other(String)` that wraps situations that don't yet
+//! have a structured shape. Avoid adding new string-encoded conditions
+//! — prefer introducing a variant.
 
 use thiserror::Error;
 
@@ -30,6 +36,41 @@ pub enum Error {
     #[error("Command channel `{channel}` is full")]
     ChannelFull { channel: &'static str },
 
+    /// A fleet operation referenced an agent id that isn't tracked
+    /// (or isn't in the bucket the operation requires — `respec`
+    /// needs an idle agent, `send` walks every bucket). The id may
+    /// have been evicted under LRU pressure, never spawned, or
+    /// already detached by a concurrent `respec`.
+    #[error("agent '{id}' not found in the fleet registry")]
+    AgentNotFound { id: String },
+
+    /// A fleet operation that requires an idle agent encountered one
+    /// that's currently executing a prompt. Recover by aborting or
+    /// interrupting the agent and waiting for `AgentEnd` before
+    /// retrying the operation.
+    #[error("agent '{id}' is currently running; abort or interrupt before this operation")]
+    AgentBusy { id: String },
+
+    /// `respec` failed to spawn the agent under its new spec. The
+    /// previous spec has been restored — the agent is still in the
+    /// registry under its prior configuration, so the caller can
+    /// continue using it. Inspect `source` for the underlying cause.
+    #[error("respec for agent '{id}' rolled back to previous spec")]
+    RespecRolledBack {
+        id: String,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// The runtime failed to set up a per-agent git worktree before
+    /// the agent could start. Typically a filesystem or git error.
+    #[error("worktree setup failed: {reason}")]
+    WorktreeSetupFailed { reason: String },
+
+    /// Unstructured error. Reserved for situations that don't yet
+    /// have a dedicated variant — channel-closed-after-actor-death,
+    /// internal invariant violations, etc. New error conditions
+    /// should grow their own variant rather than landing here.
     #[error("{0}")]
     Other(String),
 }

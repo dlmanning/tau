@@ -8,8 +8,8 @@
 //!
 //! Cross-cutting concerns:
 //!
-//! - Every spawn/run is bracketed by `SubagentStarted` and
-//!   `SubagentCompleted` on the parent's event stream — even when
+//! - Every spawn/run is bracketed by `FleetEvent::AgentStarted` and
+//!   `FleetEvent::AgentCompleted` on the manager's fleet channel — even when
 //!   setup itself fails (worktree creation, history inheritance).
 //! - On any exit (success or failure), the transcript is recorded if
 //!   a handle exists.
@@ -18,7 +18,7 @@
 //!   internal cancel.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tau_ai::{Content, Message, Usage};
@@ -39,7 +39,7 @@ use crate::fleet::result::SubagentResult;
 use crate::fleet::transcript::record_transcript;
 use crate::fleet::worktree::{WorktreeInfo, cleanup_worktree, create_worktree};
 use crate::types::error::{Error, Result};
-use crate::types::events::{AgentEvent, SubagentOutcome};
+use crate::types::events::{FleetEvent, SubagentOutcome};
 
 /// All the dependencies a lifecycle operation needs. The manager
 /// composes one of these per-call rather than holding a single
@@ -49,10 +49,15 @@ pub struct LifecycleCtx {
     pub registry: Arc<Registry>,
     pub transport: Arc<dyn Transport>,
     pub parent_config: AgentConfig,
-    pub parent_event_tx: broadcast::Sender<AgentEvent>,
+    pub fleet_event_tx: broadcast::Sender<FleetEvent>,
     pub parent_interaction_tx: Option<mpsc::Sender<InteractionRequest>>,
     pub default_approval: Arc<dyn ApprovalPolicy>,
     pub interaction_router_capacity: usize,
+    /// Deadline applied to each spawned subagent's interaction-gate
+    /// awaits. Forwarded to the subagent's builder via
+    /// [`AgentBuilder::set_interaction_timeout`]. See
+    /// [`AgentManager::with_interaction_timeout`](crate::fleet::manager::AgentManager::with_interaction_timeout).
+    pub interaction_timeout: Option<Duration>,
 }
 
 // ─── Foreground spawn ────────────────────────────────────────────────
@@ -125,10 +130,11 @@ pub async fn spawn_background(
         registry: Arc::clone(&ctx.registry),
         transport: Arc::clone(&ctx.transport),
         parent_config: ctx.parent_config.clone(),
-        parent_event_tx: ctx.parent_event_tx.clone(),
+        fleet_event_tx: ctx.fleet_event_tx.clone(),
         parent_interaction_tx: ctx.parent_interaction_tx.clone(),
         default_approval: Arc::clone(&ctx.default_approval),
         interaction_router_capacity: ctx.interaction_router_capacity,
+        interaction_timeout: ctx.interaction_timeout,
     };
     let aid = agent_id.clone();
     let desc = description.clone();
@@ -207,9 +213,18 @@ pub async fn send(
         .registry
         .take_idle_into_running(agent_id)
         .ok_or_else(|| {
-            Error::Other(format!(
-                "send: no agent with id '{agent_id}' (evicted, never stored, or currently running)"
-            ))
+            // Distinguish "mid-respec" (detached, awaiting its new actor)
+            // from genuinely gone, so a resume racing a respec reports a
+            // retryable busy condition rather than a misleading not-found.
+            if ctx.registry.respec_in_progress(agent_id) {
+                Error::AgentBusy {
+                    id: agent_id.to_string(),
+                }
+            } else {
+                Error::AgentNotFound {
+                    id: agent_id.to_string(),
+                }
+            }
         })?;
 
     let usage_before = entry.usage_at_pause.clone();
@@ -217,8 +232,8 @@ pub async fn send(
     let description = entry.description.clone();
 
     send_event(
-        &ctx.parent_event_tx,
-        AgentEvent::SubagentResumed {
+        &ctx.fleet_event_tx,
+        FleetEvent::AgentResumed {
             agent_id: agent_id.into(),
             description: description.clone(),
             prompt: message.into(),
@@ -229,7 +244,7 @@ pub async fn send(
     let forwarder_shutdown = CancellationToken::new();
     let event_task = bus::spawn_event_forwarder(
         entry.handle.subscribe(),
-        ctx.parent_event_tx.clone(),
+        ctx.fleet_event_tx.clone(),
         agent_id.into(),
         description.clone(),
         Some(Arc::clone(&ctx.registry)),
@@ -266,8 +281,8 @@ pub async fn send(
     let outcome = outcome_from(&prompt_result, &parent_cancel);
 
     send_event(
-        &ctx.parent_event_tx,
-        AgentEvent::SubagentCompleted {
+        &ctx.fleet_event_tx,
+        FleetEvent::AgentCompleted {
             agent_id: agent_id.into(),
             description,
             outcome,
@@ -308,14 +323,17 @@ pub async fn respec(
     new_spec: impl Into<Arc<AgentSpec>>,
 ) -> Result<AgentHandle> {
     // Atomic verify-and-detach under the registry's single lock.
-    let entry = ctx.registry.detach_for_respec(agent_id).map_err(|reason| match reason {
-        "running" => Error::Other(format!(
-            "respec: agent '{agent_id}' is currently running; abort and await its terminal event before respec"
-        )),
-        _ => Error::Other(format!(
-            "respec: no idle agent with id '{agent_id}' (evicted, never stored, or already respec'd)"
-        )),
-    })?;
+    let entry = ctx
+        .registry
+        .detach_for_respec(agent_id)
+        .map_err(|reason| match reason {
+            "running" => Error::AgentBusy {
+                id: agent_id.to_string(),
+            },
+            _ => Error::AgentNotFound {
+                id: agent_id.to_string(),
+            },
+        })?;
 
     // Fetch history from the still-live handle (we hold a strong
     // reference via `entry.handle`).
@@ -327,7 +345,10 @@ pub async fn respec(
     // behavior) hid useful info from anyone reading the registry.
     let opts = SpawnOpts {
         description: entry.description.clone(),
-        seed_messages: Some(messages),
+        seed: crate::core::builder::AgentSeed::Messages {
+            messages,
+            previous_summary: None,
+        },
         ..Default::default()
     };
 
@@ -338,7 +359,14 @@ pub async fn respec(
         }
         Err(e) => {
             ctx.registry.restore_respec_source(agent_id, entry);
-            Err(e)
+            // Chain the underlying error rather than stringifying it,
+            // so callers branching on `RespecRolledBack` can also
+            // inspect the inner cause (e.g. matching on
+            // `Error::ActorPanic` from a broken new spec).
+            Err(Error::RespecRolledBack {
+                id: agent_id.to_string(),
+                source: Box::new(e),
+            })
         }
     }
 }
@@ -361,7 +389,13 @@ pub async fn spawn_interactive(
             return Err(e);
         }
     };
-    let handle = builder.spawn();
+    let handle = match builder.spawn().await {
+        Ok(h) => h,
+        Err(e) => {
+            ctx.registry.abandon(&agent_id);
+            return Err(e);
+        }
+    };
     ctx.registry.commit_running(
         &agent_id,
         AgentEntry::new(handle.clone(), opts.description.clone()),
@@ -460,6 +494,9 @@ async fn configure_builder(
     ) {
         builder.set_interaction_sender(sub_tx);
     }
+    if let Some(timeout) = ctx.interaction_timeout {
+        builder.set_interaction_timeout(timeout);
+    }
 
     for tool in &spec.tools {
         builder.add_tool(tool.clone());
@@ -470,25 +507,40 @@ async fn configure_builder(
     // that's a host concern, not a runtime concern — v2 keeps it simple.)
     builder.set_system_prompt(spec.system_prompt.clone());
 
-    // Seed history. `seed_messages` (explicit vector) wins over
-    // `inherit_history_from` (registry lookup).
-    if let Some(seed) = opts.seed_messages.clone() {
-        builder.set_messages(seed);
-    } else if let Some(ref source_id) = opts.inherit_history_from {
-        let handle = ctx.registry.handle_any(source_id).ok_or_else(|| {
-            Error::Other(format!(
-                "inherit_history_from: no agent with id '{source_id}' \
-                 (still running, evicted, or never spawned)"
-            ))
-        })?;
-        let messages = handle.messages().await.ok_or_else(|| {
-            Error::Other(format!(
-                "inherit_history_from: agent '{source_id}' did not return its message log \
-                 (actor unresponsive or shutting down)"
-            ))
-        })?;
-        builder.set_messages(messages);
-    }
+    // Seed history. `Inherit` is resolved here via the registry;
+    // `Messages` is applied directly; `Empty` is a no-op.
+    let resolved_seed = match opts.seed.clone() {
+        crate::core::builder::AgentSeed::Inherit { agent_id: ref source_id } => {
+            let handle = ctx.registry.handle_any(source_id).ok_or_else(|| {
+                Error::AgentNotFound {
+                    id: source_id.clone(),
+                }
+            })?;
+            // Pull the full conversation, not just the messages: if the
+            // source was compacted it carries a `previous_summary` that
+            // threads the *next* compaction's update prompt. Dropping it
+            // would make the inheritor's first compaction fall back to the
+            // initial-summarization path and lose continuity.
+            let state = handle.state().await.ok_or_else(|| {
+                // The agent exists in the registry but its actor
+                // didn't respond — typically because the task is
+                // shutting down between idle and dead. No dedicated
+                // variant: the condition is rare and "actor died
+                // while we were holding a handle" is more naturally
+                // expressed as a generic Other than as its own kind.
+                Error::Other(format!(
+                    "AgentSeed::Inherit: agent '{source_id}' did not return its conversation state \
+                     (actor unresponsive or shutting down)"
+                ))
+            })?;
+            crate::core::builder::AgentSeed::Messages {
+                messages: state.messages,
+                previous_summary: state.previous_summary,
+            }
+        }
+        other => other,
+    };
+    builder.seed(resolved_seed);
 
     // Stamp the agent id on the pre-spawn handle so `ExecutionContext::agent_id`
     // is populated from the first tool call.
@@ -517,8 +569,8 @@ async fn run_one(
 
     // Emit Started before any setup work that could fail.
     send_event(
-        &ctx.parent_event_tx,
-        AgentEvent::SubagentStarted {
+        &ctx.fleet_event_tx,
+        FleetEvent::AgentStarted {
             agent_id: agent_id.into(),
             spec_name: opts.spec_name.clone(),
             description: opts.description.clone(),
@@ -531,8 +583,8 @@ async fn run_one(
         let completed_at = Utc::now();
         let duration_ms = start.elapsed().as_millis() as u64;
         send_event(
-            &ctx.parent_event_tx,
-            AgentEvent::SubagentCompleted {
+            &ctx.fleet_event_tx,
+            FleetEvent::AgentCompleted {
                 agent_id: agent_id.into(),
                 description: opts.description.clone(),
                 outcome: SubagentOutcome::Failed {
@@ -550,11 +602,13 @@ async fn run_one(
         e
     };
 
-    let worktree = if spec.allows_worktree && opts.isolation == Some(Isolation::Worktree) {
+    let worktree = if opts.isolation == Some(Isolation::Worktree) {
         match create_worktree(agent_id).await {
             Ok(wt) => Some(wt),
             Err(e) => {
-                let err = Error::Other(format!("Worktree setup failed: {e}"));
+                let err = Error::WorktreeSetupFailed {
+                    reason: e.to_string(),
+                };
                 return Err(emit_setup_failure(err, None, None).await);
             }
         }
@@ -607,8 +661,8 @@ async fn run_one(
     let tool_use_count = result.tool_use_count;
 
     send_event(
-        &ctx.parent_event_tx,
-        AgentEvent::SubagentCompleted {
+        &ctx.fleet_event_tx,
+        FleetEvent::AgentCompleted {
             agent_id: agent_id.into(),
             description: opts.description.clone(),
             outcome,
@@ -639,12 +693,12 @@ async fn run_agent_inner(
 ) -> Result<RunOutcome> {
     let wt_cwd = worktree.as_ref().map(|w| w.path.display().to_string());
     let builder = configure_builder(ctx, spec, opts, agent_id, wt_cwd.as_deref()).await?;
-    let handle = builder.spawn();
+    let handle = builder.spawn().await?;
 
     let forwarder_shutdown = CancellationToken::new();
     let event_task = bus::spawn_event_forwarder(
         handle.subscribe(),
-        ctx.parent_event_tx.clone(),
+        ctx.fleet_event_tx.clone(),
         agent_id.into(),
         opts.description.clone(),
         Some(Arc::clone(&ctx.registry)),
