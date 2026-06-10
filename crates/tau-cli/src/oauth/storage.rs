@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs, io, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// OAuth credentials for a provider
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredentials {
     /// Credential type (always "oauth")
     #[serde(rename = "type")]
@@ -20,6 +20,19 @@ pub struct OAuthCredentials {
     pub access: String,
     /// Expiry timestamp in milliseconds
     pub expires: i64,
+}
+
+/// Manual impl so tokens can't leak through `{:?}` in logs, error
+/// messages, or panic payloads.
+impl std::fmt::Debug for OAuthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredentials")
+            .field("cred_type", &self.cred_type)
+            .field("refresh", &"<redacted>")
+            .field("access", &"<redacted>")
+            .field("expires", &self.expires)
+            .finish()
+    }
 }
 
 impl OAuthCredentials {
@@ -124,5 +137,15 @@ mod tests {
         let expected_max = now + (55 * 60 * 1000) + 1000;
 
         assert!(creds.expires >= expected_min && creds.expires <= expected_max);
+    }
+
+    /// `{:?}` must never expose token material.
+    #[test]
+    fn debug_redacts_tokens() {
+        let creds =
+            OAuthCredentials::new("sekrit-refresh".to_string(), "sekrit-access".to_string(), 3600);
+        let dbg = format!("{creds:?}");
+        assert!(!dbg.contains("sekrit"), "tokens leaked: {dbg}");
+        assert!(dbg.contains("<redacted>"));
     }
 }

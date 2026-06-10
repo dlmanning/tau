@@ -60,6 +60,9 @@ pub struct Session {
     /// Set by a command (typically `/quit`) to exit the driver loop on
     /// the next iteration.
     exit_requested: bool,
+    /// Whether the user has already been warned about a session-log
+    /// write failure (warn once, log every failure).
+    warned_persistence: bool,
 }
 
 impl Session {
@@ -79,6 +82,7 @@ impl Session {
             prev_usage: Usage::default(),
             state: State::Idle,
             exit_requested: false,
+            warned_persistence: false,
         }
     }
 
@@ -366,6 +370,7 @@ impl Session {
 
         // Persist new messages + usage delta when running against the
         // main agent (not plan mode).
+        let mut persist_err: Option<std::io::Error> = None;
         if matches!(self.state, State::Idle)
             && let Some(persist) = self.persistence.as_mut()
         {
@@ -380,11 +385,16 @@ impl Session {
                 // messages. Snapshot instead: compaction marker + the
                 // kept tail (everything after the synthetic summary
                 // head).
-                let _ =
-                    persist.append_compaction_snapshot(summary, all_msgs.get(1..).unwrap_or(&[]));
+                if let Err(e) =
+                    persist.append_compaction_snapshot(summary, all_msgs.get(1..).unwrap_or(&[]))
+                {
+                    persist_err.get_or_insert(e);
+                }
             } else {
                 for msg in all_msgs.iter().skip(msgs_before) {
-                    let _ = persist.append_message(msg);
+                    if let Err(e) = persist.append_message(msg) {
+                        persist_err.get_or_insert(e);
+                    }
                 }
             }
             if let Some(s) = state {
@@ -405,12 +415,33 @@ impl Session {
                         .saturating_sub(self.prev_usage.thinking),
                     ..Default::default()
                 };
-                let _ = persist.append_usage(&delta);
+                if let Err(e) = persist.append_usage(&delta) {
+                    persist_err.get_or_insert(e);
+                }
                 self.prev_usage = s.total_usage.clone();
             }
         }
+        if let Some(e) = persist_err {
+            self.report_persist_error(frontend, &e).await;
+        }
 
         Ok(())
+    }
+
+    /// Report a session-log write failure: every failure is traced,
+    /// but the user is warned only once per session to avoid spamming
+    /// the frontend on a persistently failing disk.
+    async fn report_persist_error(&mut self, frontend: &mut dyn Frontend, e: &std::io::Error) {
+        tracing::error!("session log write failed: {e}");
+        if !self.warned_persistence {
+            self.warned_persistence = true;
+            frontend
+                .show_error(&format!(
+                    "Session log write failed: {e}. History may be incomplete if this \
+                     session is resumed; further failures will only be logged."
+                ))
+                .await;
+        }
     }
 
     /// Drain any side-channel action the frontend produced during the
@@ -497,13 +528,20 @@ impl Session {
                     let msgs = handle.messages().await.unwrap_or_default();
                     // Mirror the compaction in the session log so a
                     // restore doesn't replay pre-compaction history.
+                    let mut persist_err: Option<std::io::Error> = None;
                     if matches!(self.state, State::Idle)
                         && let Some(persist) = self.persistence.as_mut()
                         && let Some(summary) =
                             handle.state().await.and_then(|s| s.previous_summary)
                     {
-                        let _ = persist
-                            .append_compaction_snapshot(&summary, msgs.get(1..).unwrap_or(&[]));
+                        if let Err(e) = persist
+                            .append_compaction_snapshot(&summary, msgs.get(1..).unwrap_or(&[]))
+                        {
+                            persist_err = Some(e);
+                        }
+                    }
+                    if let Some(e) = persist_err {
+                        self.report_persist_error(frontend, &e).await;
                     }
                     frontend
                         .show_system(&format!(

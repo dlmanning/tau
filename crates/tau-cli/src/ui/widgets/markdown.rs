@@ -5,6 +5,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::super::theme::Theme;
 
@@ -167,7 +168,11 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                     for row in &table_rows {
                         for (i, cell) in row.iter().enumerate() {
                             if i < num_cols {
-                                col_widths[i] = col_widths[i].max(cell.len());
+                                // Display width, not byte length — CJK
+                                // and emoji cells are wider than their
+                                // char count and much narrower than
+                                // their byte count.
+                                col_widths[i] = col_widths[i].max(cell.width());
                             }
                         }
                     }
@@ -191,8 +196,11 @@ pub fn render_markdown<'a>(text: &str, theme: &Theme, width: usize) -> Vec<Line<
                             if i > 0 {
                                 spans.push(Span::styled(" │ ", sep_style));
                             }
-                            let w = col_widths.get(i).copied().unwrap_or(cell.len());
-                            let padded = format!("{:<width$}", cell, width = w);
+                            let w = col_widths.get(i).copied().unwrap_or(cell.width());
+                            // Pad by display width (format!'s width
+                            // counts chars, mis-padding wide glyphs).
+                            let pad = w.saturating_sub(cell.width());
+                            let padded = format!("{}{}", cell, " ".repeat(pad));
                             let style = if row_idx == 0 { head_style } else { cell_style };
                             spans.push(Span::styled(padded, style));
                         }
@@ -275,5 +283,33 @@ mod tests {
         let md = "```rust\nfn main() {}\n```";
         let lines = render_markdown(md, &theme, 80);
         assert!(!lines.is_empty());
+    }
+
+    /// Columns must align by display width: a CJK cell (2 columns per
+    /// glyph) and an ASCII cell of the same display width should pad
+    /// their rows to identical rendered widths.
+    #[test]
+    fn table_columns_align_by_display_width() {
+        let theme = Theme::dark();
+        let md = "| h1 | h2 |\n|----|----|\n| 你好 | x |\n| abcd | y |";
+        let lines = render_markdown(md, &theme, 80);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // "你好" renders 4 columns wide, same as "abcd" — both data
+        // rows must have equal total display width.
+        let data_rows: Vec<&String> = rendered
+            .iter()
+            .filter(|r| r.contains('你') || r.contains("abcd"))
+            .collect();
+        assert_eq!(data_rows.len(), 2);
+        assert_eq!(
+            data_rows[0].width(),
+            data_rows[1].width(),
+            "rows mis-aligned: {:?} vs {:?}",
+            data_rows[0],
+            data_rows[1]
+        );
     }
 }

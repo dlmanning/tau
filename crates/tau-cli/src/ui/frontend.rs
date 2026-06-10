@@ -80,6 +80,24 @@ impl TuiFrontend {
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
 
+        // Restore the terminal before the default panic output runs, so
+        // the message is readable and the shell isn't left in raw mode
+        // on the alternate screen (`on_session_end` never runs when we
+        // unwind). The hook is process-global and stays installed after
+        // a clean exit — re-emitting the restore sequences on a normal
+        // screen is harmless.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                std::io::stdout(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                DisableBracketedPaste
+            );
+            prev_hook(info);
+        }));
+
         let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>(constants::UI_CHANNEL_CAPACITY);
         let state = TuiState::new(config, available_models.clone(), ui_tx);
 
