@@ -156,22 +156,23 @@ async fn dequeue_mode_one_at_a_time() {
         .await
         .unwrap();
 
-    // Queue up 2 follow-ups, then prompt
-    handle.follow_up(Message::user("fu1")).await.unwrap();
-    handle.follow_up(Message::user("fu2")).await.unwrap();
+    // Two background subagents are expected; each posts a completion
+    // follow-up. Only subagent-completion follow-ups decrement the
+    // bg-pending counter, so queuing two of them (paired with two
+    // `expect_follow_up`s) drives the counter back to zero as they're
+    // drained — one per cycle under OneAtATime.
     handle.expect_follow_up();
     handle.expect_follow_up();
+    handle
+        .follow_up(Message::subagent_completed("a", "desc", "fu1"))
+        .await
+        .unwrap();
+    handle
+        .follow_up(Message::subagent_completed("b", "desc", "fu2"))
+        .await
+        .unwrap();
 
     let rx = handle.prompt("initial").await.unwrap();
-
-    // After initial response, DrainFollowUps should drain ONE follow-up per cycle.
-    // Post a consume after a delay to eventually stop waiting.
-    let h2 = handle.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        h2.consume_follow_up();
-        h2.consume_follow_up();
-    });
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
     assert!(result.is_ok(), "should complete");

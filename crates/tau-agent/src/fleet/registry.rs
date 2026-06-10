@@ -149,8 +149,8 @@ impl Registry {
     // ─── Begin-spawn: insert spec; agent is about to run ─────────────
 
     /// Reserve a spec for a new agent. The caller is responsible for
-    /// calling [`Self::commit_running`] or [`Self::abandon`] depending
-    /// on whether the spawn succeeded.
+    /// calling [`Self::commit_running`] or [`Self::drop_running`]
+    /// depending on whether the spawn succeeded.
     pub fn begin_spawn(&self, agent_id: &str, spec: Arc<AgentSpec>) {
         self.inner.lock().specs.insert(agent_id.to_string(), spec);
     }
@@ -167,12 +167,6 @@ impl Registry {
             .lock()
             .running
             .insert(agent_id.to_string(), entry);
-    }
-
-    /// Drop a reserved-but-not-yet-running agent (spawn failure path).
-    /// Removes spec; nothing to remove from idle/running.
-    pub fn abandon(&self, agent_id: &str) {
-        self.inner.lock().specs.remove(agent_id);
     }
 
     // ─── End-of-run: move running → idle (or drop) ───────────────────
@@ -208,9 +202,12 @@ impl Registry {
         inner.idle.push_back((agent_id.to_string(), entry));
     }
 
-    /// Drop a running agent without idling it (error path, interactive
-    /// remove_interactive, etc.). Drops the spec only if the agent
-    /// isn't also in idle (which would only be the case mid-resume).
+    /// Drop a running agent without idling it. This is *the* failure-path
+    /// cleanup: safe to call both before [`Self::commit_running`] (the
+    /// running removal no-ops; only the reserved spec is dropped) and
+    /// after it (the running entry and spec are both dropped). Drops the
+    /// spec only if the agent isn't also in idle (which would only be
+    /// the case mid-resume).
     ///
     /// **Snapshot behavior**: agents discarded via `drop_running` are
     /// removed from every tracked bucket and therefore do **not**
@@ -345,7 +342,7 @@ impl Registry {
     /// (success or failure — see [`crate::fleet::bus::spawn_event_forwarder`]).
     ///
     /// Note: this counter is updated as `ToolExecutionEnd` events
-    /// arrive; [`crate::fleet::SubagentResult::tool_use_count`]
+    /// arrive; [`crate::SubagentResult::tool_use_count`]
     /// independently counts `Content::ToolCall` blocks in the final
     /// message log. The two should usually agree but are computed via
     /// independent paths and can drift if (e.g.) a tool errors before
@@ -515,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn invariant_after_begin_then_abandon() {
+    fn invariant_after_begin_then_drop_running() {
         let r = Registry::new(4);
         let spec = Arc::new(AgentSpec {
             system_prompt: String::new(),
@@ -524,7 +521,8 @@ mod tests {
         });
         r.begin_spawn("a1", spec);
         assert!(r.spec_for("a1").is_some());
-        r.abandon("a1");
+        // Pre-commit, drop_running just releases the reserved spec.
+        r.drop_running("a1");
         assert!(r.spec_for("a1").is_none());
     }
 

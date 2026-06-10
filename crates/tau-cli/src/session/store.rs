@@ -30,13 +30,14 @@ pub enum SessionEntry {
         cache_write: u64,
         timestamp: i64,
     },
-    /// Context compaction event
+    /// Context compaction marker: every `Message` entry before this
+    /// point is summarized by `summary`; entries from
+    /// `first_kept_message_index` onward are the kept tail (re-appended
+    /// immediately after this marker by
+    /// [`SessionManager::append_compaction_snapshot`]).
     Compaction {
         summary: String,
         first_kept_message_index: usize,
-        tokens_before: u64,
-        read_files: Vec<String>,
-        modified_files: Vec<String>,
         timestamp: i64,
     },
 }
@@ -47,16 +48,27 @@ pub struct SessionManager {
     id: String,
     /// Writer for appending entries
     writer: Option<BufWriter<File>>,
+    /// Count of `Message` entries written to (or loaded from) the
+    /// file. A compaction marker's `first_kept_message_index` is this
+    /// count at write time.
+    message_entries: usize,
 }
 
 impl SessionManager {
     /// Construct from an already-opened writer. Used by
     /// [`crate::session::branch::branch_from`] which builds the file
     /// itself; the new manager picks up appends from here.
-    pub(super) fn from_open_writer(id: String, writer: BufWriter<File>) -> Self {
+    /// `message_entries` is the number of `Message` entries the caller
+    /// already wrote.
+    pub(super) fn from_open_writer(
+        id: String,
+        writer: BufWriter<File>,
+        message_entries: usize,
+    ) -> Self {
         Self {
             id,
             writer: Some(writer),
+            message_entries,
         }
     }
 
@@ -92,6 +104,7 @@ impl SessionManager {
         Ok(Self {
             id,
             writer: Some(writer),
+            message_entries: 0,
         })
     }
 
@@ -139,19 +152,8 @@ impl SessionManager {
             }
         }
 
-        let (messages, previous_summary) = if let Some((summary, kept_index)) = last_compaction {
-            let summary_msg = Message::user(format!(
-                "<context-summary>\n{}\n</context-summary>",
-                summary
-            ));
-            let mut rebuilt = vec![summary_msg];
-            if kept_index < all_messages.len() {
-                rebuilt.extend_from_slice(&all_messages[kept_index..]);
-            }
-            (rebuilt, Some(summary))
-        } else {
-            (all_messages, None)
-        };
+        let message_entries = all_messages.len();
+        let (messages, previous_summary) = rebuild_messages(all_messages, last_compaction);
 
         let file = File::options().append(true).open(&path)?;
         let writer = BufWriter::new(file);
@@ -160,6 +162,7 @@ impl SessionManager {
             Self {
                 id: id.to_string(),
                 writer: Some(writer),
+                message_entries,
             },
             messages,
             previous_summary,
@@ -180,31 +183,41 @@ impl SessionManager {
             };
             writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
             writer.flush()?;
+            self.message_entries += 1;
         }
         Ok(())
     }
 
-    /// Append a compaction entry
-    #[allow(dead_code)]
-    pub fn append_compaction(
+    /// Record a compaction: a marker stating that everything logged so
+    /// far is covered by `summary`, followed by the kept tail
+    /// (the agent's post-compaction messages minus the synthetic
+    /// summary head) re-appended as fresh entries.
+    ///
+    /// Re-appending the tail trades a little log redundancy for
+    /// correctness without coordinate bookkeeping: `load` rebuilds as
+    /// `[summary_message] + entries[first_kept..]` no matter how many
+    /// compactions the session has been through, and messages that
+    /// were summarized before they were ever logged (mid-turn overflow
+    /// compaction) can't be lost.
+    pub fn append_compaction_snapshot(
         &mut self,
         summary: &str,
-        first_kept_message_index: usize,
-        tokens_before: u64,
-        read_files: &[String],
-        modified_files: &[String],
+        kept_messages: &[Message],
     ) -> std::io::Result<()> {
+        if self.writer.is_none() {
+            return Ok(());
+        }
+        let entry = SessionEntry::Compaction {
+            summary: summary.to_string(),
+            first_kept_message_index: self.message_entries,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
         if let Some(ref mut writer) = self.writer {
-            let entry = SessionEntry::Compaction {
-                summary: summary.to_string(),
-                first_kept_message_index,
-                tokens_before,
-                read_files: read_files.to_vec(),
-                modified_files: modified_files.to_vec(),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
             writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
             writer.flush()?;
+        }
+        for msg in kept_messages {
+            self.append_message(msg)?;
         }
         Ok(())
     }
@@ -287,6 +300,25 @@ impl SessionManager {
 
 }
 
+/// Rebuild the in-memory message list from the log's `Message` entries
+/// and the last compaction marker, mirroring exactly what
+/// `apply_compaction_result` left in memory at save time:
+/// `[summary_message] + entries[first_kept..]`.
+fn rebuild_messages(
+    all_messages: Vec<Message>,
+    last_compaction: Option<(String, usize)>,
+) -> (Vec<Message>, Option<String>) {
+    if let Some((summary, kept_index)) = last_compaction {
+        let mut rebuilt = vec![tau_agent::summary_message(&summary)];
+        if kept_index < all_messages.len() {
+            rebuilt.extend_from_slice(&all_messages[kept_index..]);
+        }
+        (rebuilt, Some(summary))
+    } else {
+        (all_messages, None)
+    }
+}
+
 /// Information about a saved session
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -306,5 +338,59 @@ impl SessionInfo {
             .single()
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    #[test]
+    fn rebuild_without_compaction_returns_messages_verbatim() {
+        let msgs = vec![user("a"), user("b")];
+        let (rebuilt, summary) = rebuild_messages(msgs.clone(), None);
+        assert_eq!(rebuilt.len(), 2);
+        assert!(summary.is_none());
+    }
+
+    /// The rebuilt head must be byte-identical to what
+    /// `apply_compaction_result` left in memory at save time.
+    #[test]
+    fn rebuild_with_compaction_matches_in_memory_shape() {
+        let msgs = vec![user("old1"), user("old2"), user("kept1"), user("kept2")];
+        let (rebuilt, summary) = rebuild_messages(msgs, Some(("the summary".into(), 2)));
+        assert_eq!(summary.as_deref(), Some("the summary"));
+        assert_eq!(rebuilt.len(), 3);
+        assert_eq!(rebuilt[0].text(), tau_agent::summary_message("the summary").text());
+        assert_eq!(rebuilt[1].text(), "kept1");
+        assert_eq!(rebuilt[2].text(), "kept2");
+    }
+
+    /// Snapshot semantics: the marker's kept-index points just past
+    /// everything logged before it, so a tail re-appended after the
+    /// marker is exactly what rebuild picks up — including for a
+    /// second compaction whose tail was itself re-appended once
+    /// already.
+    #[test]
+    fn rebuild_uses_only_the_last_compaction() {
+        // Log: m0 m1 | C1(kept=2) k0 k1 | C2(kept=4) j0
+        let msgs = vec![user("m0"), user("m1"), user("k0"), user("k1"), user("j0")];
+        let (rebuilt, summary) = rebuild_messages(msgs, Some(("s2".into(), 4)));
+        assert_eq!(summary.as_deref(), Some("s2"));
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(rebuilt[1].text(), "j0");
+    }
+
+    /// A kept-index at or past the end (compaction that summarized
+    /// everything, tail not yet appended at read time) must not panic.
+    #[test]
+    fn rebuild_with_out_of_range_kept_index_keeps_only_summary() {
+        let msgs = vec![user("m0")];
+        let (rebuilt, _) = rebuild_messages(msgs, Some(("s".into(), 5)));
+        assert_eq!(rebuilt.len(), 1);
     }
 }

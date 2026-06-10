@@ -223,6 +223,41 @@ async fn subagent_report_tool_emits_wrapped_event() {
     assert!(found, "AgentReport reaches the fleet channel");
 }
 
+/// Regression: when a subagent's prompt fails *after* it was committed
+/// to the registry's `running` set, the error path must drop it from
+/// `running` (via `drop_running`), not merely remove its spec (via
+/// `abandon`). Otherwise the dead agent leaks as a perpetually-`Running`
+/// entry in every `snapshot()` and the "spec ⇔ bucket" invariant breaks.
+#[tokio::test]
+async fn failed_spawn_does_not_leak_running_entry() {
+    // ErrorTransport fails the prompt *after* commit_running has run.
+    let transport: Arc<dyn Transport> = ErrorTransport::create("boom");
+    let manager = make_manager(transport);
+
+    let result = manager
+        .spawn(
+            echo_spec(),
+            "go".to_string(),
+            spawn_opts("doomed"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.is_err(), "spawn should fail when the prompt errors");
+
+    let snapshot = manager.snapshot();
+    assert!(
+        snapshot.agents.is_empty(),
+        "failed spawn must leave no registry entry; got {} agent(s): {:?}",
+        snapshot.agents.len(),
+        snapshot
+            .agents
+            .iter()
+            .map(|a| (&a.agent_id, &a.status))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ─── Approval policy inheritance ─────────────────────────────────────
 
 /// A risky tool that records every successful invocation.

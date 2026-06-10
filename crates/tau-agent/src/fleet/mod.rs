@@ -20,3 +20,60 @@ pub mod result;
 pub mod snapshot;
 pub mod transcript;
 pub mod worktree;
+
+use tau_ai::{Content, InjectionSource, Message};
+
+/// Constructors for the subagent-lifecycle [`Message::SystemInjection`]
+/// messages a background agent's completion posts to its parent.
+///
+/// Defined here rather than on `Message` in tau-ai because subagent
+/// completion is a fleet concept: tau-ai owns only the data shape
+/// ([`InjectionSource`]), the fleet owns the semantics (these pair
+/// with `expect_follow_up()` — see
+/// `transitions::is_subagent_completion`).
+pub trait SubagentMessageExt {
+    /// System-injection message for a subagent that completed
+    /// successfully.
+    fn subagent_completed(
+        agent_id: impl Into<String>,
+        description: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Message;
+
+    /// System-injection message for a subagent that failed.
+    fn subagent_failed(
+        agent_id: impl Into<String>,
+        description: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Message;
+}
+
+impl SubagentMessageExt for Message {
+    fn subagent_completed(
+        agent_id: impl Into<String>,
+        description: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Message {
+        Message::SystemInjection {
+            content: vec![Content::text(text)],
+            source: InjectionSource::SubagentCompleted {
+                agent_id: agent_id.into(),
+                description: description.into(),
+            },
+        }
+    }
+
+    fn subagent_failed(
+        agent_id: impl Into<String>,
+        description: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Message {
+        Message::SystemInjection {
+            content: vec![Content::text(error)],
+            source: InjectionSource::SubagentFailed {
+                agent_id: agent_id.into(),
+                description: description.into(),
+            },
+        }
+    }
+}

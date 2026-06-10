@@ -35,6 +35,7 @@ pub fn branch_from(
     };
     writeln!(writer, "{}", serde_json::to_string(&metadata)?)?;
 
+    let mut written = 0;
     if let Some(idx) = branch_index {
         for msg in messages.iter().take(idx + 1) {
             let entry = SessionEntry::Message {
@@ -42,10 +43,11 @@ pub fn branch_from(
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
             writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
+            written += 1;
         }
     }
 
     writer.flush()?;
 
-    Ok(SessionManager::from_open_writer(id, writer))
+    Ok(SessionManager::from_open_writer(id, writer, written))
 }

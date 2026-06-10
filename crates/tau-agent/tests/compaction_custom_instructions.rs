@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use tau_agent::test_utils::*;
-use tau_agent::{AgentBuilder, CompactionConfig, CompactionReason, Transport};
+use tau_agent::{AgentBuilder, CompactionConfig, Transport};
 use tau_ai::{AssistantMetadata, Content, Message};
 
 fn user_msg(text: &str) -> Message {
@@ -91,7 +91,7 @@ async fn with_instructions() {
     let handle = build_handle(transport.clone()).await;
 
     let rx = handle
-        .compact(CompactionReason::Manual, Some("be terse".into()))
+        .compact(Some("be terse".into()))
         .await
         .expect("compact send");
     let result = rx.await.expect("compact reply");
@@ -118,7 +118,7 @@ async fn without_instructions() {
     let handle = build_handle(transport.clone()).await;
 
     let rx = handle
-        .compact(CompactionReason::Manual, None)
+        .compact(None)
         .await
         .expect("compact send");
     let result = rx.await.expect("compact reply");
@@ -141,7 +141,7 @@ async fn whitespace_only() {
     let handle = build_handle(transport.clone()).await;
 
     let rx = handle
-        .compact(CompactionReason::Manual, Some("   \n  ".into()))
+        .compact(Some("   \n  ".into()))
         .await
         .expect("compact send");
     let result = rx.await.expect("compact reply");

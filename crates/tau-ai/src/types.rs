@@ -432,36 +432,6 @@ impl Message {
         }
     }
 
-    /// Create a system injection message for subagent completion.
-    pub fn subagent_completed(
-        agent_id: impl Into<String>,
-        description: impl Into<String>,
-        text: impl Into<String>,
-    ) -> Self {
-        Self::SystemInjection {
-            content: vec![Content::text(text)],
-            source: InjectionSource::SubagentCompleted {
-                agent_id: agent_id.into(),
-                description: description.into(),
-            },
-        }
-    }
-
-    /// Create a system injection message for subagent failure.
-    pub fn subagent_failed(
-        agent_id: impl Into<String>,
-        description: impl Into<String>,
-        error: impl Into<String>,
-    ) -> Self {
-        Self::SystemInjection {
-            content: vec![Content::text(error)],
-            source: InjectionSource::SubagentFailed {
-                agent_id: agent_id.into(),
-                description: description.into(),
-            },
-        }
-    }
-
     /// Get the role as a string
     pub fn role(&self) -> &'static str {
         match self {

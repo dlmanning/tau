@@ -63,8 +63,9 @@ pub struct SpawnOpts {
     pub isolation: Option<Isolation>,
     pub approval_policy: Option<Arc<dyn ApprovalPolicy>>,
     pub spec_name: Option<String>,
-    /// History to load into the spawned agent. See [`AgentSeed`] for
-    /// the variants. Defaults to [`AgentSeed::Empty`].
+    /// History to load into the spawned agent. See
+    /// [`AgentSeed`](crate::AgentSeed) for the variants. Defaults to
+    /// [`AgentSeed::Empty`](crate::AgentSeed::Empty).
     pub seed: crate::core::builder::AgentSeed,
     /// Depth to stamp on the spawned agent's
     /// [`ExecutionContext::subagent_depth`](crate::ExecutionContext::subagent_depth).
@@ -150,7 +151,8 @@ impl AgentManager {
     /// Subscribe to the manager's [`FleetEvent`] stream. The channel
     /// carries `AgentStarted` / `AgentResumed` / `AgentCompleted` (the
     /// manager's own lifecycle events), `AgentReport` (translated from
-    /// tool-emitted [`AgentEvent::AgentReport`]), and `Forwarded` (every
+    /// tool-emitted [`AgentEvent::AgentReport`](crate::AgentEvent::AgentReport)),
+    /// and `Forwarded` (every
     /// other event a tracked agent emits).
     pub fn subscribe(&self) -> broadcast::Receiver<FleetEvent> {
         self.fleet_event_tx.subscribe()

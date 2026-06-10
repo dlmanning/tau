@@ -6,6 +6,18 @@
 //! block. Split-turn detection ensures a partially-summarized turn
 //! gets its prefix described separately so the kept assistant
 //! message reads coherently.
+//!
+//! Module layout:
+//! - [`cut_point`] — pure split-turn / cut-point detection;
+//! - [`prompts`] — prompt templates and prompt assembly;
+//! - [`file_ops`] — read/write file-operation extraction;
+//! - this root — orchestration ([`compact`]), result application,
+//!   token estimation, and the [`Summarizer`] seam that decouples the
+//!   algorithm from the transport.
+
+mod cut_point;
+mod file_ops;
+mod prompts;
 
 use std::sync::Arc;
 
@@ -112,8 +124,6 @@ pub struct CompactionResult {
     /// Total estimated tokens before compaction (for the
     /// `CompactionEnd` event).
     pub tokens_before: u64,
-    pub read_files: Vec<String>,
-    pub modified_files: Vec<String>,
 }
 
 // ─── Token estimation (char/4 heuristic) ─────────────────────────────
@@ -153,349 +163,75 @@ fn content_char_count(content: &[Content]) -> usize {
         .sum()
 }
 
-// ─── Cut-point finding ───────────────────────────────────────────────
+// ─── Summarizer seam ─────────────────────────────────────────────────
 
-struct CutPointResult {
-    first_kept_index: usize,
-    turn_start_index: Option<usize>,
-    is_split_turn: bool,
+/// Produces a summary for an assembled summarization prompt.
+///
+/// This is the seam between the compaction algorithm (cut-point
+/// detection, prompt assembly, summary stitching) and the LLM call
+/// that actually writes the summary: orchestration depends only on
+/// this trait, so it can be tested with a stub — no [`Transport`]
+/// required. The production impl is [`TransportSummarizer`].
+#[async_trait::async_trait]
+trait Summarizer: Send + Sync {
+    async fn summarize(&self, prompt: &str, cancel: &CancellationToken)
+    -> Result<String, String>;
 }
 
-/// Walk backward through messages, accumulating tokens, to find a
-/// boundary where the kept-suffix exceeds `keep_recent_tokens`. Then
-/// advance past any leading `ToolResult` messages so the kept slice
-/// starts at a user or assistant boundary.
-fn find_cut_point(
-    messages: &[Message],
-    keep_recent_tokens: u64,
-    cancel: &CancellationToken,
-) -> Option<CutPointResult> {
-    if messages.len() < 2 {
-        return None;
-    }
-
-    let mut accumulated: u64 = 0;
-    let mut cut_index = messages.len();
-
-    for i in (0..messages.len()).rev() {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        accumulated += estimate_tokens(&messages[i]);
-        if accumulated >= keep_recent_tokens {
-            cut_index = i + 1;
-            break;
-        }
-    }
-
-    // If the rev-loop never crossed the threshold, fall back to
-    // "keep the last two messages" — better than failing entirely.
-    if cut_index >= messages.len() {
-        cut_index = messages.len().saturating_sub(2);
-    }
-
-    // Bail if we'd only summarize one message: catches both
-    // "loop broke at i=0" and "fallback on too-small history."
-    if cut_index <= 1 {
-        return None;
-    }
-
-    // Don't start the kept slice on a tool result without its
-    // preceding assistant call.
-    let mut first_kept = cut_index;
-    while first_kept < messages.len() {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        match &messages[first_kept] {
-            Message::User { .. } | Message::SystemInjection { .. } => break,
-            Message::Assistant { .. } => break,
-            Message::ToolResult { .. } => first_kept += 1,
-        }
-    }
-
-    if first_kept >= messages.len() {
-        return None;
-    }
-
-    let is_split_turn = matches!(&messages[first_kept], Message::Assistant { .. })
-        && first_kept > 0
-        && has_tool_calls_with_results(messages, first_kept);
-
-    let turn_start_index = if is_split_turn {
-        Some(find_turn_start(messages, first_kept))
-    } else {
-        None
-    };
-
-    Some(CutPointResult {
-        first_kept_index: first_kept,
-        turn_start_index,
-        is_split_turn,
-    })
+/// Production [`Summarizer`]: a one-shot, tool-less `transport.run()`
+/// call against the agent's configured model.
+struct TransportSummarizer<'a> {
+    agent_config: &'a AgentConfig,
+    transport: &'a Arc<dyn Transport>,
 }
 
-fn has_tool_calls_with_results(messages: &[Message], idx: usize) -> bool {
-    let Message::Assistant { content, .. } = &messages[idx] else {
-        return false;
-    };
-    let has_tool_calls = content
-        .iter()
-        .any(|c| matches!(c, Content::ToolCall { .. }));
-    has_tool_calls
-        && idx + 1 < messages.len()
-        && matches!(&messages[idx + 1], Message::ToolResult { .. })
-}
-
-/// Walk backward from `from` past `ToolResult` + `Assistant` pairs
-/// until we hit a user / system-injection boundary or the start.
-fn find_turn_start(messages: &[Message], from: usize) -> usize {
-    let mut idx = from;
-    while idx > 0 {
-        match &messages[idx - 1] {
-            Message::ToolResult { .. } => idx -= 1,
-            Message::Assistant { .. } => {
-                idx -= 1;
-                continue;
-            }
-            _ => break,
-        }
-    }
-    idx
-}
-
-// ─── Serialization for the summarization prompt ──────────────────────
-
-fn serialize_messages_for_summary(messages: &[Message]) -> String {
-    let mut out = String::new();
-    for msg in messages {
-        match msg {
-            Message::User { content, .. } => {
-                let text = content_to_text(content);
-                if text.is_empty() {
-                    continue;
-                }
-                // Skip the synthetic `<context-summary>` user message
-                // prepended by a previous compaction pass. The
-                // UPDATE_SUMMARIZATION_PROMPT already embeds the
-                // summary text in its own `<previous-summary>`
-                // section; including the echo here would double the
-                // prompt's token cost and confuse the model into
-                // re-summarizing its own prior summary.
-                if text.starts_with("<context-summary>") {
-                    continue;
-                }
-                out.push_str("[User]: ");
-                out.push_str(&text);
-                out.push('\n');
-            }
-            Message::Assistant { content, .. } => {
-                let mut thinking_parts = Vec::new();
-                let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
-                for c in content {
-                    match c {
-                        Content::Thinking { thinking, .. } => {
-                            thinking_parts.push(thinking.as_str())
-                        }
-                        Content::Text { text } => text_parts.push(text.as_str()),
-                        Content::ToolCall {
-                            name, arguments, ..
-                        } => {
-                            tool_calls.push(format!("{name}({})", format_tool_args(arguments)));
-                        }
-                        _ => {}
-                    }
-                }
-                if !thinking_parts.is_empty() {
-                    out.push_str("[Assistant thinking]: ");
-                    out.push_str(&thinking_parts.join(" "));
-                    out.push('\n');
-                }
-                if !text_parts.is_empty() {
-                    out.push_str("[Assistant]: ");
-                    out.push_str(&text_parts.join(""));
-                    out.push('\n');
-                }
-                if !tool_calls.is_empty() {
-                    out.push_str("[Assistant tool calls]: ");
-                    out.push_str(&tool_calls.join("; "));
-                    out.push('\n');
-                }
-            }
-            Message::ToolResult {
-                tool_name,
-                content,
-                is_error,
-                ..
-            } => {
-                let text = content_to_text(content);
-                let label = if *is_error {
-                    format!("[Tool error ({tool_name})]: ")
-                } else {
-                    format!("[Tool result ({tool_name})]: ")
-                };
-                out.push_str(&label);
-                if text.len() > 2000 {
-                    out.push_str(&text[..2000]);
-                    out.push_str("...(truncated)");
-                } else {
-                    out.push_str(&text);
-                }
-                out.push('\n');
-            }
-            Message::SystemInjection { content, .. } => {
-                let text = content_to_text(content);
-                if !text.is_empty() {
-                    out.push_str("[System]: ");
-                    out.push_str(&text);
-                    out.push('\n');
-                }
-            }
-        }
-    }
-    out
-}
-
-fn content_to_text(content: &[Content]) -> String {
-    content
-        .iter()
-        .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
-            Content::Image { .. } => Some("[image]"),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn format_tool_args(args: &serde_json::Value) -> String {
-    match args {
-        serde_json::Value::Object(map) => map
-            .iter()
-            .map(|(k, v)| {
-                let val = match v {
-                    serde_json::Value::String(s) => {
-                        if s.len() > 100 {
-                            format!("\"{}...\"", &s[..100])
-                        } else {
-                            format!("\"{s}\"")
-                        }
-                    }
-                    other => {
-                        let s = other.to_string();
-                        if s.len() > 100 {
-                            format!("{}...", &s[..100])
-                        } else {
-                            s
-                        }
-                    }
-                };
-                format!("{k}={val}")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => args.to_string(),
-    }
-}
-
-// ─── File-operation extraction for the summary metadata ──────────────
-
-const READ_TOOLS: &[&str] = &["read", "glob", "grep", "list"];
-const WRITE_TOOLS: &[&str] = &["write", "edit"];
-
-fn extract_file_operations(messages: &[Message]) -> (Vec<String>, Vec<String>) {
-    let mut read_files = Vec::new();
-    let mut modified_files = Vec::new();
-    for msg in messages {
-        let Message::Assistant { content, .. } = msg else {
-            continue;
+#[async_trait::async_trait]
+impl Summarizer for TransportSummarizer<'_> {
+    async fn summarize(
+        &self,
+        prompt: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
+        let run_config = AgentRunConfig {
+            system_prompt: Some(prompts::SUMMARIZATION_SYSTEM_PROMPT.into()),
+            tools: vec![],
+            server_tools: vec![],
+            model: self.agent_config.model.clone(),
+            reasoning: None,
+            thinking_adaptive: false,
+            max_tokens: Some(4096),
+            temperature: None,
+            // Summarization is a one-shot call, not part of any turn loop.
+            turn_number: 0,
+            cache_scope: None,
+            cache_ttl: None,
+            system_prompt_boundary: None,
         };
-        for c in content {
-            let Content::ToolCall {
-                name, arguments, ..
-            } = c
-            else {
-                continue;
-            };
-            let n = name.as_str();
-            if READ_TOOLS.contains(&n) {
-                if let Some(p) = arguments.get("path").and_then(|v| v.as_str()) {
-                    if !read_files.contains(&p.to_string()) {
-                        read_files.push(p.into());
-                    }
+
+        let user_message = Message::user(prompt);
+        let mut stream = self
+            .transport
+            .run(vec![user_message], &run_config, cancel.clone())
+            .await
+            .map_err(|e| format!("Compaction LLM call failed: {e}"))?;
+
+        let mut result_text = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::MessageEnd { message } => result_text = message.text(),
+                AgentEvent::Error { message } => {
+                    return Err(format!("Compaction LLM error: {message}"));
                 }
-            } else if WRITE_TOOLS.contains(&n) {
-                for key in ["path", "file_path"] {
-                    if let Some(p) = arguments.get(key).and_then(|v| v.as_str()) {
-                        if !modified_files.contains(&p.to_string()) {
-                            modified_files.push(p.into());
-                        }
-                    }
-                }
+                _ => {}
             }
         }
+
+        if result_text.is_empty() {
+            return Err("Compaction LLM returned empty response".into());
+        }
+        Ok(result_text)
     }
-    (read_files, modified_files)
 }
-
-// ─── Prompts ─────────────────────────────────────────────────────────
-
-const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
-You are a specialized summarization model. Your task is to create a comprehensive \
-yet concise summary of a coding conversation. This summary will replace the original \
-messages in the conversation context, so it must capture all essential information \
-needed to continue the conversation effectively.";
-
-const SUMMARIZATION_PROMPT: &str = "\
-Please provide a detailed summary of this conversation so far. The summary should:
-
-1. **Goal**: What is the user's primary objective?
-2. **Progress**: What has been accomplished so far? List specific changes made.
-3. **Key Decisions**: What important technical decisions were made and why?
-4. **Next Steps**: What was the user about to do or ask about next?
-5. **Critical Context**: Any important constraints, preferences, or context that would be lost.
-6. **Files Read**: {read_files}
-7. **Files Modified**: {modified_files}
-
-Format your response as a structured summary using the headers above. Be thorough but concise. \
-Focus on information that would be needed to continue the conversation seamlessly.
-
-<conversation>
-{conversation}
-</conversation>";
-
-const UPDATE_SUMMARIZATION_PROMPT: &str = "\
-Below is an existing summary of an earlier portion of this conversation, followed by \
-new messages that occurred after that summary. Please create an updated, comprehensive \
-summary that integrates both.
-
-<previous-summary>
-{previous_summary}
-</previous-summary>
-
-Please provide an updated summary that incorporates the new messages below. The summary should:
-
-1. **Goal**: What is the user's primary objective? (update if it has evolved)
-2. **Progress**: What has been accomplished so far? Include both previous and new progress.
-3. **Key Decisions**: What important technical decisions were made and why?
-4. **Next Steps**: What was about to happen next?
-5. **Critical Context**: Any important constraints, preferences, or context.
-6. **Files Read**: {read_files}
-7. **Files Modified**: {modified_files}
-
-<new-messages>
-{conversation}
-</new-messages>";
-
-const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "\
-The following is the beginning of a conversation turn that was split during context compaction. \
-Please provide a very brief summary of what was happening in this partial turn, focusing on \
-what the assistant was doing and what tool calls were made.
-
-<partial-turn>
-{conversation}
-</partial-turn>";
 
 // ─── Entry point ─────────────────────────────────────────────────────
 
@@ -505,6 +241,19 @@ what the assistant was doing and what tool calls were made.
 /// appended as a `## User instructions` section to the main summarization
 /// prompt (both the initial and the update variants). The split-turn
 /// sub-summary prompt is intentionally left untouched.
+///
+/// # Failure policy
+///
+/// This function only *reports* failure (`Err(String)`); what failure
+/// *means* is decided at the two actor call sites:
+///
+/// - **Forced** compaction (overflow / manual, `step_compaction` in the
+///   actor) treats an error as fatal: the prompt fails with
+///   `Error::Compaction`.
+/// - **Proactive** compaction (threshold-based,
+///   `run_proactive_compaction` in the actor) is best-effort: the error
+///   is logged with `tracing::warn` and the conversation continues
+///   uncompacted until the next opportunity.
 pub async fn compact(
     messages: &[Message],
     config: &CompactionConfig,
@@ -514,15 +263,42 @@ pub async fn compact(
     custom_instructions: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<CompactionResult, String> {
+    let keep_recent_tokens = config
+        .keep_recent
+        .resolve(agent_config.model.context_window as u64);
+    let summarizer = TransportSummarizer {
+        agent_config,
+        transport,
+    };
+    compact_with_summarizer(
+        messages,
+        keep_recent_tokens,
+        previous_summary,
+        custom_instructions,
+        &summarizer,
+        cancel,
+    )
+    .await
+}
+
+/// Transport-free compaction orchestration: find the cut point,
+/// assemble the prompt(s), and stitch the summarizer's output into a
+/// [`CompactionResult`]. [`compact`] wraps this with the production
+/// [`TransportSummarizer`]; tests drive it with a stub.
+async fn compact_with_summarizer(
+    messages: &[Message],
+    keep_recent_tokens: u64,
+    previous_summary: Option<&str>,
+    custom_instructions: Option<&str>,
+    summarizer: &dyn Summarizer,
+    cancel: &CancellationToken,
+) -> Result<CompactionResult, String> {
     let tokens_before = estimate_total_tokens(messages);
 
     if cancel.is_cancelled() {
         return Err("Compaction cancelled".into());
     }
-    let keep_recent_tokens = config
-        .keep_recent
-        .resolve(agent_config.model.context_window as u64);
-    let cut = find_cut_point(messages, keep_recent_tokens, cancel).ok_or_else(|| {
+    let cut = cut_point::find_cut_point(messages, keep_recent_tokens, cancel).ok_or_else(|| {
         if cancel.is_cancelled() {
             "Compaction cancelled".to_string()
         } else {
@@ -531,51 +307,25 @@ pub async fn compact(
     })?;
 
     let messages_to_summarize = &messages[..cut.first_kept_index];
-    let (read_files, modified_files) = extract_file_operations(messages_to_summarize);
-    let conversation_text = serialize_messages_for_summary(messages_to_summarize);
+    let (read_files, modified_files) = file_ops::extract_file_operations(messages_to_summarize);
+    let conversation_text = prompts::serialize_messages_for_summary(messages_to_summarize);
 
-    let read_files_str = if read_files.is_empty() {
-        "(none)".to_string()
-    } else {
-        read_files.join(", ")
-    };
-    let modified_files_str = if modified_files.is_empty() {
-        "(none)".to_string()
-    } else {
-        modified_files.join(", ")
-    };
-
-    let mut prompt = if let Some(prev) = previous_summary {
-        UPDATE_SUMMARIZATION_PROMPT
-            .replace("{previous_summary}", prev)
-            .replace("{conversation}", &conversation_text)
-            .replace("{read_files}", &read_files_str)
-            .replace("{modified_files}", &modified_files_str)
-    } else {
-        SUMMARIZATION_PROMPT
-            .replace("{conversation}", &conversation_text)
-            .replace("{read_files}", &read_files_str)
-            .replace("{modified_files}", &modified_files_str)
-    };
-
-    if let Some(instructions) = custom_instructions {
-        let trimmed = instructions.trim();
-        if !trimmed.is_empty() {
-            prompt.push_str("\n\n## User instructions\n\n");
-            prompt.push_str(trimmed);
-        }
-    }
+    let prompt = prompts::build_main_prompt(
+        &conversation_text,
+        previous_summary,
+        &read_files,
+        &modified_files,
+        custom_instructions,
+    );
 
     let mut full_summary = String::new();
 
     if cut.is_split_turn {
         if let Some(turn_start) = cut.turn_start_index {
             let turn_prefix = &messages[turn_start..cut.first_kept_index];
-            let turn_prefix_text = serialize_messages_for_summary(turn_prefix);
-            let turn_prompt =
-                TURN_PREFIX_SUMMARIZATION_PROMPT.replace("{conversation}", &turn_prefix_text);
-            let turn_summary =
-                call_summarization_llm(&turn_prompt, agent_config, transport, cancel).await?;
+            let turn_prefix_text = prompts::serialize_messages_for_summary(turn_prefix);
+            let turn_prompt = prompts::build_turn_prefix_prompt(&turn_prefix_text);
+            let turn_summary = summarizer.summarize(&turn_prompt, cancel).await?;
             full_summary.push_str("## Split Turn Context\n");
             full_summary.push_str(&turn_summary);
             full_summary.push_str("\n\n");
@@ -585,66 +335,28 @@ pub async fn compact(
     if cancel.is_cancelled() {
         return Err("Compaction cancelled".into());
     }
-    let main_summary = call_summarization_llm(&prompt, agent_config, transport, cancel).await?;
+    let main_summary = summarizer.summarize(&prompt, cancel).await?;
     full_summary.push_str(&main_summary);
 
     Ok(CompactionResult {
         summary: full_summary,
         first_kept_index: cut.first_kept_index,
         tokens_before,
-        read_files,
-        modified_files,
     })
-}
-
-async fn call_summarization_llm(
-    prompt: &str,
-    agent_config: &AgentConfig,
-    transport: &Arc<dyn Transport>,
-    cancel: &CancellationToken,
-) -> Result<String, String> {
-    let run_config = AgentRunConfig {
-        system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.into()),
-        tools: vec![],
-        server_tools: vec![],
-        model: agent_config.model.clone(),
-        reasoning: None,
-        thinking_adaptive: false,
-        max_tokens: Some(4096),
-        temperature: None,
-        // Summarization is a one-shot call, not part of any turn loop.
-        turn_number: 0,
-        cache_scope: None,
-        cache_ttl: None,
-        system_prompt_boundary: None,
-    };
-
-    let user_message = Message::user(prompt);
-    let mut stream = transport
-        .run(vec![user_message], &run_config, cancel.clone())
-        .await
-        .map_err(|e| format!("Compaction LLM call failed: {e}"))?;
-
-    let mut result_text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            AgentEvent::MessageEnd { message } => result_text = message.text(),
-            AgentEvent::Error { message } => {
-                return Err(format!("Compaction LLM error: {message}"));
-            }
-            _ => {}
-        }
-    }
-
-    if result_text.is_empty() {
-        return Err("Compaction LLM returned empty response".into());
-    }
-    Ok(result_text)
 }
 
 /// Apply a successful compaction result to a conversation: splice off
 /// the summarized prefix, prepend a `<context-summary>` user message,
 /// keep the suffix.
+/// The synthetic user message that replaces summarized history.
+/// Public so hosts that persist sessions can reconstruct the exact
+/// in-memory message on load.
+pub fn summary_message(summary: &str) -> Message {
+    Message::user(format!(
+        "<context-summary>\n{summary}\n</context-summary>\n\nThe conversation was compacted. Continue from where we left off.",
+    ))
+}
+
 pub fn apply_compaction_result(
     messages: &mut Vec<Message>,
     previous_summary: &mut Option<String>,
@@ -652,15 +364,14 @@ pub fn apply_compaction_result(
 ) {
     *previous_summary = Some(result.summary.clone());
     let kept = messages.split_off(result.first_kept_index);
-    *messages = vec![Message::user(format!(
-        "<context-summary>\n{}\n</context-summary>\n\nThe conversation was compacted. Continue from where we left off.",
-        result.summary
-    ))];
+    *messages = vec![summary_message(&result.summary)];
     messages.extend(kept);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use tau_ai::{AssistantMetadata, Content, Message};
 
@@ -748,73 +459,6 @@ mod tests {
     }
 
     #[test]
-    fn cut_point_too_few_messages_returns_none() {
-        let messages = vec![user("hi")];
-        let cancel = CancellationToken::new();
-        assert!(find_cut_point(&messages, 100, &cancel).is_none());
-    }
-
-    #[test]
-    fn find_turn_start_walks_back_multi_step() {
-        // user → assistant(tool) → result → assistant(tool) → result
-        // from = 3 (second assistant) should find turn start at 1.
-        let messages = vec![
-            user("do"),
-            assistant_tool("read"),
-            tool_result("id"),
-            assistant_tool("write"),
-            tool_result("id"),
-        ];
-        assert_eq!(find_turn_start(&messages, 3), 1);
-    }
-
-    #[test]
-    fn find_turn_start_stops_at_user_boundary() {
-        let messages = vec![
-            user("X"),
-            assistant_tool("read"),
-            tool_result("id"),
-            user("Y"),
-            assistant_tool("write"),
-            tool_result("id"),
-            assistant_tool("edit"),
-            tool_result("id"),
-        ];
-        assert_eq!(find_turn_start(&messages, 6), 4);
-    }
-
-    #[test]
-    fn serialize_messages_smoke() {
-        let messages = vec![user("Hello"), assistant("Hi there!")];
-        let text = serialize_messages_for_summary(&messages);
-        assert!(text.contains("[User]: Hello"));
-        assert!(text.contains("[Assistant]: Hi there!"));
-    }
-
-    /// A previous compaction's `<context-summary>` user message must
-    /// not be re-embedded in the next summarization prompt. The
-    /// UPDATE template already injects it as `<previous-summary>`;
-    /// including the echo here would double-charge tokens and confuse
-    /// the model.
-    #[test]
-    fn serialize_skips_context_summary_user_message() {
-        let messages = vec![
-            user(
-                "<context-summary>\nOld stuff happened.\n</context-summary>\n\nThe conversation was compacted. Continue from where we left off.",
-            ),
-            user("a new thing"),
-            assistant("response"),
-        ];
-        let text = serialize_messages_for_summary(&messages);
-        assert!(
-            !text.contains("<context-summary>"),
-            "context-summary echo excluded: {text}"
-        );
-        assert!(text.contains("[User]: a new thing"));
-        assert!(text.contains("[Assistant]: response"));
-    }
-
-    #[test]
     fn apply_compaction_replaces_prefix() {
         let mut messages = vec![
             user("old 1"),
@@ -830,8 +474,6 @@ mod tests {
                 summary: "Summary of old conversation".into(),
                 first_kept_index: 2,
                 tokens_before: 1000,
-                read_files: vec![],
-                modified_files: vec![],
             },
         );
         // summary + 2 recent
@@ -840,5 +482,120 @@ mod tests {
         assert_eq!(messages[1].text(), "recent 1");
         assert_eq!(messages[2].text(), "recent 2");
         assert_eq!(prev.as_deref(), Some("Summary of old conversation"));
+    }
+
+    // ─── Summarizer-seam tests (no Transport) ────────────────────────
+
+    /// Stub that records every prompt it receives and replays canned
+    /// replies in order.
+    struct StubSummarizer {
+        replies: Mutex<Vec<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl StubSummarizer {
+        fn new(replies: &[&str]) -> Self {
+            Self {
+                replies: Mutex::new(replies.iter().rev().map(|s| s.to_string()).collect()),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Summarizer for StubSummarizer {
+        async fn summarize(
+            &self,
+            prompt: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, String> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            self.replies
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| "stub exhausted".to_string())
+        }
+    }
+
+    /// The orchestration runs end-to-end against a stub `Summarizer`,
+    /// with no `Transport` anywhere: the cut point lands after the old
+    /// prefix, the assembled prompt contains only summarized messages
+    /// plus the `## User instructions` section, and the stub's reply
+    /// comes back as the summary.
+    #[tokio::test]
+    async fn compact_orchestrates_with_stub_summarizer() {
+        let messages = vec![
+            user("old question"),
+            assistant("old answer"),
+            user("recent question"),
+            assistant("recent answer"),
+        ];
+        let stub = StubSummarizer::new(&["STUB SUMMARY"]);
+        let cancel = CancellationToken::new();
+
+        // keep_recent = 1 token → the rev-walk overshoots immediately
+        // and the fallback keeps the last two messages.
+        let result = compact_with_summarizer(
+            &messages,
+            1,
+            None,
+            Some("Focus on file paths."),
+            &stub,
+            &cancel,
+        )
+        .await
+        .expect("compaction succeeds with stub");
+
+        assert_eq!(result.summary, "STUB SUMMARY");
+        assert_eq!(result.first_kept_index, 2);
+        assert_eq!(result.tokens_before, estimate_total_tokens(&messages));
+
+        let prompts = stub.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "single main summarization call");
+        assert!(prompts[0].contains("[User]: old question"));
+        assert!(
+            !prompts[0].contains("recent question"),
+            "kept suffix must not be summarized"
+        );
+        assert!(prompts[0].contains("## User instructions\n\nFocus on file paths."));
+    }
+
+    /// A cut point landing mid-turn produces *two* summarizer calls —
+    /// turn-prefix first, then the main prompt — stitched together
+    /// under `## Split Turn Context`.
+    #[tokio::test]
+    async fn compact_split_turn_makes_two_stub_calls() {
+        let messages = vec![
+            user("first task"),
+            assistant("first reply"),
+            user("second task"),
+            assistant_tool("read"),
+            tool_result("id"),
+            assistant_tool("write"),
+            tool_result("id"),
+        ];
+        // Choose the threshold so the rev-walk breaks exactly at index 4,
+        // putting first_kept on the second tool-calling assistant (5).
+        let keep_recent = estimate_tokens(&messages[6])
+            + estimate_tokens(&messages[5])
+            + estimate_tokens(&messages[4]);
+        let stub = StubSummarizer::new(&["TURN PREFIX", "MAIN SUMMARY"]);
+        let cancel = CancellationToken::new();
+
+        let result = compact_with_summarizer(&messages, keep_recent, None, None, &stub, &cancel)
+            .await
+            .expect("split-turn compaction succeeds with stub");
+
+        assert_eq!(result.first_kept_index, 5);
+        assert_eq!(
+            result.summary,
+            "## Split Turn Context\nTURN PREFIX\n\nMAIN SUMMARY"
+        );
+
+        let prompts = stub.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "turn-prefix call then main call");
+        assert!(prompts[0].contains("<partial-turn>"));
+        assert!(prompts[1].contains("[User]: first task"));
     }
 }

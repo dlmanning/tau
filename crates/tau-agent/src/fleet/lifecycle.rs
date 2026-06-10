@@ -32,6 +32,7 @@ use crate::core::handle::AgentHandle;
 use crate::core::interaction::InteractionRequest;
 use crate::core::tool::send_event;
 use crate::core::transport::Transport;
+use crate::fleet::SubagentMessageExt;
 use crate::fleet::bus;
 use crate::fleet::manager::{AgentSpec, Isolation, SpawnOpts};
 use crate::fleet::registry::{AgentEntry, Registry};
@@ -83,7 +84,13 @@ pub async fn spawn(
             Ok(subresult)
         }
         Err(e) => {
-            ctx.registry.abandon(&agent_id);
+            // `run_one` may have already committed the agent into the
+            // running set (via `commit_running`) before the prompt
+            // failed. `drop_running` handles both cases: it removes the
+            // running entry if commit happened (and the spec either
+            // way), and no-ops on the running map if setup failed
+            // before commit.
+            ctx.registry.drop_running(&agent_id);
             Err(e)
         }
     }
@@ -182,7 +189,10 @@ pub async fn spawn_background(
                     .await;
             }
             Err(e) => {
-                inner_ctx.registry.abandon(&aid);
+                // See `spawn`: the agent may already be in the running
+                // set; `drop_running` cleans up whether or not the
+                // commit happened.
+                inner_ctx.registry.drop_running(&aid);
                 let _ = parent_handle
                     .follow_up(Message::subagent_failed(&aid, &desc, format!("Error: {e}")))
                     .await;
@@ -385,14 +395,14 @@ pub async fn spawn_interactive(
     let builder = match configure_builder(ctx, &spec, &opts, &agent_id, None).await {
         Ok(b) => b,
         Err(e) => {
-            ctx.registry.abandon(&agent_id);
+            ctx.registry.drop_running(&agent_id);
             return Err(e);
         }
     };
     let handle = match builder.spawn().await {
         Ok(h) => h,
         Err(e) => {
-            ctx.registry.abandon(&agent_id);
+            ctx.registry.drop_running(&agent_id);
             return Err(e);
         }
     };

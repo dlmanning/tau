@@ -24,6 +24,6 @@ pub enum AgentHealth {
     ///
     /// Not `PartialEq`-compared: panic payload strings carry stack
     /// addresses and timestamps and are not meaningful for equality.
-    /// Use `matches!` or [`AgentHandle::is_alive`](crate::core::handle::AgentHandle::is_alive).
+    /// Use `matches!(health, AgentHealth::Dead { .. })` to test for it.
     Dead { reason: Option<String> },
 }

@@ -38,6 +38,72 @@ async fn follow_up_processed_after_prompt() {
 }
 
 #[tokio::test]
+async fn host_follow_up_does_not_release_pending_background() {
+    // Regression: a host `follow_up()` shares the follow-up queue with
+    // background-completion messages, but only the latter are paired
+    // with an `expect_follow_up()` increment. Draining a host follow_up
+    // must NOT decrement the bg-pending counter, or the prompt would
+    // end while a real background agent is still outstanding (its later
+    // completion then arrives with no active prompt and is dropped).
+    let transport = MockTransport::new()
+        .with_text_response("initial done") // initial prompt turn
+        .with_text_response("host ack") // host follow_up turn
+        .with_text_response("bg ack"); // bg-completion turn
+    let (handle, collector) = spawn_test_agent(transport, vec![]).await;
+
+    // Simulate one outstanding background subagent.
+    handle.expect_follow_up();
+    assert!(handle.has_pending_follow_ups());
+
+    let mut rx = handle.prompt("go").await.unwrap();
+
+    // A plain host follow_up must be processed but must NOT satisfy the
+    // outstanding background agent.
+    handle
+        .follow_up(Message::user("host interjection"))
+        .await
+        .unwrap();
+
+    // The counter decrement happens in the drain step *before* the
+    // "host ack" turn runs, so once that turn's MessageEnd is observed
+    // the (correct or buggy) decrement has already been applied — no
+    // sleep needed for a race-free assertion.
+    collector
+        .wait_for_event(|e| {
+            matches!(e, AgentEvent::MessageEnd { message } if message.text() == "host ack")
+        })
+        .await;
+    assert!(
+        handle.has_pending_follow_ups(),
+        "bg-pending counter must survive a host follow_up"
+    );
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "prompt must stay alive after a host follow_up while a bg agent is pending"
+    );
+
+    // The background agent now reports completion — only this should
+    // release the prompt.
+    handle
+        .follow_up(Message::subagent_completed("a", "desc", "bg result"))
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .expect("prompt did not complete after bg completion")
+        .expect("prompt sender dropped");
+    assert!(result.result.is_ok());
+    assert!(
+        !handle.has_pending_follow_ups(),
+        "counter should drain to zero after the bg completion"
+    );
+}
+
+#[tokio::test]
 async fn no_pending_follow_ups_finishes_immediately() {
     let handle = AgentBuilder::new(test_config(), TextTransport::create("ok"))
         .spawn()

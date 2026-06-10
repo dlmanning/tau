@@ -27,7 +27,7 @@ use crate::core::config::AgentConfig;
 use crate::core::state::Shared;
 use crate::types::conversation::Conversation;
 use crate::types::error::{Error, Result};
-use crate::types::events::{AgentEvent, CompactionReason};
+use crate::types::events::AgentEvent;
 use crate::types::info::{ContextStats, ToolInfo};
 
 /// Channel-based handle into a running agent. **Pure-core**: this type
@@ -149,14 +149,12 @@ impl AgentHandle {
 
     pub async fn compact(
         &self,
-        reason: CompactionReason,
         custom_instructions: Option<String>,
     ) -> Result<oneshot::Receiver<PromptResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .normal_tx
             .send(Command::Compact {
-                reason,
                 custom_instructions,
                 reply: reply_tx,
             })

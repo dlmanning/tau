@@ -24,7 +24,7 @@ pub struct AgentSnapshot {
     pub usage: Usage,
     /// Cumulative count of `ToolExecutionEnd` events observed for this
     /// agent across its entire lifetime. Note this is computed via an
-    /// independent path from [`crate::fleet::SubagentResult::tool_use_count`]:
+    /// independent path from [`crate::SubagentResult::tool_use_count`]:
     /// the snapshot counter is incremented as events flow through the
     /// fleet bus, while `SubagentResult.tool_use_count` is derived by
     /// scanning the final message log for `Content::ToolCall` blocks.

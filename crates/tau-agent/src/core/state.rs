@@ -13,9 +13,9 @@
 //!   never by transition functions themselves.
 //! - [`Conv`] — mutable per-turn state (conversation, queues, cwd).
 //!   Borrowed `&mut Conv` by `apply_*` transitions.
-//! - [`Shared`] — atomics shared with [`AgentHandle`]. The actor
-//!   writes a few of these (e.g. `prompt_in_flight`); tools read from them
-//!   via [`ExecutionContext`].
+//! - [`Shared`] — atomics shared with [`AgentHandle`](crate::AgentHandle).
+//!   The actor writes a few of these (e.g. `prompt_in_flight`); tools
+//!   read from them via [`ExecutionContext`](crate::ExecutionContext).
 //!
 //! All three live on the actor task. `Shared` is just `Arc`s — it
 //! holds no senders, so even though the state is owned by the actor,
@@ -99,13 +99,14 @@ pub struct Frame {
     pub transform_context: Option<Arc<TransformContextFn>>,
     /// File-access tracker. Logically "shared mutable" but it's owned
     /// by the actor and reached by tools per-call via
-    /// [`ExecutionContext::file_access`]; not part of the per-prompt
+    /// [`ExecutionContext::file_access`](crate::ExecutionContext::file_access);
+    /// not part of the per-prompt
     /// `Conv` mutation discipline.
     pub file_access: Arc<Mutex<FileAccessTracker>>,
     /// Depth of this agent in the subagent spawn tree. `0` for the
     /// host's root agent; the manager's spawn paths increment by one
     /// for each descendant. Surfaced to tools via
-    /// [`ExecutionContext::subagent_depth`].
+    /// [`ExecutionContext::subagent_depth`](crate::ExecutionContext::subagent_depth).
     pub subagent_depth: u32,
 }
 
@@ -113,6 +114,12 @@ pub struct Frame {
 
 /// Genuinely mutable per-turn state. Every `apply_*` transition takes
 /// `&mut Conv`; pure decision functions take `&Conv`.
+///
+/// Discipline: `Conv` is mutated **only** through
+/// [`transitions`](crate::core::transitions) `apply_*` functions — the
+/// actor never writes fields directly. This keeps every state mutation
+/// nameable, testable, and greppable (`&mut Conv` outside
+/// `transitions.rs` is a review flag).
 pub struct Conv {
     pub conversation: Conversation,
     pub steering_queue: Vec<Message>,

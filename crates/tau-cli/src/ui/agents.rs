@@ -263,18 +263,39 @@ impl TuiState {
         }
     }
 
-    /// Finalize the agent tree message and clear tracking state.
+    /// Finalize the agent tree message and clear tracking state — but
+    /// only once every tracked agent has finished.
+    ///
+    /// A background subagent (spawned with `run_in_background: true`)
+    /// outlives the prompt that launched it, so its `AgentCompleted`
+    /// can arrive after the root agent's `AgentEnd`. Clearing the map
+    /// here unconditionally would drop that completion — `get_mut`
+    /// would miss it, so a failed bg agent would render as a silent
+    /// success and `any_error` would be computed over the wrong set.
+    /// We therefore defer the freeze+clear while any agent is still
+    /// running; the deferred call fires from the `AgentCompleted` /
+    /// forwarded-`Error` handlers when the last one finishes.
     fn finalize_agent_progress(&mut self, is_error: bool) {
-        if !self.agent_progress.is_empty() {
-            if let Some(msg) = self.messages.iter_mut().rev().find(|m| m.role == "agents") {
-                msg.is_streaming = false;
-                if is_error {
-                    msg.is_error = true;
-                }
-            }
-            self.agent_progress.clear();
-            self.agent_order.clear();
+        if self.agent_progress.is_empty() {
+            return;
         }
+        // Record the error state on the tree as soon as it's known, even
+        // if a still-running bg agent means we can't freeze yet.
+        if is_error {
+            if let Some(msg) = self.messages.iter_mut().rev().find(|m| m.role == "agents") {
+                msg.is_error = true;
+            }
+        }
+        // Defer until nothing is left running so no completion is dropped
+        // and finished agents stay visible in the tree.
+        if !self.agent_progress.values().all(|p| p.finished) {
+            return;
+        }
+        if let Some(msg) = self.messages.iter_mut().rev().find(|m| m.role == "agents") {
+            msg.is_streaming = false;
+        }
+        self.agent_progress.clear();
+        self.agent_order.clear();
     }
 
     /// Update or insert the agent tree message in the conversation.
@@ -297,5 +318,118 @@ impl TuiState {
             });
         }
         self.scroll_to_bottom();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tau_agent::test_utils::{make_test_config, make_test_model};
+
+    fn test_state() -> TuiState {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        TuiState::new(&make_test_config(), vec![make_test_model()], tx)
+    }
+
+    fn started(agent_id: &str) -> FleetEvent {
+        FleetEvent::AgentStarted {
+            agent_id: agent_id.into(),
+            spec_name: None,
+            description: format!("agent {agent_id}"),
+            prompt: "go".into(),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    fn completed(agent_id: &str, outcome: SubagentOutcome) -> FleetEvent {
+        FleetEvent::AgentCompleted {
+            agent_id: agent_id.into(),
+            description: format!("agent {agent_id}"),
+            outcome,
+            started_at: chrono::Utc::now(),
+            completed_at: chrono::Utc::now(),
+            duration_ms: 0,
+            usage: Default::default(),
+            tool_use_count: 0,
+            worktree_path: None,
+            worktree_branch: None,
+        }
+    }
+
+    fn agent_end() -> AgentEvent {
+        AgentEvent::AgentEnd {
+            total_turns: 1,
+            total_usage: Default::default(),
+            interrupted: false,
+        }
+    }
+
+    /// A background subagent that completes *after* the root agent's
+    /// `AgentEnd` must not be dropped: its failure has to surface rather
+    /// than render as a silent success.
+    #[test]
+    fn background_failure_after_agent_end_is_not_lost() {
+        let mut s = test_state();
+
+        // A background subagent starts, then the root prompt ends while
+        // it is still running.
+        s.handle_fleet_event(started("bg"));
+        s.handle_agent_event(agent_end());
+
+        // It must still be tracked — finalize must not have cleared it.
+        assert!(
+            s.agent_progress.contains_key("bg"),
+            "a still-running bg agent must survive the root AgentEnd"
+        );
+
+        // The bg agent later fails. This must be recorded, not dropped.
+        s.handle_fleet_event(completed("bg", SubagentOutcome::Failed { reason: "boom".into() }));
+
+        assert!(
+            s.agent_progress.is_empty(),
+            "tree finalizes once the last agent finishes"
+        );
+        let tree = s
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "agents")
+            .expect("agents tree message");
+        assert!(tree.is_error, "a failed bg agent must mark the tree as error");
+        assert!(!tree.is_streaming, "tree frozen after the last agent finished");
+        assert!(
+            tree.content.contains('✗'),
+            "tree should show the failure indicator, got: {:?}",
+            tree.content
+        );
+    }
+
+    /// Regression guard: the common foreground-only flow still finalizes
+    /// (freeze + clear) once every subagent has completed.
+    #[test]
+    fn foreground_agents_finalize_when_all_complete() {
+        let mut s = test_state();
+        s.handle_fleet_event(started("a"));
+        s.handle_fleet_event(started("b"));
+
+        s.handle_fleet_event(completed("a", SubagentOutcome::Completed));
+        assert!(
+            !s.agent_progress.is_empty(),
+            "must not finalize until every agent has finished"
+        );
+
+        s.handle_fleet_event(completed("b", SubagentOutcome::Completed));
+        assert!(
+            s.agent_progress.is_empty(),
+            "finalized once all agents completed"
+        );
+        let tree = s
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "agents")
+            .expect("agents tree message");
+        assert!(!tree.is_error);
+        assert!(!tree.is_streaming);
     }
 }

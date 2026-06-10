@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use tau_ai::{Content, Message, Usage};
+use tau_ai::{Content, InjectionSource, Message, Usage};
 
 use crate::core::config::DequeueMode;
 use crate::core::overflow::is_context_overflow;
@@ -29,7 +29,6 @@ use crate::core::state::{Conv, Frame, ToolCall};
 use crate::core::stream::StreamOutcome;
 use crate::core::tool::{BoxedTool, Concurrency, ToolResult, to_api_tool};
 use crate::core::transport::AgentRunConfig;
-use crate::types::events::CompactionReason;
 
 // ─── Action enums (the language `decide_*` speaks) ───────────────────
 
@@ -42,12 +41,10 @@ pub enum ResponseAction {
         groups: Vec<Vec<usize>>,
         first_user_message: Option<Message>,
     },
-    /// Compact (overflow); optionally retry the in-flight pending
-    /// messages after compaction completes.
-    Compact {
-        reason: CompactionReason,
-        resume_pending: Option<(Vec<Message>, Option<Message>)>,
-    },
+    /// Compact (overflow). The actor assembles the resume payload from
+    /// its own in-flight `pending` / partial — see
+    /// `CompactionTrigger::Overflow`.
+    Compact,
     /// Turn complete — go to the queue-drain phase.
     Done,
     /// Fatal error.
@@ -144,13 +141,7 @@ pub fn decide_response_action(
         let overflow = is_context_overflow(error_msg);
         if overflow && frame.config.compaction.enabled {
             return ResponseDecision {
-                action: ResponseAction::Compact {
-                    reason: CompactionReason::Overflow,
-                    resume_pending: Some((
-                        first_user_message.iter().cloned().collect(),
-                        first_user_message,
-                    )),
-                },
+                action: ResponseAction::Compact,
                 needs_proactive_compaction: false,
             };
         }
@@ -236,6 +227,29 @@ pub fn apply_drain_queues(frame: &Frame, conv: &mut Conv) -> DrainedQueue {
     }
 }
 
+/// Whether a drained follow-up message is a background-subagent
+/// completion notification (success or failure), as opposed to a
+/// host-injected `follow_up()` message.
+///
+/// Only background completions are paired with an `expect_follow_up()`
+/// increment of the bg-pending counter, so only they should decrement
+/// it — see `step_drain`. Counting host follow-ups too would zero the
+/// counter early and end the prompt while real bg agents are still
+/// running.
+pub fn is_subagent_completion(msg: &Message) -> bool {
+    let Message::SystemInjection { source, .. } = msg else {
+        return false;
+    };
+    // Exhaustive on purpose — adding an `InjectionSource` variant must
+    // force a decision here about whether it pairs with an
+    // `expect_follow_up()` increment. A silently-unmatched variant
+    // would leave the counter stuck and hang the prompt in
+    // WaitingForBackground.
+    match source {
+        InjectionSource::SubagentCompleted { .. } | InjectionSource::SubagentFailed { .. } => true,
+    }
+}
+
 /// Decide what to do at a tool-batch boundary. If steering arrived
 /// during the batch, commit results and redirect; otherwise advance
 /// to the next group or finish.
@@ -293,39 +307,57 @@ pub fn apply_response(conv: &mut Conv, outcome: StreamOutcome, pending: &[Messag
     apply_usage(conv, &outcome.usage);
 }
 
-/// Apply the partial-message + pending preservation that the error
-/// path of [`decide_response_action`] depends on for context. Called
-/// by the actor when the decision is `Compact { reason: Overflow }`
-/// or `Error`.
-///
-/// Pending is committed when *either* `force_pending` is true *or* the
-/// stream produced a meaningful partial message. The actor passes
-/// `force_pending: true` on the overflow-into-compaction path because
-/// the prompt is going to resume after compaction — pending must
-/// survive. On a non-overflow error, the prompt is going to terminate;
-/// pending stays re-presentable unless preserving it gives a partial
-/// some context.
-///
-/// The partial is committed only when it's meaningful (some text /
-/// thinking / a tool call).
-pub fn apply_partial_on_error(
-    conv: &mut Conv,
-    outcome: &StreamOutcome,
-    pending: &[Message],
-    force_pending: bool,
-) {
-    let has_meaningful = outcome
+/// The stream's partial assistant message, if it carries meaningful
+/// content (text / thinking / a tool call) worth preserving in
+/// history.
+pub fn meaningful_partial(outcome: &StreamOutcome) -> Option<Message> {
+    outcome
         .partial_message
         .as_ref()
-        .is_some_and(message_has_content);
-    if has_meaningful || force_pending {
+        .filter(|m| message_has_content(m))
+        .cloned()
+}
+
+/// Apply the partial-message + pending preservation the `Error` path
+/// of [`decide_response_action`] depends on for context. The prompt is
+/// going to terminate, so pending stays re-presentable unless the
+/// stream produced a meaningful partial that needs it for context — in
+/// which case both are committed, in order.
+///
+/// (The overflow-into-compaction path does *not* use this: it defers
+/// all commits until compaction succeeds — see
+/// `CompactionTrigger::Overflow`.)
+pub fn apply_partial_on_error(conv: &mut Conv, outcome: &StreamOutcome, pending: &[Message]) {
+    if let Some(partial) = meaningful_partial(outcome) {
         apply_pending(conv, pending);
+        conv.conversation.messages.push(partial);
     }
-    if has_meaningful {
-        if let Some(ref partial) = outcome.partial_message {
-            conv.conversation.messages.push(partial.clone());
-        }
-    }
+}
+
+/// Record a fatal prompt error on the conversation.
+pub fn apply_error(conv: &mut Conv, message: &str) {
+    conv.conversation.error = Some(message.to_string());
+}
+
+/// Clear any prior prompt error at the start of a new prompt.
+pub fn apply_clear_error(conv: &mut Conv) {
+    conv.conversation.error = None;
+}
+
+/// Enqueue a steering message for the next tool-batch boundary.
+pub fn apply_enqueue_steering(conv: &mut Conv, msg: Message) {
+    conv.steering_queue.push(msg);
+}
+
+/// Enqueue a follow-up message for the post-turn drain.
+pub fn apply_enqueue_follow_up(conv: &mut Conv, msg: Message) {
+    conv.follow_up_queue.push(msg);
+}
+
+/// Commit the assistant's final-summary message produced after an
+/// interrupt (no tool calls; appended verbatim).
+pub fn apply_final_summary(conv: &mut Conv, msg: Message) {
+    conv.conversation.messages.push(msg);
 }
 
 /// Accumulate per-turn token usage into the running total.
@@ -482,29 +514,10 @@ mod tests {
         }
     }
 
-    /// Force-pending must commit the user message even when there's no
-    /// partial. Regression for the overflow-without-partial path that
-    /// silently dropped pending in an earlier v2 implementation.
+    /// No meaningful partial: pending stays uncommitted
+    /// (re-presentable after the prompt terminates).
     #[test]
-    fn apply_partial_on_error_force_pending_commits_without_partial() {
-        let mut conv = empty_conv();
-        let outcome = StreamOutcome {
-            assistant_message: None,
-            usage: Usage::default(),
-            error: Some("context overflow".into()),
-            partial_message: None,
-        };
-        let pending = vec![Message::user("the user's prompt")];
-
-        apply_partial_on_error(&mut conv, &outcome, &pending, /* force */ true);
-
-        assert_eq!(conv.conversation.messages.len(), 1, "pending committed");
-        assert_eq!(conv.conversation.messages[0].role(), "user");
-    }
-
-    /// Non-force, no meaningful partial: pending stays uncommitted.
-    #[test]
-    fn apply_partial_on_error_no_force_no_partial_leaves_pending() {
+    fn apply_partial_on_error_no_partial_leaves_pending() {
         let mut conv = empty_conv();
         let outcome = StreamOutcome {
             assistant_message: None,
@@ -514,7 +527,7 @@ mod tests {
         };
         let pending = vec![Message::user("the user's prompt")];
 
-        apply_partial_on_error(&mut conv, &outcome, &pending, /* force */ false);
+        apply_partial_on_error(&mut conv, &outcome, &pending);
 
         assert!(
             conv.conversation.messages.is_empty(),
@@ -522,8 +535,7 @@ mod tests {
         );
     }
 
-    /// Meaningful partial commits pending and the partial, regardless
-    /// of force flag.
+    /// Meaningful partial commits pending and the partial, in order.
     #[test]
     fn apply_partial_on_error_meaningful_partial_commits_both() {
         let mut conv = empty_conv();
@@ -535,7 +547,7 @@ mod tests {
         };
         let pending = vec![Message::user("prompt")];
 
-        apply_partial_on_error(&mut conv, &outcome, &pending, /* force */ false);
+        apply_partial_on_error(&mut conv, &outcome, &pending);
 
         assert_eq!(conv.conversation.messages.len(), 2);
         assert_eq!(conv.conversation.messages[0].role(), "user");

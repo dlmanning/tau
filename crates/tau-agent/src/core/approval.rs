@@ -12,7 +12,8 @@
 //! Tools self-report their inherent risk via [`Tool::risk`](crate::core::tool::Tool::risk);
 //! policies combine that with the tool name and arguments to make the call.
 //!
-//! After the gate resolves, the actor emits [`ToolApprovalOutcome`] on the
+//! After the gate resolves, the actor emits
+//! [`ToolApprovalOutcome`](crate::ToolApprovalOutcome) on the
 //! event channel — that's the *observable* outcome (which lives in
 //! [`crate::types::events`] because it's purely an event payload). The
 //! distinction is deliberate: `ApprovalDecision` is the policy's input to

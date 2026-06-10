@@ -42,6 +42,32 @@ impl Tool for ElevatedTool {
     }
 }
 
+/// Assert that every `tool_use` block in the conversation has a matching
+/// `tool_result`. A dangling `tool_use` makes the conversation invalid
+/// for the provider (each `tool_use` must be answered), so the next
+/// prompt would be rejected.
+fn assert_no_dangling_tool_use(msgs: &[Message]) {
+    let result_ids: std::collections::HashSet<&str> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for m in msgs {
+        if let Message::Assistant { content, .. } = m {
+            for c in content {
+                if let Content::ToolCall { id, .. } = c {
+                    assert!(
+                        result_ids.contains(id.as_str()),
+                        "tool_use {id} has no matching tool_result (dangling history)"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Spawn a one-shot interaction handler that resolves every `tool.confirm`
 /// request with the given response.
 fn handle_confirm_with(
@@ -432,17 +458,10 @@ async fn abort_during_pending_gate_terminates_cleanly() {
         .with_tool_call_response("danger", "c1", serde_json::json!({}))
         .with_text_response("never reached");
 
-    // Receiver that captures the request but never responds, so the gate
-    // stays pending until we abort.
+    // Receive the gate request but never respond, so the gate stays
+    // pending until we abort. Holding the request in a local keeps its
+    // response oneshot alive.
     let (interaction_tx, mut interaction_rx) = tokio::sync::mpsc::channel::<InteractionRequest>(8);
-    let captured: Arc<tokio::sync::Mutex<Option<InteractionRequest>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let captured_clone = captured.clone();
-    let _capturer = tokio::spawn(async move {
-        if let Some(req) = interaction_rx.recv().await {
-            *captured_clone.lock().await = Some(req);
-        }
-    });
 
     let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
     builder.add_tool(tool);
@@ -453,22 +472,13 @@ async fn abort_during_pending_gate_terminates_cleanly() {
 
     let prompt_rx = handle.prompt("go").await.unwrap();
 
-    // Wait until the actor has emitted the assistant tool-call message and
-    // the gate request has reached our capturer — that's the window where
-    // the actor is parked in AwaitingApproval.
-    collector
-        .wait_for_event(|e| matches!(e, AgentEvent::MessageEnd { .. }))
-        .await;
-    for _ in 0..50 {
-        if captured.lock().await.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(
-        captured.lock().await.is_some(),
-        "tool.confirm interaction never reached the host"
-    );
+    // Once the gate request reaches the host, the actor is parked in
+    // AwaitingApproval — that's the window where we abort.
+    let captured =
+        tokio::time::timeout(std::time::Duration::from_secs(2), interaction_rx.recv())
+            .await
+            .expect("tool.confirm interaction never reached the host")
+            .expect("interaction channel closed");
 
     handle.abort();
 
@@ -490,7 +500,7 @@ async fn abort_during_pending_gate_terminates_cleanly() {
     );
 
     // Drop the dangling oneshot so the request is cleaned up.
-    drop(captured.lock().await.take());
+    drop(captured);
 }
 
 #[tokio::test]
@@ -624,5 +634,120 @@ async fn interaction_timeout_does_not_fire_when_host_replies_in_time() {
     assert!(
         approved,
         "expected ToolApprovalResolved::Approved, not a timeout"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_pending_gate_leaves_valid_history() {
+    // Regression: aborting while a tool.confirm gate is still pending
+    // must backfill a synthetic result for the committed assistant
+    // tool_use. Otherwise the next prompt sends a dangling tool_use to
+    // the provider, which rejects the conversation.
+    let invocations = Arc::new(AtomicU32::new(0));
+    let tool = Arc::new(ElevatedTool {
+        name: "danger",
+        invocations: invocations.clone(),
+    });
+
+    let transport = MockTransport::new()
+        .with_tool_call_response("danger", "c1", serde_json::json!({}))
+        .with_text_response("never reached");
+
+    // Receive the gate request but never respond, so the actor parks
+    // in AwaitingApproval until we abort. Holding the request in a
+    // local keeps its response oneshot alive.
+    let (interaction_tx, mut interaction_rx) = tokio::sync::mpsc::channel::<InteractionRequest>(8);
+
+    let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
+    builder.add_tool(tool);
+    builder.set_interaction_sender(interaction_tx);
+    let handle = builder.handle();
+    let collector = EventCollector::from_handle(&handle);
+    builder.spawn().await.unwrap();
+
+    let prompt_rx = handle.prompt("go").await.unwrap();
+
+    let captured =
+        tokio::time::timeout(std::time::Duration::from_secs(2), interaction_rx.recv())
+            .await
+            .expect("tool.confirm interaction never reached the host")
+            .expect("interaction channel closed");
+
+    handle.abort();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_rx)
+        .await
+        .expect("prompt did not return after abort")
+        .expect("oneshot dropped");
+    assert!(result.result.is_ok(), "abort should yield Ok");
+
+    collector
+        .wait_for_event(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        .await;
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "tool must not run after abort"
+    );
+
+    // The committed assistant tool_use (c1) must have a backfilled result.
+    let msgs = handle.messages().await.unwrap();
+    assert_no_dangling_tool_use(&msgs);
+    let c1_answered = msgs.iter().any(|m| {
+        matches!(m, Message::ToolResult { tool_call_id, .. } if tool_call_id == "c1")
+    });
+    assert!(
+        c1_answered,
+        "the pending tool_use c1 must be backfilled with a (synthetic) result"
+    );
+
+    // Drop the dangling oneshot so the request is cleaned up.
+    drop(captured);
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_leaves_valid_history() {
+    // Regression: aborting while a tool is mid-execution must backfill a
+    // synthetic result for the aborted tool_use so history stays valid
+    // for the next prompt. The JoinSet aborts the running tool; the
+    // actor must still answer the committed tool_use.
+    let transport = MockTransport::new()
+        .with_tool_call_response("slow", "c1", serde_json::json!({}))
+        .with_text_response("never reached");
+
+    let mut builder = AgentBuilder::new(test_config(), Arc::new(transport));
+    builder.add_tool(Arc::new(SlowTool { delay_ms: 5_000 }));
+    builder.set_approval_policy(Arc::new(AutoAcceptAll));
+    let handle = builder.handle();
+    let collector = EventCollector::from_handle(&handle);
+    builder.spawn().await.unwrap();
+
+    let prompt_rx = handle.prompt("go").await.unwrap();
+
+    // Wait until the tool is actually executing, then abort mid-flight.
+    collector
+        .wait_for_event(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+        .await;
+    handle.abort();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_rx)
+        .await
+        .expect("prompt did not return after abort")
+        .expect("oneshot dropped");
+    assert!(result.result.is_ok(), "abort should yield Ok");
+
+    collector
+        .wait_for_event(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        .await;
+
+    let msgs = handle.messages().await.unwrap();
+    assert_no_dangling_tool_use(&msgs);
+    let c1_answered = msgs.iter().any(|m| {
+        matches!(m, Message::ToolResult { tool_call_id, .. } if tool_call_id == "c1")
+    });
+    assert!(
+        c1_answered,
+        "the aborted tool_use c1 must be backfilled with a (synthetic) result"
     );
 }

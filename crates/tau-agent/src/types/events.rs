@@ -1,8 +1,9 @@
 //! Broadcast events and their auxiliary payloads.
 //!
 //! Events flow on a `tokio::sync::broadcast` channel. Subscribers are
-//! the host UI, the fleet's event-forwarding bus (which wraps child
-//! events as [`AgentEvent::Subagent`]), and any test collectors.
+//! the host UI, the fleet's event-forwarding bus (which re-emits child
+//! events as [`FleetEvent::Forwarded`](crate::FleetEvent::Forwarded)),
+//! and any test collectors.
 
 use std::path::PathBuf;
 
@@ -68,7 +69,7 @@ pub enum ToolApprovalOutcome {
 /// Only this agent's own activity appears here — no subagent events.
 /// For fleet-level events (which agent started, which one finished,
 /// forwarded child events) subscribe to
-/// [`AgentManager`](crate::fleet::AgentManager)'s
+/// [`AgentManager`](crate::AgentManager)'s
 /// [`FleetEvent`] channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -161,7 +162,7 @@ pub enum AgentEvent {
     },
 }
 
-/// Events emitted on [`AgentManager`](crate::fleet::AgentManager)'s
+/// Events emitted on [`AgentManager`](crate::AgentManager)'s
 /// broadcast channel.
 ///
 /// Three kinds:

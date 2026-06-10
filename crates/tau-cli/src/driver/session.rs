@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tau_agent::{
-    AgentEvent, AgentHandle, AgentManager, AutoAcceptAll, CompactionReason, FleetEvent,
+    AgentEvent, AgentHandle, AgentManager, AutoAcceptAll, FleetEvent,
     InteractionRequest, SpawnOpts,
 };
 use tau_ai::{Message, Model, Usage};
@@ -279,6 +279,10 @@ impl Session {
         // by a still-running background agent — is missed.
         let mut events = handle.subscribe();
         let msgs_before = handle.messages().await.map(|m| m.len()).unwrap_or(0);
+        // Compaction sentinel: if `previous_summary` changes across the
+        // prompt, in-memory history was rewritten and the append-only
+        // message diff below would be invalid.
+        let summary_before = handle.state().await.and_then(|s| s.previous_summary);
 
         // Fire-and-await the prompt. The actor will start producing
         // events; we drain them in this same task via select!.
@@ -366,10 +370,23 @@ impl Session {
             && let Some(persist) = self.persistence.as_mut()
         {
             let all_msgs = self.handle.messages().await.unwrap_or_default();
-            for msg in all_msgs.iter().skip(msgs_before) {
-                let _ = persist.append_message(msg);
-            }
             let state = self.handle.state().await;
+            let summary_after = state.as_ref().and_then(|s| s.previous_summary.clone());
+            if summary_after != summary_before
+                && let Some(summary) = &summary_after
+            {
+                // A compaction rewrote in-memory history this prompt;
+                // the index-based diff below would log the wrong
+                // messages. Snapshot instead: compaction marker + the
+                // kept tail (everything after the synthetic summary
+                // head).
+                let _ =
+                    persist.append_compaction_snapshot(summary, all_msgs.get(1..).unwrap_or(&[]));
+            } else {
+                for msg in all_msgs.iter().skip(msgs_before) {
+                    let _ = persist.append_message(msg);
+                }
+            }
             if let Some(s) = state {
                 let delta = Usage {
                     input: s.total_usage.input.saturating_sub(self.prev_usage.input),
@@ -474,14 +491,24 @@ impl Session {
     pub(crate) async fn compact(&mut self, frontend: &mut dyn Frontend) {
         frontend.show_system("Compacting context...").await;
         let handle = self.effective_handle().clone();
-        match handle.compact(CompactionReason::Manual, None).await {
+        match handle.compact(None).await {
             Ok(rx) => match rx.await {
                 Ok(r) if r.result.is_ok() => {
-                    let msg_count = handle.messages().await.map(|m| m.len()).unwrap_or(0);
+                    let msgs = handle.messages().await.unwrap_or_default();
+                    // Mirror the compaction in the session log so a
+                    // restore doesn't replay pre-compaction history.
+                    if matches!(self.state, State::Idle)
+                        && let Some(persist) = self.persistence.as_mut()
+                        && let Some(summary) =
+                            handle.state().await.and_then(|s| s.previous_summary)
+                    {
+                        let _ = persist
+                            .append_compaction_snapshot(&summary, msgs.get(1..).unwrap_or(&[]));
+                    }
                     frontend
                         .show_system(&format!(
                             "Context compacted. {} messages remaining.",
-                            msg_count
+                            msgs.len()
                         ))
                         .await;
                 }

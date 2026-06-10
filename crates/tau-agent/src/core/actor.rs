@@ -20,6 +20,10 @@
 //! Pure decisions live in [`crate::core::transitions`]; all async I/O
 //! lives here.
 
+mod approval;
+mod drain;
+mod executing;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
@@ -35,14 +39,18 @@ use serde_json::Value as JsonValue;
 use crate::core::approval::{ApprovalDecision, ToolRisk};
 use crate::core::command::{Command, PromptResult};
 use crate::core::compaction::estimate_total_tokens;
-use crate::core::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
-use crate::core::state::{Frame, State, ToolCall};
+use crate::core::interaction::InteractionResponse;
+use crate::core::state::{State, ToolCall};
 use crate::core::stream::{StreamOutcome, StreamReducer};
-use crate::core::tool::{ExecutionContext, ProgressSender, ToolResult, send_event};
+use crate::core::tool::{ToolResult, send_event};
 use crate::core::transitions as t;
 use crate::core::transport::AgentEventStream;
-use crate::types::events::{AgentEvent, CompactionReason, ToolApprovalOutcome};
+use crate::types::events::{AgentEvent, CompactionReason};
 use crate::types::info::{ContextStats, ToolInfo};
+
+use approval::{classify_and_enter_approval, step_approval};
+use drain::step_drain;
+use executing::step_executing;
 
 /// Future yielded by a pending approval gate.
 type GateFuture = BoxFuture<
@@ -144,11 +152,20 @@ enum CompactionTrigger {
         custom_instructions: Option<String>,
         reply: oneshot::Sender<PromptResult>,
     },
-    /// Overflow recovery mid-prompt. After compaction succeeds, the
-    /// prompt resumes with `resume_pending` as the next turn's
-    /// pending messages.
+    /// Overflow recovery mid-prompt. Nothing is committed to history
+    /// until compaction succeeds — if it fails, the prompt dies with
+    /// the in-flight messages un-committed (re-presentable) instead of
+    /// baked into a history that just proved too large.
     Overflow {
+        /// `(pending, first_user_message)` for the resumed turn: the
+        /// un-committed messages are re-presented against the
+        /// compacted history.
         resume_pending: (Vec<Message>, Option<Message>),
+        /// Messages committed to history immediately after a
+        /// successful compaction, *before* the resume — e.g. a
+        /// meaningful partial assistant message (together with the
+        /// pending that precedes it) whose position must be preserved.
+        commit_on_success: Vec<Message>,
     },
 }
 
@@ -337,15 +354,17 @@ async fn step_prepare(
             let overflow =
                 e.is_context_overflow() || crate::core::overflow::is_context_overflow(&error_msg);
             if overflow && state.frame.config.compaction.enabled {
-                t::apply_pending(&mut state.conv, &pending);
+                // `pending` stays un-committed across compaction (see
+                // `CompactionTrigger::Overflow`) and is re-presented by
+                // the resumed turn — committing it first would bake it
+                // into history even if compaction fails, and duplicate
+                // it in the model's context when compaction succeeds.
                 Phase::Compaction(CompactionTrigger::Overflow {
-                    resume_pending: (
-                        first_user_message.iter().cloned().collect(),
-                        first_user_message,
-                    ),
+                    resume_pending: (pending, first_user_message),
+                    commit_on_success: vec![],
                 })
             } else {
-                state.conv.conversation.error = Some(error_msg.clone());
+                t::apply_error(&mut state.conv, &error_msg);
                 send_event(
                     &state.frame.event_tx,
                     AgentEvent::Error { message: error_msg },
@@ -401,32 +420,30 @@ async fn step_processing(
     let decision = t::decide_response_action(&state.frame, &outcome, first_user_message.clone());
 
     let action = match decision.action {
-        t::ResponseAction::Compact {
-            reason: _,
-            resume_pending,
-        } => {
-            // Overflow → compaction: force-commit pending so it
-            // survives compaction and is in history when the prompt
-            // resumes.
-            t::apply_partial_on_error(
-                &mut state.conv,
-                &outcome,
-                &pending,
-                /* force_pending */ true,
-            );
+        t::ResponseAction::Compact => {
+            // Defer all commits until compaction succeeds (see
+            // `CompactionTrigger::Overflow`). A meaningful partial must
+            // keep its position after the pending that precedes it, so
+            // when one exists both go through `commit_on_success` and
+            // the resume re-presents nothing; otherwise pending is
+            // simply re-presented by the resumed turn.
+            let (commit_on_success, resume_messages) = match t::meaningful_partial(&outcome) {
+                Some(partial) => {
+                    let mut commit = pending.clone();
+                    commit.push(partial);
+                    (commit, Vec::new())
+                }
+                None => (Vec::new(), pending.clone()),
+            };
             return Phase::Compaction(CompactionTrigger::Overflow {
-                resume_pending: resume_pending.unwrap_or_else(|| (Vec::new(), None)),
+                resume_pending: (resume_messages, first_user_message),
+                commit_on_success,
             });
         }
         t::ResponseAction::Error(e) => {
-            t::apply_partial_on_error(
-                &mut state.conv,
-                &outcome,
-                &pending,
-                /* force_pending */ false,
-            );
+            t::apply_partial_on_error(&mut state.conv, &outcome, &pending);
             let msg = e.to_string();
-            state.conv.conversation.error = Some(msg.clone());
+            t::apply_error(&mut state.conv, &msg);
             send_event(&state.frame.event_tx, AgentEvent::Error { message: msg });
             return Phase::Done(Err(e));
         }
@@ -457,7 +474,7 @@ async fn step_processing(
             first_user_message,
             sub: TurnSub::Drain(DrainPhase::CheckQueues),
         }),
-        t::ResponseAction::Compact { .. } | t::ResponseAction::Error(_) => unreachable!(),
+        t::ResponseAction::Compact | t::ResponseAction::Error(_) => unreachable!(),
     }
 }
 
@@ -525,197 +542,70 @@ async fn step_tool(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn step_approval(
-    tool_calls: Vec<ToolCall>,
-    groups: Vec<Vec<usize>>,
-    mut pre_results: HashMap<usize, (String, String, ToolResult)>,
-    mut dispatch: HashSet<usize>,
-    mut pending_gates: FuturesUnordered<GateFuture>,
-    first_user_message: Option<Message>,
+/// Close out a tool batch on prompt cancellation. The assistant message
+/// (committed in `step_processing`) carries `tool_use` blocks; every
+/// tool-phase exit must answer them or the next prompt sends malformed
+/// history to the provider (each `tool_use` must have a `tool_result`).
+/// Calls with a result in `results` keep it (resolved/rejected gates,
+/// completed tools); the rest — approved-but-unrun, still-pending gates,
+/// aborted tools — get synthetic "cancelled" errors via
+/// `collect_ordered_results`.
+fn finish_cancelled_batch(
     state: &mut State,
-    urgent_rx: &mut mpsc::Receiver<Command>,
-    normal_rx: &mut mpsc::Receiver<Command>,
-    prompt_cancel: &CancellationToken,
+    tool_calls: &[ToolCall],
+    results: &mut HashMap<usize, (String, String, ToolResult)>,
 ) -> Phase {
-    loop {
-        if pending_gates.is_empty() {
-            return finalize_approval(
-                state,
-                tool_calls,
-                groups,
-                pre_results,
-                &dispatch,
-                first_user_message,
-                prompt_cancel,
-            );
-        }
-        tokio::select! {
-            biased;
-            _ = prompt_cancel.cancelled() => return Phase::Done(Ok(())),
-            Some(cmd) = urgent_rx.recv() => handle_busy_command(state, cmd),
-            Some(cmd) = normal_rx.recv() => handle_busy_command(state, cmd),
-            Some((idx, id, name, resp)) = pending_gates.next() => {
-                apply_gate_response(state, idx, id, name, resp, &tool_calls, &mut pre_results, &mut dispatch);
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn step_executing(
-    mut join_set: tokio::task::JoinSet<(usize, String, String, ToolResult)>,
-    remaining_groups: Vec<Vec<usize>>,
-    all_tool_calls: Vec<ToolCall>,
-    mut results_map: HashMap<usize, (String, String, ToolResult)>,
-    first_user_message: Option<Message>,
-    state: &mut State,
-    urgent_rx: &mut mpsc::Receiver<Command>,
-    normal_rx: &mut mpsc::Receiver<Command>,
-    prompt_cancel: &CancellationToken,
-) -> Phase {
-    loop {
-        tokio::select! {
-            biased;
-            _ = prompt_cancel.cancelled() => {
-                // JoinSet aborts spawned tasks on drop.
-                return Phase::Done(Ok(()));
-            }
-            Some(cmd) = urgent_rx.recv() => handle_busy_command(state, cmd),
-            Some(cmd) = normal_rx.recv() => handle_busy_command(state, cmd),
-            result = join_set.join_next() => match result {
-                Some(Ok((idx, id, name, tool_result))) => {
-                    results_map.insert(idx, (id, name, tool_result));
-                }
-                Some(Err(join_err)) => {
-                    tracing::error!("Tool task panicked: {}", join_err);
-                }
-                None => {
-                    let action = t::decide_batch_complete(
-                        &state.frame, &state.conv, &remaining_groups, &all_tool_calls,
-                    );
-                    return match action {
-                        t::BatchCompleteAction::Redirect { skipped_indices } => {
-                            // Inject skipped synth-results, commit, drain, redirect.
-                            for (idx, id, name) in &skipped_indices {
-                                let skip = ToolResult::error("Skipped due to steering message");
-                                results_map.insert(*idx, (id.clone(), name.clone(), skip));
-                                send_event(&state.frame.event_tx, AgentEvent::ToolExecutionStart {
-                                    tool_call_id: id.clone(),
-                                    tool_name: name.clone(),
-                                    arguments: serde_json::Value::Null,
-                                    activity: "Skipped".into(),
-                                });
-                                send_event(&state.frame.event_tx, AgentEvent::ToolExecutionEnd {
-                                    tool_call_id: id.clone(),
-                                    tool_name: name.clone(),
-                                    result: "Skipped due to steering message".into(),
-                                    is_error: true,
-                                });
-                            }
-                            t::apply_tool_results(&mut state.conv, &all_tool_calls, &mut results_map);
-                            // Redirect path is steering-driven; FollowUps drains
-                            // happen only at the post-turn DrainFollowUps phase.
-                            let drained = t::apply_drain_queues(&state.frame, &mut state.conv);
-                            Phase::Turn(Turn {
-                                first_user_message: None,
-                                sub: TurnSub::Prepare { pending: drained.messages },
-                            })
-                        }
-                        t::BatchCompleteAction::AllGroupsDone => Phase::Turn(Turn {
-                            first_user_message,
-                            sub: TurnSub::Tool(ToolPhase::Applying {
-                                tool_calls: all_tool_calls,
-                                results_map,
-                            }),
-                        }),
-                        t::BatchCompleteAction::NextGroup(next_group) => {
-                            let mut remaining = remaining_groups;
-                            remaining.remove(0);
-                            let new_join = spawn_group(state, &all_tool_calls, &next_group, prompt_cancel);
-                            Phase::Turn(Turn {
-                                first_user_message,
-                                sub: TurnSub::Tool(ToolPhase::Executing {
-                                    join_set: new_join,
-                                    remaining_groups: remaining,
-                                    all_tool_calls,
-                                    results_map,
-                                }),
-                            })
-                        }
-                    };
-                }
-            }
-        }
-    }
-}
-
-// ─── Drain sub-machine ──────────────────────────────────────────────
-
-async fn step_drain(
-    dp: DrainPhase,
-    state: &mut State,
-    urgent_rx: &mut mpsc::Receiver<Command>,
-    normal_rx: &mut mpsc::Receiver<Command>,
-    prompt_cancel: &CancellationToken,
-) -> Phase {
-    match dp {
-        DrainPhase::CheckQueues => {
-            let drained = t::apply_drain_queues(&state.frame, &mut state.conv);
-            match drained.source {
-                t::DrainedFrom::Steering => Phase::Turn(Turn {
-                    first_user_message: None,
-                    sub: TurnSub::Prepare {
-                        pending: drained.messages,
-                    },
-                }),
-                t::DrainedFrom::FollowUps => {
-                    let count = drained.messages.len() as u32;
-                    let _ = state.shared.pending_follow_ups.fetch_update(
-                        Ordering::Release,
-                        Ordering::Acquire,
-                        |n| Some(n.saturating_sub(count)),
-                    );
-                    Phase::Turn(Turn {
-                        first_user_message: None,
-                        sub: TurnSub::Prepare {
-                            pending: drained.messages,
-                        },
-                    })
-                }
-                t::DrainedFrom::Nothing => {
-                    if state.shared.pending_follow_ups.load(Ordering::Acquire) > 0 {
-                        Phase::Turn(Turn {
-                            first_user_message: None,
-                            sub: TurnSub::Drain(DrainPhase::WaitingForBackground),
-                        })
-                    } else {
-                        Phase::Done(Ok(()))
-                    }
-                }
-            }
-        }
-        DrainPhase::WaitingForBackground => loop {
-            tokio::select! {
-                biased;
-                _ = prompt_cancel.cancelled() => break Phase::Done(Ok(())),
-                Some(cmd) = urgent_rx.recv() => match cmd {
-                    Command::FollowUp(msg) => {
-                        state.conv.follow_up_queue.push(msg);
-                        break Phase::Turn(Turn {
-                            first_user_message: None,
-                            sub: TurnSub::Drain(DrainPhase::CheckQueues),
-                        });
-                    }
-                    other => handle_busy_command(state, other),
-                },
-                Some(cmd) = normal_rx.recv() => handle_busy_command(state, cmd),
-            }
-        },
-    }
+    t::apply_tool_results(&mut state.conv, tool_calls, results);
+    Phase::Done(Ok(()))
 }
 
 // ─── Compaction ─────────────────────────────────────────────────────
+
+/// Run one compaction pass: emit `CompactionStart`, summarize via
+/// [`compaction::compact`](crate::core::compaction::compact), and on
+/// success emit `CompactionEnd` and commit the result to the
+/// conversation. On failure nothing is committed and no event beyond
+/// `CompactionStart` is emitted — what the failure *means* is the
+/// caller's decision: fatal for forced compaction (`step_compaction`,
+/// overflow/manual), logged-and-ignored for the proactive threshold
+/// pass (`run_proactive_compaction`).
+async fn run_compaction_pass(
+    state: &mut State,
+    reason: CompactionReason,
+    custom_instructions: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    send_event(
+        &state.frame.event_tx,
+        AgentEvent::CompactionStart { reason },
+    );
+    let cr = crate::core::compaction::compact(
+        &state.conv.conversation.messages,
+        &state.frame.config.compaction,
+        &state.frame.config,
+        &state.frame.transport,
+        state.conv.conversation.previous_summary.as_deref(),
+        custom_instructions,
+        cancel,
+    )
+    .await?;
+    let tokens_after = crate::core::compaction::estimate_total_tokens(
+        &state.conv.conversation.messages[cr.first_kept_index..],
+    );
+    send_event(
+        &state.frame.event_tx,
+        AgentEvent::CompactionEnd {
+            tokens_before: cr.tokens_before,
+            tokens_after,
+        },
+    );
+    crate::core::compaction::apply_compaction_result(
+        &mut state.conv.conversation.messages,
+        &mut state.conv.conversation.previous_summary,
+        cr,
+    );
+    Ok(())
+}
 
 async fn step_compaction(
     trigger: CompactionTrigger,
@@ -734,57 +624,29 @@ async fn step_compaction(
         } => custom_instructions.as_deref(),
         CompactionTrigger::Overflow { .. } => None,
     };
-    send_event(
-        &state.frame.event_tx,
-        AgentEvent::CompactionStart { reason },
-    );
 
-    let result = crate::core::compaction::compact(
-        &state.conv.conversation.messages,
-        &state.frame.config.compaction,
-        &state.frame.config,
-        &state.frame.transport,
-        state.conv.conversation.previous_summary.as_deref(),
-        custom_instructions,
-        cancel,
-    )
-    .await;
-
-    match result {
-        Ok(cr) => {
-            let tokens_after = crate::core::compaction::estimate_total_tokens(
-                &state.conv.conversation.messages[cr.first_kept_index..],
-            );
-            send_event(
-                &state.frame.event_tx,
-                AgentEvent::CompactionEnd {
-                    tokens_before: cr.tokens_before,
-                    tokens_after,
-                },
-            );
-            crate::core::compaction::apply_compaction_result(
-                &mut state.conv.conversation.messages,
-                &mut state.conv.conversation.previous_summary,
-                cr,
-            );
-
-            match trigger {
-                CompactionTrigger::Manual { reply, .. } => {
-                    let _ = reply.send(PromptResult { result: Ok(()) });
-                    Phase::Idle
-                }
-                CompactionTrigger::Overflow {
-                    resume_pending: (pending, first_user_message),
-                } => {
-                    // Overflow recovery — reset turns and retry.
-                    *turn_number = 0;
-                    Phase::Turn(Turn {
-                        first_user_message,
-                        sub: TurnSub::Prepare { pending },
-                    })
-                }
+    match run_compaction_pass(state, reason, custom_instructions, cancel).await {
+        Ok(()) => match trigger {
+            CompactionTrigger::Manual { reply, .. } => {
+                let _ = reply.send(PromptResult { result: Ok(()) });
+                Phase::Idle
             }
-        }
+            CompactionTrigger::Overflow {
+                resume_pending: (pending, first_user_message),
+                commit_on_success,
+            } => {
+                // Commit what the overflowing turn had produced
+                // (e.g. a meaningful partial) now that the
+                // compacted history has room, then reset turns
+                // and retry.
+                t::apply_pending(&mut state.conv, &commit_on_success);
+                *turn_number = 0;
+                Phase::Turn(Turn {
+                    first_user_message,
+                    sub: TurnSub::Prepare { pending },
+                })
+            }
+        },
         Err(e) => {
             send_event(
                 &state.frame.event_tx,
@@ -812,41 +674,8 @@ async fn step_compaction(
 /// the loop continues — the conversation isn't lost, it just stays
 /// larger than ideal until the next opportunity.
 async fn run_proactive_compaction(state: &mut State, cancel: &CancellationToken) {
-    send_event(
-        &state.frame.event_tx,
-        AgentEvent::CompactionStart {
-            reason: CompactionReason::Threshold,
-        },
-    );
-    let result = crate::core::compaction::compact(
-        &state.conv.conversation.messages,
-        &state.frame.config.compaction,
-        &state.frame.config,
-        &state.frame.transport,
-        state.conv.conversation.previous_summary.as_deref(),
-        None,
-        cancel,
-    )
-    .await;
-    match result {
-        Ok(cr) => {
-            let tokens_after = crate::core::compaction::estimate_total_tokens(
-                &state.conv.conversation.messages[cr.first_kept_index..],
-            );
-            send_event(
-                &state.frame.event_tx,
-                AgentEvent::CompactionEnd {
-                    tokens_before: cr.tokens_before,
-                    tokens_after,
-                },
-            );
-            crate::core::compaction::apply_compaction_result(
-                &mut state.conv.conversation.messages,
-                &mut state.conv.conversation.previous_summary,
-                cr,
-            );
-        }
-        Err(e) => tracing::warn!("Proactive compaction failed: {e}"),
+    if let Err(e) = run_compaction_pass(state, CompactionReason::Threshold, None, cancel).await {
+        tracing::warn!("Proactive compaction failed: {e}");
     }
 }
 
@@ -879,7 +708,7 @@ fn handle_idle_command(
                 *guard = fresh;
             }
             *turn_number = 0;
-            state.conv.conversation.error = None;
+            t::apply_clear_error(&mut state.conv);
             send_event(&state.frame.event_tx, AgentEvent::AgentStart);
 
             let user_message = Message::User {
@@ -894,19 +723,12 @@ fn handle_idle_command(
             })
         }
         Command::Compact {
-            reason: _,
             custom_instructions,
             reply,
-        } => {
-            // The `reason` field on Command::Compact is informational
-            // for the host; the actor emits `CompactionStart` with
-            // `Manual` since this entry point is manual by
-            // construction.
-            Phase::Compaction(CompactionTrigger::Manual {
-                custom_instructions,
-                reply,
-            })
-        }
+        } => Phase::Compaction(CompactionTrigger::Manual {
+            custom_instructions,
+            reply,
+        }),
         other => {
             handle_busy_command(state, other);
             Phase::Idle
@@ -970,8 +792,8 @@ fn handle_busy_command(state: &mut State, cmd: Command) {
         Command::SetReasoning(l) => state.frame.config.reasoning = l,
         Command::SetCompactionConfig(c) => state.frame.config.compaction = c,
         Command::SetApprovalPolicy(p) => state.frame.approval_policy = p,
-        Command::Steer(msg) => state.conv.steering_queue.push(msg),
-        Command::FollowUp(msg) => state.conv.follow_up_queue.push(msg),
+        Command::Steer(msg) => t::apply_enqueue_steering(&mut state.conv, msg),
+        Command::FollowUp(msg) => t::apply_enqueue_follow_up(&mut state.conv, msg),
         // Reject concurrent prompts / manual compactions.
         Command::Prompt { reply, .. } => {
             let _ = reply.send(PromptResult {
@@ -984,403 +806,6 @@ fn handle_busy_command(state: &mut State, cmd: Command) {
             });
         }
     }
-}
-
-// ─── Approval gates ──────────────────────────────────────────────────
-
-fn synth_rejection(tc: &ToolCall, reason: &str) -> (String, String, ToolResult) {
-    (
-        tc.id.clone(),
-        tc.name.clone(),
-        ToolResult::error(format!("Tool call rejected: {reason}")),
-    )
-}
-
-/// Classify each tool call against the policy. Sends a `Typed
-/// {schema_id: "tool.confirm"}` interaction request for each `Gate`
-/// decision via `try_send` (saturated channel ⇒ synthetic rejection).
-/// Returns the initial `ToolPhase::AwaitingApproval` — caller wraps
-/// in a `Turn` so `first_user_message` lives on the outer struct.
-fn classify_and_enter_approval(
-    state: &State,
-    tool_calls: Vec<ToolCall>,
-    groups: Vec<Vec<usize>>,
-) -> ToolPhase {
-    let mut pre_results: HashMap<usize, (String, String, ToolResult)> = HashMap::new();
-    let mut dispatch: HashSet<usize> = HashSet::new();
-    let pending_gates: FuturesUnordered<GateFuture> = FuturesUnordered::new();
-
-    for (idx, tc) in tool_calls.iter().enumerate() {
-        let tool = state
-            .frame
-            .tools
-            .iter()
-            .find(|t| t.name() == tc.name)
-            .cloned();
-        let risk = tool
-            .as_ref()
-            .map(|t| t.risk(&tc.args))
-            .unwrap_or(ToolRisk::Local);
-        let activity = tool
-            .as_ref()
-            .map(|t| t.activity_description(&tc.args))
-            .unwrap_or_else(|| format!("Running {}", tc.name));
-
-        match state
-            .frame
-            .approval_policy
-            .classify(&tc.name, &tc.args, risk)
-        {
-            ApprovalDecision::Auto => {
-                emit_resolved(
-                    &state.frame,
-                    &tc.id,
-                    &tc.name,
-                    ToolApprovalOutcome::AutoApproved,
-                );
-                dispatch.insert(idx);
-            }
-            ApprovalDecision::Reject(reason) => {
-                emit_resolved(
-                    &state.frame,
-                    &tc.id,
-                    &tc.name,
-                    ToolApprovalOutcome::Rejected {
-                        reason: reason.clone(),
-                    },
-                );
-                pre_results.insert(idx, synth_rejection(tc, &reason));
-            }
-            ApprovalDecision::Gate => {
-                let Some(ref interaction_tx) = state.frame.interaction_tx else {
-                    let reason = "no interaction channel".to_string();
-                    emit_resolved(
-                        &state.frame,
-                        &tc.id,
-                        &tc.name,
-                        ToolApprovalOutcome::Rejected {
-                            reason: reason.clone(),
-                        },
-                    );
-                    pre_results.insert(idx, synth_rejection(tc, &reason));
-                    continue;
-                };
-                let (response_tx, response_rx) = oneshot::channel();
-                let request = InteractionRequest {
-                    agent_id: None,
-                    kind: InteractionKind::Typed {
-                        schema_id: "tool.confirm".into(),
-                        payload: serde_json::json!({
-                            "tool_call_id": tc.id.clone(),
-                            "tool_name": tc.name.clone(),
-                            "arguments": tc.args.clone(),
-                            "activity": activity,
-                            "risk": risk,
-                        }),
-                    },
-                    response_tx,
-                };
-
-                match interaction_tx.try_send(request) {
-                    Ok(()) => {
-                        let id = tc.id.clone();
-                        let name = tc.name.clone();
-                        let timeout = state.frame.interaction_timeout;
-                        pending_gates.push(Box::pin(async move {
-                            let resp = await_gate_response(response_rx, timeout).await;
-                            (idx, id, name, resp)
-                        }));
-                    }
-                    Err(_) => {
-                        let reason = "interaction channel saturated or closed".to_string();
-                        emit_resolved(
-                            &state.frame,
-                            &tc.id,
-                            &tc.name,
-                            ToolApprovalOutcome::Rejected {
-                                reason: reason.clone(),
-                            },
-                        );
-                        pre_results.insert(idx, synth_rejection(tc, &reason));
-                    }
-                }
-            }
-        }
-    }
-
-    ToolPhase::AwaitingApproval {
-        tool_calls,
-        groups,
-        pre_results,
-        dispatch,
-        pending_gates,
-    }
-}
-
-/// Await a gate's response receiver, optionally bounded by a timeout.
-///
-/// On timeout, returns `Ok(Rejected { reason })` so the gate is
-/// rejected with a clear attribution rather than getting mixed in with
-/// user-initiated cancellations or channel-closed errors. The tool is
-/// fed back the same synthesized error path used for any other
-/// rejection — the host doesn't have to special-case timeouts.
-///
-/// The `response_rx` is dropped on timeout. If the host eventually
-/// calls `send` on its `response_tx`, the send fails silently, matching
-/// the existing "host replied after the actor moved on" semantics.
-async fn await_gate_response(
-    response_rx: oneshot::Receiver<InteractionResponse>,
-    timeout: Option<std::time::Duration>,
-) -> std::result::Result<InteractionResponse, oneshot::error::RecvError> {
-    match timeout {
-        Some(dur) => match tokio::time::timeout(dur, response_rx).await {
-            Ok(r) => r,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    timeout_ms = dur.as_millis() as u64,
-                    "interaction request timed out; rejecting tool call"
-                );
-                Ok(InteractionResponse::Rejected {
-                    reason: format!("interaction timed out after {dur:?}"),
-                })
-            }
-        },
-        None => response_rx.await,
-    }
-}
-
-fn emit_resolved(frame: &Frame, id: &str, name: &str, outcome: ToolApprovalOutcome) {
-    send_event(
-        &frame.event_tx,
-        AgentEvent::ToolApprovalResolved {
-            tool_call_id: id.into(),
-            tool_name: name.into(),
-            outcome,
-        },
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_gate_response(
-    state: &State,
-    idx: usize,
-    id: String,
-    name: String,
-    resp: std::result::Result<InteractionResponse, oneshot::error::RecvError>,
-    tool_calls: &[ToolCall],
-    pre_results: &mut HashMap<usize, (String, String, ToolResult)>,
-    dispatch: &mut HashSet<usize>,
-) {
-    let outcome = match resp {
-        Ok(InteractionResponse::Approved { .. }) => Ok(()),
-        Ok(InteractionResponse::Rejected { reason }) => Err(reason),
-        Ok(InteractionResponse::Cancelled) => Err("cancelled".into()),
-        Ok(InteractionResponse::Answer(_)) => Err("unexpected response to tool.confirm".into()),
-        Err(_) => Err("interaction channel closed".into()),
-    };
-    match outcome {
-        Ok(()) => {
-            emit_resolved(&state.frame, &id, &name, ToolApprovalOutcome::Approved);
-            dispatch.insert(idx);
-        }
-        Err(reason) => {
-            emit_resolved(
-                &state.frame,
-                &id,
-                &name,
-                ToolApprovalOutcome::Rejected {
-                    reason: reason.clone(),
-                },
-            );
-            pre_results.insert(idx, synth_rejection(&tool_calls[idx], &reason));
-        }
-    }
-}
-
-fn finalize_approval(
-    state: &State,
-    tool_calls: Vec<ToolCall>,
-    groups: Vec<Vec<usize>>,
-    pre_results: HashMap<usize, (String, String, ToolResult)>,
-    dispatch: &HashSet<usize>,
-    first_user_message: Option<Message>,
-    cancel: &CancellationToken,
-) -> Phase {
-    let mut filtered: Vec<Vec<usize>> = groups
-        .into_iter()
-        .map(|g| g.into_iter().filter(|i| dispatch.contains(i)).collect())
-        .filter(|g: &Vec<usize>| !g.is_empty())
-        .collect();
-
-    if filtered.is_empty() {
-        return Phase::Turn(Turn {
-            first_user_message,
-            sub: TurnSub::Tool(ToolPhase::Applying {
-                tool_calls,
-                results_map: pre_results,
-            }),
-        });
-    }
-
-    let first = filtered.remove(0);
-    let join_set = spawn_group(state, &tool_calls, &first, cancel);
-    Phase::Turn(Turn {
-        first_user_message,
-        sub: TurnSub::Tool(ToolPhase::Executing {
-            join_set,
-            remaining_groups: filtered,
-            all_tool_calls: tool_calls,
-            results_map: pre_results,
-        }),
-    })
-}
-
-// ─── Tool execution ─────────────────────────────────────────────────
-
-fn spawn_group(
-    state: &State,
-    tool_calls: &[ToolCall],
-    group: &[usize],
-    cancel: &CancellationToken,
-) -> tokio::task::JoinSet<(usize, String, String, ToolResult)> {
-    let mut join_set = tokio::task::JoinSet::new();
-    let cwd = state
-        .conv
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let agent_id = state.shared.agent_id.get().cloned();
-
-    for &idx in group {
-        let tc = &tool_calls[idx];
-        let tool = state
-            .frame
-            .tools
-            .iter()
-            .find(|t| t.name() == tc.name)
-            .cloned();
-        let validator_and_schema = state.frame.schema_cache.get(&tc.name).cloned();
-        let event_tx = state.frame.event_tx.clone();
-        let cancel = cancel.clone();
-        let file_access = state.frame.file_access.clone();
-        let interaction_tx = state.frame.interaction_tx.clone();
-        let cwd = cwd.clone();
-        let agent_id = agent_id.clone();
-        let subagent_depth = state.frame.subagent_depth;
-
-        let id = tc.id.clone();
-        let name = tc.name.clone();
-        let args = tc.args.clone();
-
-        let progress = ProgressSender::new(event_tx.clone(), &id, &name);
-        let ctx = ExecutionContext {
-            cwd,
-            cancel,
-            progress,
-            interaction: interaction_tx,
-            interaction_timeout: state.frame.interaction_timeout,
-            file_access,
-            agent_id,
-            subagent_depth,
-        };
-
-        join_set.spawn(async move {
-            let result = run_single_tool(
-                tool,
-                id.clone(),
-                name.clone(),
-                args,
-                validator_and_schema,
-                event_tx,
-                ctx,
-            )
-            .await;
-            (idx, id, name, result)
-        });
-    }
-
-    join_set
-}
-
-async fn run_single_tool(
-    tool: Option<crate::core::tool::BoxedTool>,
-    id: String,
-    name: String,
-    args: serde_json::Value,
-    validator_and_schema: Option<(
-        std::sync::Arc<jsonschema::Validator>,
-        std::sync::Arc<serde_json::Value>,
-    )>,
-    event_tx: tokio::sync::broadcast::Sender<AgentEvent>,
-    ctx: ExecutionContext,
-) -> ToolResult {
-    let activity = tool
-        .as_ref()
-        .map(|t| t.activity_description(&args))
-        .unwrap_or_else(|| format!("Running {}", name));
-    send_event(
-        &event_tx,
-        AgentEvent::ToolExecutionStart {
-            tool_call_id: id.clone(),
-            tool_name: name.clone(),
-            arguments: args.clone(),
-            activity,
-        },
-    );
-
-    let result = if let Some(tool) = tool {
-        let validation_error =
-            validator_and_schema.and_then(|(v, schema)| validate_with(&args, &v, &schema));
-        if let Some(err) = validation_error {
-            ToolResult::error(err)
-        } else {
-            tool.execute(args, ctx).await
-        }
-    } else {
-        ToolResult::error(format!("Tool not found: {}", name))
-    };
-
-    send_event(
-        &event_tx,
-        AgentEvent::ToolExecutionEnd {
-            tool_call_id: id,
-            tool_name: name,
-            result: result.text_content(),
-            is_error: result.is_error,
-        },
-    );
-    result
-}
-
-fn validate_with(
-    args: &serde_json::Value,
-    validator: &jsonschema::Validator,
-    schema: &serde_json::Value,
-) -> Option<String> {
-    let errs: Vec<String> = validator
-        .iter_errors(args)
-        .map(|e| {
-            let p = e.instance_path().to_string();
-            if p.is_empty() {
-                e.to_string()
-            } else {
-                format!("{p}: {e}")
-            }
-        })
-        .collect();
-    if errs.is_empty() {
-        return None;
-    }
-    // Include the schema so the LLM can self-correct on the next call.
-    // Terse JSON keeps the token cost low; the model already sees this
-    // schema in the tool definition but echoing it on failure has been
-    // observed to break wrong-shape loops materially faster.
-    let schema_str = serde_json::to_string(schema).unwrap_or_else(|_| "<unavailable>".into());
-    Some(format!(
-        "Tool argument validation failed:\n{}\nExpected schema: {}",
-        errs.join("\n"),
-        schema_str
-    ))
 }
 
 // ─── Final summary on max-turns ─────────────────────────────────────
@@ -1427,7 +852,7 @@ async fn run_final_summary(
         let outcome = reducer.finalize();
         t::apply_usage(&mut state.conv, &outcome.usage);
         if let Some(msg) = outcome.assistant_message {
-            state.conv.conversation.messages.push(msg);
+            t::apply_final_summary(&mut state.conv, msg);
         }
     }
 }

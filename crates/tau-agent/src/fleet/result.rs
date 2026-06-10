@@ -16,7 +16,7 @@ pub struct SubagentResult {
     /// regardless of whether each invocation produced a
     /// `ToolExecutionEnd` event.
     ///
-    /// Cross-reference: [`crate::fleet::AgentSnapshot::tool_use_count`]
+    /// Cross-reference: [`crate::AgentSnapshot::tool_use_count`]
     /// counts the same concept but from the other side of the wire —
     /// it increments on every `ToolExecutionEnd` event seen by the
     /// fleet bus. The two should usually agree but can diverge if a

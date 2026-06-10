@@ -24,7 +24,8 @@ use crate::types::events::{AgentEvent, FleetEvent};
 /// Default capacity of the per-subagent interaction router's mpsc
 /// channel. Reached when a subagent issues many concurrent gated tool
 /// calls before the host UI drains them. Override via
-/// [`AgentManager::with_interaction_router_capacity`] when the host
+/// [`AgentManager::with_interaction_router_capacity`](crate::AgentManager::with_interaction_router_capacity)
+/// when the host
 /// expects bursts.
 pub const DEFAULT_INTERACTION_ROUTER_CAPACITY: usize = 64;
 

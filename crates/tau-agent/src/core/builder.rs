@@ -1,8 +1,10 @@
 //! `AgentBuilder` — configure and spawn an agent.
 //!
 //! Shared primitives (channels, atomics) are created eagerly so
-//! [`Self::handle`] can return a working `AgentHandle` *before*
-//! [`Self::spawn`] consumes the builder. Used by:
+//! [`AgentBuilder::handle`](crate::AgentBuilder::handle) can return a
+//! working `AgentHandle` *before*
+//! [`AgentBuilder::spawn`](crate::AgentBuilder::spawn) consumes the
+//! builder. Used by:
 //!
 //! - The fleet manager, which stamps the agent's id on the handle's
 //!   shared cell before consuming the builder.
@@ -60,7 +62,7 @@ pub enum AgentSeed {
     },
     /// Clone another tracked agent's current message history at spawn
     /// time. The named id must be in
-    /// [`AgentManager`](crate::fleet::AgentManager)'s registry (idle,
+    /// [`AgentManager`](crate::AgentManager)'s registry (idle,
     /// running, or adopted) when the fleet resolves this variant.
     Inherit { agent_id: String },
 }

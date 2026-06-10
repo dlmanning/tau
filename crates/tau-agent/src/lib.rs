@@ -32,7 +32,9 @@ pub use crate::core::approval::{
 };
 pub use crate::core::builder::{AgentBuilder, AgentSeed};
 pub use crate::core::command::PromptResult;
-pub use crate::core::compaction::{CompactionConfig, CompactionReason, CompactionThreshold};
+pub use crate::core::compaction::{
+    CompactionConfig, CompactionReason, CompactionThreshold, summary_message,
+};
 pub use crate::core::config::{AgentConfig, AgentConfigBuilder, DequeueMode};
 pub use crate::core::handle::AgentHandle;
 pub use crate::core::interaction::{
@@ -52,6 +54,7 @@ pub use crate::types::events::{
 pub use crate::types::health::AgentHealth;
 pub use crate::types::info::{ContextStats, ToolInfo};
 
+pub use crate::fleet::SubagentMessageExt;
 pub use crate::fleet::manager::{AgentManager, AgentSpec, AgentStatus, Isolation, SpawnOpts};
 pub use crate::fleet::registry::Located;
 pub use crate::fleet::result::SubagentResult;
