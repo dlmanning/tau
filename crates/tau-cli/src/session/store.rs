@@ -279,15 +279,24 @@ impl SessionManager {
             return None;
         };
 
-        let message_count = lines
-            .map_while(Result::ok)
-            .filter(|l| {
-                matches!(
-                    serde_json::from_str::<SessionEntry>(l),
-                    Ok(SessionEntry::Message { .. })
-                )
-            })
-            .count();
+        let mut message_count = 0;
+        let mut preview = String::new();
+        for line in lines.map_while(Result::ok) {
+            if let Ok(SessionEntry::Message { message, .. }) =
+                serde_json::from_str::<SessionEntry>(&line)
+            {
+                message_count += 1;
+                // First user message = what the session was about.
+                if preview.is_empty() && message.role() == "user" {
+                    preview = message
+                        .text()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+        }
 
         Some(SessionInfo {
             id,
@@ -295,9 +304,45 @@ impl SessionManager {
             model,
             working_dir,
             message_count,
+            preview,
         })
     }
 
+    /// Resolve a session id or unique prefix to a full session id.
+    pub fn resolve_id(prefix: &str) -> std::io::Result<String> {
+        let sessions_dir = Self::sessions_dir();
+        if sessions_dir.join(format!("{prefix}.jsonl")).exists() {
+            return Ok(prefix.to_string());
+        }
+        let mut matches: Vec<String> = Vec::new();
+        if sessions_dir.exists() {
+            for entry in fs::read_dir(&sessions_dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && stem.starts_with(prefix)
+                {
+                    matches.push(stem.to_string());
+                }
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.pop().unwrap()),
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No session matches '{prefix}'. Run `tau sessions ls` to see saved sessions."),
+            )),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Session prefix '{prefix}' is ambiguous; matches:\n  {}",
+                    matches.join("\n  ")
+                ),
+            )),
+        }
+    }
 }
 
 /// Rebuild the in-memory message list from the log's `Message` entries
@@ -328,6 +373,9 @@ pub struct SessionInfo {
     pub model: String,
     pub working_dir: String,
     pub message_count: usize,
+    /// First line of the first user message — what the session was
+    /// about, so `sessions ls` is more than a wall of UUIDs.
+    pub preview: String,
 }
 
 impl SessionInfo {

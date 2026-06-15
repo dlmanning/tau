@@ -35,6 +35,24 @@ pub(super) struct PendingPlan {
     pub scroll: u16,
 }
 
+/// A `tool.confirm` gate awaiting the user's decision. Rendered as a
+/// centered overlay by `render_approval_modal`. Gates can arrive
+/// concurrently (parallel tool batches, subagents), so `TuiState`
+/// queues them and shows one at a time.
+pub(super) struct PendingApproval {
+    pub tool_name: String,
+    /// Human-readable activity string from the tool (what it's about
+    /// to do).
+    pub activity: String,
+    /// Risk classification as reported by the gate payload.
+    pub risk: String,
+    /// Pretty-printed tool arguments.
+    pub args: String,
+    pub response_tx: tokio::sync::oneshot::Sender<tau_agent::InteractionResponse>,
+    /// Vertical scroll position in the args body.
+    pub scroll: u16,
+}
+
 /// Messages sent from UI to agent handler
 #[derive(Debug)]
 pub enum UiMessage {

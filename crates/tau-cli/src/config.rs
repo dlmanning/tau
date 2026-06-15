@@ -21,6 +21,9 @@ pub struct Config {
     pub thinking_adaptive: Option<bool>,
     /// Whether to use TUI mode by default
     pub tui: Option<bool>,
+    /// UI color theme: "dark" (default) or "light". `NO_COLOR` in the
+    /// environment overrides both with a monochrome theme.
+    pub theme: Option<String>,
     /// API keys (alternative to environment variables)
     #[serde(default)]
     pub api_keys: ApiKeys,
@@ -145,6 +148,15 @@ impl Config {
                 ),
             }
         }
+        if let Some(ref theme) = self.theme {
+            match theme.as_str() {
+                "dark" | "light" => {}
+                _ => anyhow::bail!(
+                    "Invalid theme '{}' in config. Valid values: dark, light",
+                    theme
+                ),
+            }
+        }
         for (name, server) in &self.mcp_servers {
             let name_ok = !name.is_empty()
                 && name.len() <= 32
@@ -250,6 +262,7 @@ impl Config {
             reasoning_level: Some("off".to_string()),
             thinking_adaptive: None,
             tui: Some(true),
+            theme: None,
             api_keys: ApiKeys::default(),
             compaction: None,
             cache: None,
@@ -418,6 +431,10 @@ reasoning_level = "off"
 # Whether to use TUI mode by default (true by default)
 # Set to false for simple stdin/stdout mode
 tui = true
+
+# UI color theme: "dark" (default) or "light".
+# Setting the NO_COLOR environment variable overrides both (monochrome).
+# theme = "dark"
 
 # MCP servers (optional). Tools appear to the agent as mcp__<server>__<tool>.
 # Values support ${VAR} expansion from the environment at connect time.

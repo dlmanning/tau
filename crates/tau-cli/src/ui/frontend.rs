@@ -29,7 +29,7 @@ use crate::driver::{Frontend, FrontendAction, SessionStart, UserInput};
 use super::constants;
 use super::input::{Action, key_to_action};
 use super::state::TuiState;
-use super::types::{PendingInteraction, PendingPlan, PlanModalMode, UiMessage};
+use super::types::{PendingApproval, PendingInteraction, PendingPlan, PlanModalMode, UiMessage};
 use super::widgets::{SelectorState, message_list::ChatMessage};
 
 /// Minimum gap between redraws — ~60fps. Coalesces rapid `render_event`
@@ -68,6 +68,7 @@ impl TuiFrontend {
     pub async fn new(
         config: &tau_agent::AgentConfig,
         available_models: Vec<Model>,
+        theme: crate::ui::theme::Theme,
     ) -> anyhow::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
@@ -99,7 +100,7 @@ impl TuiFrontend {
         }));
 
         let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>(constants::UI_CHANNEL_CAPACITY);
-        let state = TuiState::new(config, available_models.clone(), ui_tx);
+        let state = TuiState::new(config, available_models.clone(), ui_tx, theme);
 
         // Background task: pumps crossterm events into an mpsc so we
         // don't lose keypresses while the `Session` is busy.
@@ -262,6 +263,76 @@ impl TuiFrontend {
         }
     }
 
+    /// Approval-modal key handler. Active while a `tool.confirm` gate
+    /// is queued (and no plan modal is up). Returns `true` if the key
+    /// was consumed.
+    ///
+    /// * `y` / `a` — approve this call.
+    /// * `n` / `d` / `Esc` — deny this call.
+    /// * `s` — approve and auto-approve this tool for the session.
+    /// * arrows / PgUp / PgDn — scroll the argument body.
+    fn handle_approval_modal_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        if self.state.pending_approvals.is_empty() {
+            return false;
+        }
+        let action = key_to_action(key);
+        match action {
+            Action::Char('y') | Action::Char('Y') | Action::Char('a') | Action::Char('A') => {
+                if let Some(pa) = self.state.pending_approvals.pop_front() {
+                    let _ = pa
+                        .response_tx
+                        .send(InteractionResponse::Approved { payload: None });
+                    self.state.status = format!("Approved {}", pa.tool_name);
+                }
+            }
+            Action::Char('s') | Action::Char('S') => {
+                if let Some(pa) = self.state.pending_approvals.pop_front() {
+                    let _ = pa
+                        .response_tx
+                        .send(InteractionResponse::Approved { payload: None });
+                    self.state.status =
+                        format!("Approved {} (always this session)", pa.tool_name);
+                    self.pending_action = Some(FrontendAction::AlwaysAllowTool(pa.tool_name));
+                }
+            }
+            Action::Char('n') | Action::Char('N') | Action::Char('d') | Action::Char('D')
+            | Action::Escape => {
+                if let Some(pa) = self.state.pending_approvals.pop_front() {
+                    let _ = pa.response_tx.send(InteractionResponse::Rejected {
+                        reason: "User denied".into(),
+                    });
+                    self.state.status = format!("Denied {}", pa.tool_name);
+                }
+            }
+            Action::Up => {
+                if let Some(pa) = self.state.pending_approvals.front_mut() {
+                    pa.scroll = pa.scroll.saturating_sub(1);
+                }
+            }
+            Action::Down => {
+                if let Some(pa) = self.state.pending_approvals.front_mut() {
+                    pa.scroll = pa.scroll.saturating_add(1);
+                }
+            }
+            Action::PageUp => {
+                if let Some(pa) = self.state.pending_approvals.front_mut() {
+                    pa.scroll = pa.scroll.saturating_sub(10);
+                }
+            }
+            Action::PageDown => {
+                if let Some(pa) = self.state.pending_approvals.front_mut() {
+                    pa.scroll = pa.scroll.saturating_add(10);
+                }
+            }
+            // Swallow everything else: the modal owns the keyboard.
+            // (Interrupt is deliberately NOT consumed so Ctrl-C can
+            // still abort the whole prompt with the gate pending.)
+            Action::Interrupt => return false,
+            _ => {}
+        }
+        true
+    }
+
     /// Handle a crossterm event while a prompt is executing. Returns
     /// `Some` for events the Session needs to react to (Abort, Steer,
     /// Quit). Other events mutate `self.state` directly.
@@ -270,6 +341,13 @@ impl TuiFrontend {
         if let Event::Key(key) = event
             && self.state.pending_plan.is_some()
             && self.handle_plan_modal_key(key, area_width)
+        {
+            return None;
+        }
+        // Approval modal is next in precedence.
+        if let Event::Key(key) = event
+            && !self.state.pending_approvals.is_empty()
+            && self.handle_approval_modal_key(key)
         {
             return None;
         }
@@ -313,11 +391,10 @@ impl TuiFrontend {
                     }
                     Action::Quit => Some(UserInput::Quit),
                     Action::Submit => {
-                        let content = self.state.input.content().to_string();
-                        if content.is_empty() {
+                        if self.state.input.content().is_empty() {
                             return None;
                         }
-                        self.state.input.clear();
+                        let content = self.state.input.commit();
                         self.state.messages.push(ChatMessage {
                             role: "steer".to_string(),
                             content: content.clone(),
@@ -382,6 +459,15 @@ impl Frontend for TuiFrontend {
                 event = self.crossterm_rx.recv() => {
                     match event {
                         Some(ev) => {
+                            // Approval gates can arrive while idle too
+                            // (e.g. a background subagent hits one);
+                            // the modal owns the keyboard when active.
+                            if let Event::Key(key) = ev
+                                && !self.state.pending_approvals.is_empty()
+                                && self.handle_approval_modal_key(key)
+                            {
+                                continue;
+                            }
                             // handle_event_while_idle returns false on
                             // Quit; in that case the action handler has
                             // already pushed UiMessage::Quit to ui_tx,
@@ -443,16 +529,36 @@ impl Frontend for TuiFrontend {
             }
             InteractionKind::Typed { schema_id, payload } => match schema_id.as_str() {
                 "tool.confirm" => {
-                    // Should not fire: TuiFrontend reports
-                    // can_render_approval() == false, so Session
-                    // installs AutoAcceptAll.
                     let tool_name = payload
                         .get("tool_name")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    self.state.status = format!("Unexpected tool.confirm for {tool_name}");
-                    let _ = req.response_tx.send(InteractionResponse::Rejected {
-                        reason: "TUI confirm not implemented".into(),
+                        .unwrap_or("?")
+                        .to_string();
+                    let activity = payload
+                        .get("activity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let risk = payload
+                        .get("risk")
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| v.to_string())
+                        })
+                        .unwrap_or_default();
+                    let args = payload
+                        .get("arguments")
+                        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                        .unwrap_or_default();
+                    self.state.status = format!("Approval required: {tool_name}");
+                    self.state.pending_approvals.push_back(PendingApproval {
+                        tool_name,
+                        activity,
+                        risk,
+                        args,
+                        response_tx: req.response_tx,
+                        scroll: 0,
                     });
                     self.redraw();
                 }
@@ -493,7 +599,7 @@ impl Frontend for TuiFrontend {
     }
 
     fn can_render_approval(&self) -> bool {
-        false
+        true
     }
 
     fn take_action(&mut self) -> Option<FrontendAction> {

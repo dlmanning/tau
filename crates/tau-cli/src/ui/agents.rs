@@ -328,7 +328,12 @@ mod tests {
 
     fn test_state() -> TuiState {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        TuiState::new(&make_test_config(), vec![make_test_model()], tx)
+        TuiState::new(
+            &make_test_config(),
+            vec![make_test_model()],
+            tx,
+            crate::ui::theme::Theme::dark(),
+        )
     }
 
     fn started(agent_id: &str) -> FleetEvent {

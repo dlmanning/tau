@@ -41,6 +41,8 @@ impl TuiState {
 
         if self.pending_plan.is_some() {
             self.render_plan_modal(frame, size);
+        } else if !self.pending_approvals.is_empty() {
+            self.render_approval_modal(frame, size);
         } else if self.pending_interaction.is_some() {
             self.render_question_selector(frame, size);
         } else if self.model_selector.visible {
@@ -48,6 +50,93 @@ impl TuiState {
         } else if self.branch_selector.visible {
             self.render_branch_selector(frame, size);
         }
+    }
+
+    /// Centered overlay for the active `tool.confirm` gate: tool name,
+    /// risk, activity, scrollable pretty-printed arguments, and a
+    /// `[Y]es / [N]o / [S] always` footer. Queued gates are counted in
+    /// the title.
+    fn render_approval_modal(&self, frame: &mut Frame, area: Rect) {
+        let Some(pa) = self.pending_approvals.front() else {
+            return;
+        };
+
+        // Centered box: ~70% wide, ~60% tall, clamped to sane minima.
+        let w = (area.width as u32 * 70 / 100).max(40).min(area.width as u32) as u16;
+        let h = (area.height as u32 * 60 / 100).max(10).min(area.height as u32) as u16;
+        let modal = Rect {
+            x: area.x + (area.width.saturating_sub(w)) / 2,
+            y: area.y + (area.height.saturating_sub(h)) / 2,
+            width: w,
+            height: h,
+        };
+        frame.render_widget(ratatui::widgets::Clear, modal);
+
+        let queued = self.pending_approvals.len() - 1;
+        let mut title_spans = vec![
+            Span::raw(" "),
+            Span::styled(
+                "Tool Approval",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if queued > 0 {
+            title_spans.push(Span::raw(format!(" (+{queued} queued)")));
+        }
+        title_spans.push(Span::raw(" "));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border_style())
+            .title(Line::from(title_spans));
+        let inner = block.inner(modal);
+        frame.render_widget(block, modal);
+        if inner.height < 4 {
+            return;
+        }
+
+        // Header lines + scrollable args body + footer.
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::styled(&pa.tool_name, self.theme.accent_bold()),
+                Span::styled(format!("  [{}]", pa.risk), self.theme.error_style()),
+            ]),
+            Line::from(Span::styled(pa.activity.clone(), self.theme.base_style())),
+            Line::from(""),
+        ];
+        for arg_line in pa.args.lines().skip(pa.scroll as usize) {
+            lines.push(Line::from(Span::styled(
+                arg_line.to_string(),
+                self.theme.dim_style(),
+            )));
+        }
+        let body = Rect {
+            height: inner.height - 1,
+            ..inner
+        };
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(lines)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            body,
+        );
+
+        let footer = Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(Line::from(vec![
+                Span::styled("[Y]", self.theme.accent_bold()),
+                Span::styled("es allow once · ", self.theme.dim_style()),
+                Span::styled("[N]", self.theme.accent_bold()),
+                Span::styled("o deny · ", self.theme.dim_style()),
+                Span::styled("[S]", self.theme.accent_bold()),
+                Span::styled(" always allow this session · ↑↓ scroll", self.theme.dim_style()),
+            ])),
+            footer,
+        );
     }
 
     fn render_question_selector(&self, frame: &mut Frame, area: Rect) {

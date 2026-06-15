@@ -15,3 +15,10 @@
 
 # Working notes
 /plans/
+
+# Local scratch / research data
+/strings/
+
+# Agent worktrees and harness state
+.claude/worktrees/
+.claude/scheduled_tasks.lock

@@ -89,11 +89,18 @@ pub fn key_to_action(event: KeyEvent) -> Action {
     }
 
     if modifiers.contains(KeyModifiers::ALT) {
-        return Action::Unknown;
+        return match code {
+            // Alt+Enter inserts a newline (Shift+Enter below works
+            // only on terminals that report it; Alt+Enter is the
+            // widely-supported fallback).
+            KeyCode::Enter => Action::Char('\n'),
+            _ => Action::Unknown,
+        };
     }
 
     match code {
         KeyCode::Char(c) => Action::Char(c),
+        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => Action::Char('\n'),
         KeyCode::Enter => Action::Submit,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::Delete,

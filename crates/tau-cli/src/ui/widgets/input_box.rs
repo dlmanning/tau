@@ -10,7 +10,9 @@ use unicode_width::UnicodeWidthStr;
 
 use super::super::{input::Action, theme::Theme};
 
-/// Single-line text input widget
+/// Text input widget. Renders as a single line (embedded newlines show
+/// as `⏎`), but the content — and therefore the submitted prompt —
+/// preserves newlines from pastes and Shift/Alt+Enter.
 #[derive(Debug, Default)]
 pub struct InputBox {
     /// Current input text
@@ -23,6 +25,22 @@ pub struct InputBox {
     placeholder: String,
     /// Whether the input is focused
     focused: bool,
+    /// Previously committed entries, oldest first.
+    history: Vec<String>,
+    /// `Some(i)` while browsing `history[i]` with Up/Down.
+    history_pos: Option<usize>,
+    /// The in-progress draft stashed while browsing history.
+    draft: String,
+}
+
+/// Display width of one char as the input box renders it: newlines
+/// render as the `⏎` glyph (width 1).
+fn char_display_width(c: char) -> usize {
+    if c == '\n' {
+        1
+    } else {
+        c.to_string().width()
+    }
 }
 
 impl InputBox {
@@ -76,8 +94,34 @@ impl InputBox {
         self.content
             .chars()
             .take(self.cursor)
-            .map(|c| c.to_string().width())
+            .map(char_display_width)
             .sum()
+    }
+
+    /// Commit the current content: push it to history (deduplicating
+    /// consecutive repeats), reset history browsing, clear the box,
+    /// and return the text.
+    pub fn commit(&mut self) -> String {
+        let text = self.content.clone();
+        if !text.trim().is_empty() && self.history.last() != Some(&text) {
+            self.history.push(text.clone());
+        }
+        self.history_pos = None;
+        self.draft.clear();
+        self.clear();
+        text
+    }
+
+    /// Load a history entry (or the stashed draft for `None`) into the
+    /// box with the cursor at the end.
+    fn load_history(&mut self, pos: Option<usize>, width: usize) {
+        self.history_pos = pos;
+        self.content = match pos {
+            Some(i) => self.history[i].clone(),
+            None => std::mem::take(&mut self.draft),
+        };
+        self.cursor = self.content.chars().count();
+        self.update_scroll(width);
     }
 
     /// Handle an input action
@@ -177,19 +221,39 @@ impl InputBox {
                 true
             }
             Action::Paste(text) => {
-                for c in text.chars() {
-                    if c == '\n' || c == '\r' {
-                        // Avoid double spaces from \r\n
-                        if !self.content.ends_with(' ') && self.cursor > 0 {
-                            self.insert_char(' ');
-                        }
-                    } else {
-                        self.insert_char(c);
-                    }
+                // Preserve newlines (normalized to `\n`) — pasted code
+                // must survive round-trip into the prompt.
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                for c in normalized.chars() {
+                    self.insert_char(c);
                 }
                 self.update_scroll(width as usize);
                 true
             }
+            Action::Up => {
+                let next = match self.history_pos {
+                    None if !self.history.is_empty() => {
+                        self.draft = self.content.clone();
+                        Some(self.history.len() - 1)
+                    }
+                    Some(i) if i > 0 => Some(i - 1),
+                    other => return other.is_some(), // top of history: consume; no history: pass
+                };
+                self.load_history(next, width as usize);
+                true
+            }
+            Action::Down => match self.history_pos {
+                Some(i) => {
+                    let next = if i + 1 < self.history.len() {
+                        Some(i + 1)
+                    } else {
+                        None // back to the stashed draft
+                    };
+                    self.load_history(next, width as usize);
+                    true
+                }
+                None => false,
+            },
             _ => false,
         }
     }
@@ -237,17 +301,19 @@ impl InputBox {
                     start_idx = i;
                     break;
                 }
-                current_width += c.to_string().width();
+                current_width += char_display_width(*c);
             }
 
             let mut visible = String::new();
             current_width = 0;
             for c in chars.iter().skip(start_idx) {
-                let char_width = c.to_string().width();
+                let char_width = char_display_width(*c);
                 if current_width + char_width > visible_width {
                     break;
                 }
-                visible.push(*c);
+                // Newlines are real data but render as a marker in the
+                // single-line view.
+                visible.push(if *c == '\n' { '⏎' } else { *c });
                 current_width += char_width;
             }
             visible
@@ -272,5 +338,66 @@ impl InputBox {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pasted multiline text must keep its newlines in the content
+    /// (the old behavior flattened them to spaces, corrupting code).
+    #[test]
+    fn paste_preserves_newlines() {
+        let mut input = InputBox::new();
+        input.handle_action(&Action::Paste("fn main() {\r\n    body\r\n}".into()), 80);
+        assert_eq!(input.content(), "fn main() {\n    body\n}");
+    }
+
+    /// Up recalls prior entries newest-first; Down returns through
+    /// them and finally restores the unsent draft.
+    #[test]
+    fn history_round_trip_preserves_draft() {
+        let mut input = InputBox::new();
+        input.handle_action(&Action::Paste("first".into()), 80);
+        input.commit();
+        input.handle_action(&Action::Paste("second".into()), 80);
+        input.commit();
+
+        input.handle_action(&Action::Paste("draft".into()), 80);
+        input.handle_action(&Action::Up, 80);
+        assert_eq!(input.content(), "second");
+        input.handle_action(&Action::Up, 80);
+        assert_eq!(input.content(), "first");
+        // Top of history: Up is consumed but content stays.
+        input.handle_action(&Action::Up, 80);
+        assert_eq!(input.content(), "first");
+        input.handle_action(&Action::Down, 80);
+        assert_eq!(input.content(), "second");
+        input.handle_action(&Action::Down, 80);
+        assert_eq!(input.content(), "draft");
+    }
+
+    /// Consecutive identical commits don't duplicate history entries,
+    /// and blank commits are not recorded.
+    #[test]
+    fn history_dedupes_and_skips_blank() {
+        let mut input = InputBox::new();
+        input.handle_action(&Action::Paste("same".into()), 80);
+        input.commit();
+        input.handle_action(&Action::Paste("same".into()), 80);
+        input.commit();
+        input.handle_action(&Action::Paste("   ".into()), 80);
+        input.commit();
+        assert_eq!(input.history.len(), 1);
+    }
+
+    /// With no history, Up is not consumed (falls through to the
+    /// caller); with history browsing inactive, Down is not consumed.
+    #[test]
+    fn unconsumed_arrows_fall_through() {
+        let mut input = InputBox::new();
+        assert!(!input.handle_action(&Action::Up, 80));
+        assert!(!input.handle_action(&Action::Down, 80));
     }
 }

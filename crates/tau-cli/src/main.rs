@@ -20,8 +20,8 @@ use clap::Parser;
 use tau_ai::ReasoningLevel;
 
 use cli::{
-    Args, AuthCmd, Command, ConfigCmd, McpCmd, SessionsCmd, get_available_models, get_model,
-    parse_reasoning_level,
+    Args, AuthCmd, Command, ConfigCmd, McpCmd, ModelsCmd, SessionsCmd, get_available_models,
+    get_model, parse_reasoning_level,
 };
 
 #[tokio::main]
@@ -65,10 +65,16 @@ async fn main() -> anyhow::Result<()> {
             return session::list_sessions_cli();
         }
         Some(Command::Sessions(SessionsCmd::Resume { id })) => {
-            resume_id = Some(id);
+            // Resolve prefix → full id now, before the auth gate, so a
+            // bad session id fails with a session error.
+            resume_id = Some(session::SessionManager::resolve_id(&id)?);
         }
         Some(Command::Run { prompt }) => {
             run_prompt = Some(prompt);
+        }
+        Some(Command::Models(ModelsCmd::List)) => {
+            cli::print_models_list();
+            return Ok(());
         }
         Some(Command::Mcp(cmd)) => {
             // Needs the config, which loads below.
@@ -98,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         .or(cfg.model.clone())
         .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
 
-    let model = get_model(&provider, &model_id).await;
+    let model = get_model(&provider, &model_id).await?;
 
     let reasoning = if args.reasoning {
         ReasoningLevel::Medium
@@ -289,11 +295,12 @@ async fn main() -> anyhow::Result<()> {
             .config()
             .await
             .ok_or_else(|| anyhow::anyhow!("Agent shut down"))?;
-        let mut frontend = ui::TuiFrontend::new(&agent_config, available_models).await?;
+        let theme = ui::Theme::detect(cfg.theme.as_deref());
+        let mut frontend = ui::TuiFrontend::new(&agent_config, available_models, theme).await?;
         sess.drive(&mut frontend).await
     } else {
         let mut frontend = match run_prompt {
-            Some(prompt) => frontends::stdout::StdoutFrontend::one_shot(prompt),
+            Some(prompt) => frontends::stdout::StdoutFrontend::one_shot(prompt, args.quiet),
             None => frontends::stdout::StdoutFrontend::repl(),
         };
         sess.drive(&mut frontend).await
@@ -301,6 +308,12 @@ async fn main() -> anyhow::Result<()> {
 
     mcp_manager.shutdown_all().await;
     lsp_manager.shutdown_all().await;
-    result
+    result?;
+    // Scripting contract: `tau run` exits non-zero when the prompt
+    // failed, so pipelines can detect failure.
+    if is_one_shot && sess.had_agent_error() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 

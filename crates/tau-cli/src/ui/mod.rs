@@ -30,3 +30,4 @@ mod types;
 mod widgets;
 
 pub use frontend::TuiFrontend;
+pub use theme::Theme;

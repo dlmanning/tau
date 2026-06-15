@@ -63,6 +63,34 @@ pub struct Session {
     /// Whether the user has already been warned about a session-log
     /// write failure (warn once, log every failure).
     warned_persistence: bool,
+    /// Whether any prompt in this session failed with an agent error.
+    /// One-shot mode turns this into a non-zero exit code.
+    had_agent_error: bool,
+    /// Tools the user chose "always allow" for in the approval modal.
+    /// Applied as a [`SessionAllowlistPolicy`] on the root agent and
+    /// the manager (so subagents inherit it).
+    always_allowed_tools: std::collections::HashSet<String>,
+}
+
+/// [`DefaultPolicy`] plus a session allowlist: tools the user approved
+/// with "always allow" skip the gate; everything else keeps the
+/// default risk-based gating.
+struct SessionAllowlistPolicy {
+    allowed: std::collections::HashSet<String>,
+}
+
+impl tau_agent::ApprovalPolicy for SessionAllowlistPolicy {
+    fn classify(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+        risk: tau_agent::ToolRisk,
+    ) -> tau_agent::ApprovalDecision {
+        if self.allowed.contains(tool) {
+            return tau_agent::ApprovalDecision::Auto;
+        }
+        tau_agent::ApprovalPolicy::classify(&tau_agent::DefaultPolicy, tool, arguments, risk)
+    }
 }
 
 impl Session {
@@ -83,7 +111,15 @@ impl Session {
             state: State::Idle,
             exit_requested: false,
             warned_persistence: false,
+            had_agent_error: false,
+            always_allowed_tools: std::collections::HashSet::new(),
         }
+    }
+
+    /// Whether any prompt failed with an agent error during this
+    /// session. `tau run` maps this to exit code 1.
+    pub fn had_agent_error(&self) -> bool {
+        self.had_agent_error
     }
 
     // ─── Accessors for commands ───────────────────────────────────────
@@ -298,6 +334,11 @@ impl Session {
         // Cumulative-text tracker for MessageEnd: not needed — frontend
         // handles its own delta state via render_event.
         let mut total_usage = Usage::default();
+        // Captured prompt outcome. The loop can exit via the AgentEnd
+        // event *before* `prompt_task` is polled to completion, so the
+        // result is also collected after the loop — otherwise a prompt
+        // error is silently dropped (and `tau run` exits 0 on failure).
+        let mut prompt_res: Option<Result<(), tau_agent::Error>> = None;
         loop {
             // No `biased;`: fair polling so frontend.tick() (and the
             // input it carries) doesn't starve when agent events stream
@@ -347,9 +388,7 @@ impl Session {
                 res = &mut prompt_task => {
                     // Prompt completed but we may still have events
                     // queued. Drain them non-blockingly.
-                    if let Ok(Err(e)) = res {
-                        frontend.show_error(&format!("{}", e)).await;
-                    }
+                    prompt_res = Some(res.unwrap_or(Ok(())));
                     while let Ok(event) = events.try_recv() {
                         let is_end = matches!(event, AgentEvent::AgentEnd { .. });
                         if let AgentEvent::AgentEnd { total_usage: u, .. } = &event {
@@ -364,6 +403,25 @@ impl Session {
                     break;
                 }
             }
+        }
+
+        // Collect the prompt outcome if the loop exited via the
+        // AgentEnd event (or Quit) before polling the task. The actor
+        // has already finished (or been aborted), so this resolves
+        // promptly; the timeout is a backstop against a wedged actor.
+        let res = match prompt_res {
+            Some(r) => r,
+            None => tokio::time::timeout(std::time::Duration::from_secs(2), &mut prompt_task)
+                .await
+                .map(|join| join.unwrap_or(Ok(())))
+                .unwrap_or_else(|_elapsed| {
+                    prompt_task.abort();
+                    Ok(())
+                }),
+        };
+        if let Err(e) = res {
+            self.had_agent_error = true;
+            frontend.show_error(&format!("{}", e)).await;
         }
 
         frontend.render_turn_end(&total_usage, &model).await;
@@ -459,6 +517,20 @@ impl Session {
                     } else {
                         frontend
                             .show_system("Execute now is only available within /plan mode.")
+                            .await;
+                    }
+                }
+                FrontendAction::AlwaysAllowTool(tool_name) => {
+                    self.always_allowed_tools.insert(tool_name.clone());
+                    let policy = Arc::new(SessionAllowlistPolicy {
+                        allowed: self.always_allowed_tools.clone(),
+                    });
+                    if self.handle.set_approval_policy(policy.clone()).await.is_ok() {
+                        self.manager.set_default_approval_policy(policy);
+                        frontend
+                            .show_system(&format!(
+                                "Auto-approving `{tool_name}` for the rest of this session."
+                            ))
                             .await;
                     }
                 }

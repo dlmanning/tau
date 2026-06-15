@@ -21,6 +21,9 @@ pub enum FrontendAction {
     /// should immediately invoke `/plan approve` after the planner
     /// finishes its turn, skipping the manual command.
     ExecutePlanNow,
+    /// User chose "always allow" in the tool-approval modal — Session
+    /// should auto-approve this tool for the rest of the session.
+    AlwaysAllowTool(String),
 }
 
 /// User-supplied input that drives the session forward.

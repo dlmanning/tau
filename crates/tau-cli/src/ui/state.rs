@@ -6,6 +6,7 @@ use tau_ai::Model;
 
 use super::{
     theme::Theme,
+    types::PendingApproval,
     widgets::{InputBox, SelectorState, message_list::ChatMessage},
 };
 use tokio::sync::mpsc;
@@ -103,6 +104,9 @@ pub(super) struct TuiState {
     pub pending_interaction: Option<PendingInteraction>,
     /// Pending plan submission awaiting Approve / Execute now / Reject.
     pub pending_plan: Option<PendingPlan>,
+    /// Queued `tool.confirm` gates; the front entry is the active
+    /// approval modal.
+    pub pending_approvals: std::collections::VecDeque<PendingApproval>,
 }
 
 impl TuiState {
@@ -110,6 +114,7 @@ impl TuiState {
         config: &AgentConfig,
         available_models: Vec<Model>,
         ui_tx: mpsc::Sender<UiMessage>,
+        theme: Theme,
     ) -> Self {
         let mut input = InputBox::new().with_placeholder("Type a message...");
         input.set_focused(true);
@@ -134,7 +139,7 @@ impl TuiState {
             is_processing: false,
             git_branch: GitBranchState::new(),
             status: "Ready".to_string(),
-            theme: Theme::dark(),
+            theme,
             usage: UsageStats::default(),
             model: config.model().clone(),
             reasoning: config.reasoning(),
@@ -145,6 +150,7 @@ impl TuiState {
             branch_selector: SelectorState::default(),
             pending_interaction: None,
             pending_plan: None,
+            pending_approvals: std::collections::VecDeque::new(),
         }
     }
 

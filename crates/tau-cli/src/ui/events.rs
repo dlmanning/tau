@@ -78,7 +78,7 @@ impl TuiState {
             Action::Submit => {
                 let content = self.input.content().to_string();
                 if !content.is_empty() && !self.is_processing {
-                    self.input.clear();
+                    self.input.commit();
 
                     if content.starts_with('/') {
                         self.send_ui(UiMessage::Command(content)).await;

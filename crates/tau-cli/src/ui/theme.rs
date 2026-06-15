@@ -54,8 +54,39 @@ impl Theme {
         }
     }
 
+    /// Pick the theme from the environment and config: `NO_COLOR`
+    /// (any non-empty value, per the no-color.org convention) wins
+    /// with a monochrome theme; otherwise the config's `theme` key
+    /// selects `light`/`dark`; default is dark.
+    pub fn detect(config_theme: Option<&str>) -> Self {
+        if std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()) {
+            return Self::monochrome();
+        }
+        match config_theme {
+            Some("light") => Self::light(),
+            _ => Self::dark(),
+        }
+    }
+
+    /// No ANSI colors at all — emphasis comes from modifiers (bold,
+    /// dim) only. Used when `NO_COLOR` is set.
+    pub fn monochrome() -> Self {
+        Self {
+            bg: Color::Reset,
+            fg: Color::Reset,
+            dim: Color::Reset,
+            accent: Color::Reset,
+            error: Color::Reset,
+            success: Color::Reset,
+            warning: Color::Reset,
+            border: Color::Reset,
+            selection_bg: Color::Reset,
+            code: Color::Reset,
+            link: Color::Reset,
+        }
+    }
+
     /// Light theme
-    #[allow(dead_code)]
     pub fn light() -> Self {
         Self {
             bg: Color::White,

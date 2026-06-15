@@ -13,18 +13,25 @@ pub(crate) fn list_sessions_cli() -> anyhow::Result<()> {
                 );
             } else {
                 println!("Saved sessions:\n");
-                println!("{:<38} {:<20} {:<8} Working Dir", "ID", "Created", "Msgs");
-                println!("{}", "-".repeat(90));
+                println!(
+                    "{:<10} {:<17} {:>5}  {:<44} Working Dir",
+                    "ID", "Created", "Msgs", "First prompt"
+                );
+                println!("{}", "-".repeat(110));
                 for s in sessions {
+                    // Short id — `resume` accepts any unique prefix.
+                    let short_id: String = s.id.chars().take(8).collect();
+                    let preview = crate::utils::truncate_chars(&s.preview, 42);
                     println!(
-                        "{:<38} {:<20} {:<8} {}",
-                        s.id,
+                        "{:<10} {:<17} {:>5}  {:<44} {}",
+                        short_id,
                         s.created_at_display(),
                         s.message_count,
+                        preview,
                         s.working_dir
                     );
                 }
-                println!("\nResume with: tau sessions resume <session-id>");
+                println!("\nResume with: tau sessions resume <id-prefix>");
             }
         }
         Err(e) => {

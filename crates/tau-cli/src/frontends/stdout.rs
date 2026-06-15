@@ -24,15 +24,19 @@ pub struct StdoutFrontend {
     /// have already printed, so deltas land correctly without
     /// re-printing the prefix.
     rendered_chars: usize,
+    /// One-shot only: suppress everything except the assistant's
+    /// answer (and errors on stderr), so stdout pipes cleanly.
+    quiet: bool,
 }
 
 impl StdoutFrontend {
-    pub fn one_shot(prompt: String) -> Self {
+    pub fn one_shot(prompt: String, quiet: bool) -> Self {
         Self {
             mode: Mode::OneShot {
                 prompt: Some(prompt),
             },
             rendered_chars: 0,
+            quiet,
         }
     }
 
@@ -40,6 +44,7 @@ impl StdoutFrontend {
         Self {
             mode: Mode::Repl,
             rendered_chars: 0,
+            quiet: false,
         }
     }
 
@@ -53,7 +58,7 @@ impl Frontend for StdoutFrontend {
     async fn on_session_start(&mut self, info: SessionStart<'_>) {
         if !self.is_repl() {
             // One-shot mode: print the user's prompt as the "tau> ..." line.
-            if let Mode::OneShot { prompt: Some(p) } = &self.mode {
+            if !self.quiet && let Mode::OneShot { prompt: Some(p) } = &self.mode {
                 println!("tau> {}", p);
                 println!();
             }
@@ -103,6 +108,18 @@ impl Frontend for StdoutFrontend {
     }
 
     async fn render_event(&mut self, event: AgentEvent) {
+        // Quiet one-shot: only the answer text (MessageUpdate/End) and
+        // errors reach the terminal.
+        if self.quiet
+            && !matches!(
+                event,
+                AgentEvent::MessageUpdate { .. }
+                    | AgentEvent::MessageEnd { .. }
+                    | AgentEvent::Error { .. }
+            )
+        {
+            return;
+        }
         match event {
             AgentEvent::MessageUpdate { message } => {
                 let text = message.text();
@@ -193,6 +210,9 @@ impl Frontend for StdoutFrontend {
         let cost = total_usage.calculate_cost(model);
         match self.mode {
             Mode::OneShot { .. } => {
+                if self.quiet {
+                    return;
+                }
                 println!(
                     "\n[Tokens: {} in, {} out | Cost: ${:.4}]",
                     total_usage.input, total_usage.output, cost.total

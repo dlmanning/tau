@@ -53,6 +53,11 @@ pub(crate) struct Args {
     #[arg(long, global = true)]
     pub no_tui: bool,
 
+    /// Quiet mode for `run`: only the assistant's answer on stdout
+    /// (no prompt echo, tool activity, or cost footer)
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -73,6 +78,9 @@ pub(crate) enum Command {
     /// Manage the configuration file.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// List available models.
+    #[command(subcommand)]
+    Models(ModelsCmd),
     /// Inspect configured MCP servers.
     #[command(subcommand)]
     Mcp(McpCmd),
@@ -117,6 +125,12 @@ pub(crate) enum ConfigCmd {
     Init,
 }
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelsCmd {
+    /// List every model in the registry, grouped by provider.
+    List,
+}
+
 pub(crate) fn parse_reasoning_level(s: &str) -> anyhow::Result<ReasoningLevel> {
     match s.to_lowercase().as_str() {
         "off" => Ok(ReasoningLevel::Off),
@@ -131,14 +145,48 @@ pub(crate) fn parse_reasoning_level(s: &str) -> anyhow::Result<ReasoningLevel> {
     }
 }
 
-pub(crate) async fn get_model(provider: &str, model_id: &str) -> Model {
+pub(crate) async fn get_model(provider: &str, model_id: &str) -> anyhow::Result<Model> {
     if let Some(model) = tau_ai::models::get_model_by_id(model_id) {
-        return model;
+        return Ok(model);
+    }
+
+    let provider_enum = Provider::from_id(provider);
+
+    // Unknown id on a cloud provider is almost certainly a typo —
+    // fail with suggestions instead of silently constructing a model
+    // the API will reject. Ollama (and other local/custom setups)
+    // legitimately run models the registry doesn't know.
+    if provider_enum != Provider::Ollama {
+        let known = tau_ai::models::get_all_models();
+        let needle = model_id.to_lowercase();
+        let fuzzy: Vec<&Model> = known
+            .iter()
+            .filter(|m| {
+                m.id.to_lowercase().contains(&needle) || m.name.to_lowercase().contains(&needle)
+            })
+            .collect();
+        let (header, suggestions) = if fuzzy.is_empty() {
+            (
+                format!("Available {provider} models:"),
+                known
+                    .iter()
+                    .filter(|m| m.provider == provider_enum)
+                    .collect(),
+            )
+        } else {
+            ("Did you mean one of these?".to_string(), fuzzy)
+        };
+        let listing = suggestions
+            .iter()
+            .map(|m| format!("  {}  ({})", m.id, m.name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "Unknown model '{model_id}'.\n\n{header}\n{listing}\n\nRun `tau models list` to see every available model."
+        );
     }
 
     // Fallback: construct a default model for unknown/custom model IDs
-    let provider_enum = Provider::from_id(provider);
-
     let mut model = Model {
         id: model_id.to_string(),
         name: model_id.to_string(),
@@ -169,7 +217,37 @@ pub(crate) async fn get_model(provider: &str, model_id: &str) -> Model {
         }
     }
 
-    model
+    Ok(model)
+}
+
+/// Print every registry model grouped by provider (`tau models list`).
+pub(crate) fn print_models_list() {
+    let mut models = tau_ai::models::get_all_models();
+    models.sort_by(|a, b| {
+        a.provider
+            .name()
+            .cmp(b.provider.name())
+            .then(a.id.cmp(&b.id))
+    });
+    let mut current_provider: Option<&str> = None;
+    for m in &models {
+        let pid = m.provider.name();
+        if current_provider != Some(pid) {
+            if current_provider.is_some() {
+                println!();
+            }
+            println!("{pid}:");
+            current_provider = Some(pid);
+        }
+        println!(
+            "  {:<36} {:>5}k ctx  ${:>5.2}/${:<5.2} per Mtok{}",
+            m.id,
+            m.context_window / 1000,
+            m.cost.input,
+            m.cost.output,
+            if m.reasoning { "  [reasoning]" } else { "" }
+        );
+    }
 }
 
 /// Get list of commonly available models
