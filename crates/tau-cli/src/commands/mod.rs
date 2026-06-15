@@ -7,6 +7,7 @@
 //! command by name/alias and calls `execute`.
 
 mod branch;
+pub(crate) mod mcp;
 mod model;
 mod plan;
 mod session;

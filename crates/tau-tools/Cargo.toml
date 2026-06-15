@@ -38,9 +38,17 @@ lsp-types = { version = "0.97", optional = true }
 anyhow = { workspace = true, optional = true }
 urlencoding = { version = "2.1", optional = true }
 
+# MCP feature: tools provided by Model Context Protocol servers.
+rmcp = { workspace = true, optional = true }
+jsonschema = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
 [features]
 default = []
 lsp = ["dep:lsp-types", "dep:anyhow", "dep:urlencoding"]
+mcp = ["dep:rmcp", "dep:jsonschema", "dep:sha2", "dep:anyhow"]
 
 [dev-dependencies]
 tau-agent = { workspace = true, features = ["test-utils"] }
+# In-process fixture MCP server for integration tests.
+rmcp = { workspace = true, features = ["server", "macros", "transport-async-rw"] }

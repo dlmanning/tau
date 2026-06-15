@@ -12,6 +12,8 @@ mod grep;
 mod list;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod plan;
 mod read;
 mod send_message;

@@ -19,7 +19,10 @@ use std::sync::Arc;
 use clap::Parser;
 use tau_ai::ReasoningLevel;
 
-use cli::{Args, AuthCmd, Command, ConfigCmd, SessionsCmd, get_available_models, get_model, parse_reasoning_level};
+use cli::{
+    Args, AuthCmd, Command, ConfigCmd, McpCmd, SessionsCmd, get_available_models, get_model,
+    parse_reasoning_level,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     // Subcommands that don't need an agent.
     let mut resume_id: Option<String> = None;
     let mut run_prompt: Option<String> = None;
+    let mut mcp_cmd: Option<McpCmd> = None;
     match args.command {
         Some(Command::Config(ConfigCmd::Init)) => {
             return match config::Config::init() {
@@ -66,10 +70,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Run { prompt }) => {
             run_prompt = Some(prompt);
         }
+        Some(Command::Mcp(cmd)) => {
+            // Needs the config, which loads below.
+            mcp_cmd = Some(cmd);
+        }
         None => {}
     }
 
     let cfg = config::Config::load()?;
+
+    if let Some(McpCmd::List) = mcp_cmd {
+        return commands::mcp::list(&cfg).await;
+    }
 
     if let Some(ref dir) = args.working_dir {
         std::env::set_current_dir(dir)?;
@@ -155,9 +167,24 @@ async fn main() -> anyhow::Result<()> {
     builder.add_tool(Arc::new(tau_tools::SubmitPlanTool::new()));
     builder.add_tool(Arc::new(tau_tools::SubagentReportTool::new()));
 
-    let lsp_manager = Arc::new(tau_tools::lsp::LspManager::new(std::env::current_dir()?).await);
+    // LSP discovery and MCP server connections are independent
+    // startup I/O — run them concurrently.
+    let (lsp_manager, mcp_manager) = tokio::join!(
+        tau_tools::lsp::LspManager::new(std::env::current_dir()?),
+        tau_tools::mcp::McpManager::connect_all(cfg.mcp_specs()),
+    );
+    let lsp_manager = Arc::new(lsp_manager);
     if lsp_manager.is_available() {
         builder.add_tool(Arc::new(tau_tools::lsp::LspTool::new(lsp_manager.clone())));
+    }
+    let mcp_manager = Arc::new(mcp_manager);
+    for (name, err) in mcp_manager.failures() {
+        eprintln!("warning: MCP server '{name}' unavailable: {err}");
+    }
+    // Added before `build_resolver` so AllExceptAgent subagent specs
+    // inherit MCP tools; curated whitelists stay MCP-free.
+    for tool in mcp_manager.tools().await {
+        builder.add_tool(tool);
     }
 
     let manager = Arc::new(
@@ -272,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
         sess.drive(&mut frontend).await
     };
 
+    mcp_manager.shutdown_all().await;
     lsp_manager.shutdown_all().await;
     result
 }

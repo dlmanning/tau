@@ -73,6 +73,15 @@ pub(crate) enum Command {
     /// Manage the configuration file.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Inspect configured MCP servers.
+    #[command(subcommand)]
+    Mcp(McpCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum McpCmd {
+    /// Connect to every configured MCP server and list its tools.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
